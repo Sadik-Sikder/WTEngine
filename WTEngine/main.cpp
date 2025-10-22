@@ -33,9 +33,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hWnd, &ps);
-        TextOutW(hdc, 50, 50, L"Hello World from Win32", 24);
-        Rectangle(hdc, 40, 80, 300, 150);
-       /* if (engine) engine->render(hdc);*/
+        /*TextOutW(hdc, 50, 50, L"Hello World from Win32", 24);
+        Rectangle(hdc, 40, 80, 300, 150);*/
+        if (engine) engine->render(hdc);
         EndPaint(hWnd, &ps);
         return 0;
     }

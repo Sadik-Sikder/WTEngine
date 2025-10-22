@@ -37,6 +37,7 @@ void Engine::doLayout() {
 }
 
 void Engine::render(HDC hdc) {
+
     OutputDebugString(L"Engine::render called\n");
 
     if (!document || !document->body) {
@@ -47,6 +48,7 @@ void Engine::render(HDC hdc) {
         MessageBox(hwnd, L"No layout boxes generated.", L"Error", MB_OK);
         return;
     }
+
 
     // white background
     RECT rc; GetClientRect(hwnd, &rc);
