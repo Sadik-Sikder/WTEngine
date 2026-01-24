@@ -14,11 +14,14 @@ public:
 
     void loadHTML(const std::wstring& html);
     void onResize(int width, int height);
+    void scroll(int delta);
     void render(HDC hdc);
+    int getDocumentHeight() const;
 
 private:
     HWND hwnd;
-    int width, height;
+    int width, height, documentHeight = 0;
+    int scrollY = 0;
 
     std::shared_ptr<Document> document;
     LayoutRoot layoutRoot;

@@ -4,6 +4,9 @@
 #include <fstream>
 #include "Engine.h"
 
+static int scrollY = 0;
+static int contentHeight = 0;
+
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static Engine* engine = nullptr;
     switch (msg) {
@@ -26,17 +29,72 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         engine->loadHTML(html);
         return 0;
     }
-    case WM_SIZE:
-        if (engine) engine->onResize(LOWORD(lParam), HIWORD(lParam));
+    case WM_SIZE: {
+        int width = LOWORD(lParam);
+        int height = HIWORD(lParam);
+
+        if (engine) {
+            engine->onResize(width, height);
+            contentHeight = engine->getDocumentHeight();
+        }
+        int maxScroll = contentHeight - height;
+        if (maxScroll < 0) maxScroll = 0;
+
+        if (scrollY > maxScroll) scrollY = maxScroll;
+        if (scrollY < 0) scrollY = 0;
+
+        SCROLLINFO si = {};
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+
+        si.nMin = 0;
+        si.nMax = contentHeight - 1;
+        si.nPage = height;
+        si.nPos = scrollY;
+
+        SetScrollInfo(hWnd, SB_VERT, &si, TRUE);
+
         InvalidateRect(hWnd, NULL, TRUE);
         return 0;
+    }
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hWnd, &ps);
-        /*TextOutW(hdc, 50, 50, L"Hello World from Win32", 24);
-        Rectangle(hdc, 40, 80, 300, 150);*/
+        int saved = SaveDC(hdc);
+
+        SetViewportOrgEx(hdc, 0, -scrollY, NULL);
+
         if (engine) engine->render(hdc);
+
+        RestoreDC(hdc, saved);
         EndPaint(hWnd, &ps);
+        return 0;
+    }
+    case WM_VSCROLL:
+    {
+        SCROLLINFO si = {};
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_ALL;
+        GetScrollInfo(hWnd, SB_VERT, &si);
+
+        int oldScrollY = scrollY;
+
+        switch (LOWORD(wParam)) {
+        case SB_LINEUP:        scrollY -= 20; break;
+        case SB_LINEDOWN:      scrollY += 20; break;
+        case SB_PAGEUP:        scrollY -= si.nPage; break;
+        case SB_PAGEDOWN:      scrollY += si.nPage; break;
+        case SB_THUMBTRACK:    scrollY = si.nTrackPos; break;
+        }
+
+        scrollY = max(0, min(scrollY, si.nMax - (int)si.nPage));
+
+        if (scrollY != oldScrollY) {
+            si.fMask = SIF_POS;
+            si.nPos = scrollY;
+            SetScrollInfo(hWnd, SB_VERT, &si, TRUE);
+            InvalidateRect(hWnd, NULL, TRUE);
+        }
         return 0;
     }
     case WM_DESTROY:
@@ -60,7 +118,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
 
     HWND hwnd = CreateWindowEx(
         0, CLASS_NAME, L"WTEngine - Minimal Browser Engine",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 900, 600,
+        WS_OVERLAPPEDWINDOW | WS_VSCROLL, CW_USEDEFAULT, CW_USEDEFAULT, 900, 600,
         NULL, NULL, hInstance, NULL
     );
 
