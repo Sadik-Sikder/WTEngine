@@ -3,23 +3,22 @@
 #include <string>
 #include <memory>
 #include <vector>
-#include <windows.h>
 #include "DOM.h"
 #include "Layout.h"
 
+class Renderer;
 class Engine {
 public:
-    Engine(HWND hwnd);
+    Engine(int w, int h);
     ~Engine();
 
     void loadHTML(const std::wstring& html);
     void onResize(int width, int height);
     void scroll(int delta);
-    void render(HDC hdc);
+    void render(Renderer& renderer);
     int getDocumentHeight() const;
 
 private:
-    HWND hwnd;
     int width, height, documentHeight = 0;
     int scrollY = 0;
 
