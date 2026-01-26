@@ -129,19 +129,19 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="Engine.cpp" />
-    <ClCompile Include="HTMLParser.cpp" />
-    <ClCompile Include="Layout.cpp" />
-    <ClCompile Include="main.cpp" />
-    <ClCompile Include="OpenGLRenderer.cpp" />
+    <ClCompile Include="src\Engine.cpp" />
+    <ClCompile Include="src\HTMLParser.cpp" />
+    <ClCompile Include="src\Layout.cpp" />
+    <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\OpenGLRenderer.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="DOM.h" />
-    <ClInclude Include="Engine.h" />
-    <ClInclude Include="OpenGLRenderer.h" />
-    <ClInclude Include="Renderer.h" />
-    <ClInclude Include="HTMLParser.h" />
-    <ClInclude Include="Layout.h" />
+    <ClInclude Include="include\DOM.h" />
+    <ClInclude Include="include\Engine.h" />
+    <ClInclude Include="include\HTMLParser.h" />
+    <ClInclude Include="include\Layout.h" />
+    <ClInclude Include="include\OpenGLRenderer.h" />
+    <ClInclude Include="include\Renderer.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

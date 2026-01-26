@@ -59,7 +59,6 @@ std::shared_ptr<Element> HTMLParser::parseElement() {
     while (pos < s.size() && s[pos] != L'>') pos++;
     if (pos < s.size() && s[pos] == L'>') pos++;
 
-    // self-closing simple
     if (s.substr(pos - 2, 2) == L"/>") return elem;
 
     // parse children until </name>
