@@ -2,9 +2,12 @@
 #include "Engine.h"
 #include "HTMLParser.h"
 #include "Renderer.h"
+#include "Fetcher.h"
 #include <algorithm>
+#include <cmath>
+#include <cwctype>
 #include <string>
-#include <sstream> 
+#include <sstream>
 
 // Minimal color struct for OpenGL
 
@@ -45,6 +48,11 @@ void Engine::loadHTML(const std::wstring& html) {
 }
 
 void Engine::parseAndBuild(const std::wstring& html) {
+    // The old DOM (and the elements form state points into) is about to go.
+    focusedEl = nullptr;
+    focusedForm = nullptr;
+    hasSubmission = false;
+
     HTMLParser parser;
     document = parser.parse(html);
 
@@ -98,7 +106,7 @@ void Engine::scroll(int delta) {
     scrollY = std::max(0, std::min(scrollY, maxScroll));
 }
 
-void Engine::render(Renderer& renderer) {
+void Engine::render(Renderer& renderer, double timeSeconds) {
     // Renderer should clear framebuffer first:
     // glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -109,6 +117,11 @@ void Engine::render(Renderer& renderer) {
         // Cull boxes outside viewport
         if (screenY + b.height < topInset || screenY > height)
             continue;
+
+        if (b.control != LayoutBox::NoControl) {
+            drawControl(renderer, b, screenY, timeSeconds);
+            continue;
+        }
 
         // Draw background
         if (!b.background.empty()) {

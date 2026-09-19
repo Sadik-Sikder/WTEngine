@@ -2,7 +2,6 @@
 #define NOMINMAX
 #include "AddressBar.h"
 #include "Renderer.h"
-#include <GLFW/glfw3.h> // key codes only
 #include <windows.h>
 #include <algorithm>
 #include <cmath>
@@ -26,103 +25,37 @@ namespace {
 }
 
 void AddressBar::setText(const std::wstring& text) {
-    text_ = text;
-    cursor_ = text_.size();
-    allSelected_ = false;
+    ed_.setText(text);
     scrollX_ = 0;
 }
 
 void AddressBar::focus() {
     focused_ = true;
-    selectAll();
+    ed_.selectAll();
 }
 
 void AddressBar::blur() {
     focused_ = false;
-    allSelected_ = false;
+    ed_.collapseTo(ed_.cursor());
 }
 
-void AddressBar::selectAll() {
-    allSelected_ = !text_.empty();
-    cursor_ = text_.size();
-}
+void AddressBar::onClick(int x, Renderer& renderer, double now) {
+    bool isDouble = ed_.registerClick(x, now);
 
-void AddressBar::insert(const std::wstring& s) {
-    std::wstring clean;
-    for (wchar_t c : s) {
-        if (c >= 32 && c != 127) clean.push_back(c); // drop newlines/control chars
-    }
-    if (clean.empty()) return;
-
-    if (allSelected_) { text_.clear(); cursor_ = 0; allSelected_ = false; }
-    text_.insert(cursor_, clean);
-    cursor_ += clean.size();
-}
-
-void AddressBar::onChar(unsigned int cp) {
-    if (cp < 32 || cp == 127) return;
-    std::wstring s;
-    if (cp > 0xFFFF) { // UTF-16 surrogate pair
-        cp -= 0x10000;
-        s.push_back((wchar_t)(0xD800 + (cp >> 10)));
-        s.push_back((wchar_t)(0xDC00 + (cp & 0x3FF)));
-    }
-    else {
-        s.push_back((wchar_t)cp);
-    }
-    insert(s);
-}
-
-bool AddressBar::onEditKey(int key) {
-    switch (key) {
-    case GLFW_KEY_BACKSPACE:
-        if (allSelected_) { text_.clear(); cursor_ = 0; allSelected_ = false; }
-        else if (cursor_ > 0) { text_.erase(cursor_ - 1, 1); cursor_--; }
-        return true;
-    case GLFW_KEY_DELETE:
-        if (allSelected_) { text_.clear(); cursor_ = 0; allSelected_ = false; }
-        else if (cursor_ < text_.size()) { text_.erase(cursor_, 1); }
-        return true;
-    case GLFW_KEY_LEFT:
-        if (allSelected_) { cursor_ = 0; allSelected_ = false; }
-        else if (cursor_ > 0) cursor_--;
-        return true;
-    case GLFW_KEY_RIGHT:
-        if (allSelected_) { cursor_ = text_.size(); allSelected_ = false; }
-        else if (cursor_ < text_.size()) cursor_++;
-        return true;
-    case GLFW_KEY_HOME:
-        cursor_ = 0; allSelected_ = false;
-        return true;
-    case GLFW_KEY_END:
-        cursor_ = text_.size(); allSelected_ = false;
-        return true;
-    }
-    return false;
-}
-
-void AddressBar::onClick(int x, Renderer& renderer) {
     if (!focused_) { focus(); return; }
 
-    // Place the caret at the character boundary nearest the click.
-    float target = x - (kFieldX + kTextPad) + scrollX_;
-    size_t best = 0;
-    float bestDist = std::fabs(target);
-    for (size_t i = 1; i <= text_.size(); i++) {
-        float w = renderer.measureText(text_.substr(0, i), kFontSize);
-        float d = std::fabs(target - w);
-        if (d < bestDist) { bestDist = d; best = i; }
-    }
-    cursor_ = best;
-    allSelected_ = false;
+    float localX = x - (kFieldX + kTextPad) + scrollX_;
+    if (isDouble) ed_.selectWordAt(localX, renderer, kFontSize);
+    else ed_.placeCaretAt(localX, renderer, kFontSize);
 }
 
 void AddressBar::draw(Renderer& r, int windowWidth, double t) {
     const int fieldW = std::max(windowWidth - 2 * kFieldX, 50);
     const int viewW = fieldW - 2 * kTextPad; // visible text area
+    const std::wstring& text = ed_.text();
 
     // Keep the caret in view while editing; show the start when idle.
-    float caretX = r.measureText(text_.substr(0, cursor_), kFontSize);
+    float caretX = r.measureText(text.substr(0, ed_.cursor()), kFontSize);
     if (!focused_) scrollX_ = 0;
     else {
         if (caretX - scrollX_ > viewW) scrollX_ = caretX - viewW;
@@ -135,30 +68,31 @@ void AddressBar::draw(Renderer& r, int windowWidth, double t) {
                focused_ ? kBorderFocus : kBorder);
     r.drawRect((float)kFieldX, (float)kFieldY, (float)fieldW, (float)kFieldH, kField);
 
+    // Long text scrolls sideways; keep it inside the field.
+    r.setClip((float)kFieldX, (float)kFieldY, (float)fieldW, (float)kFieldH);
+
     const float textX = kFieldX + kTextPad - scrollX_;
     const float textY = (float)(kFieldY + kTextTop);
 
-    if (text_.empty()) {
+    if (text.empty()) {
         r.drawText((float)(kFieldX + kTextPad), textY, L"Type a URL and press Enter",
                    kFontSize, kPlaceholder);
     }
     else {
-        if (allSelected_) {
-            float w = r.measureText(text_, kFontSize);
-            r.drawRect(textX, (float)kFieldY + 3, w, (float)kFieldH - 6, kSelection);
+        if (ed_.hasSelection()) {
+            float x0 = r.measureText(text.substr(0, ed_.selLow()), kFontSize);
+            float x1 = r.measureText(text.substr(0, ed_.selHigh()), kFontSize);
+            r.drawRect(textX + x0, (float)kFieldY + 3, x1 - x0, (float)kFieldH - 6, kSelection);
         }
-        r.drawText(textX, textY, text_, kFontSize, kInk);
+        r.drawText(textX, textY, text, kFontSize, kInk);
     }
 
-    if (focused_ && !allSelected_ && std::fmod(t, 1.0) < 0.6) { // blinking caret
+    if (focused_ && !ed_.hasSelection() && std::fmod(t, 1.0) < 0.6) { // blinking caret
         r.drawRect(kFieldX + kTextPad + caretX - scrollX_, (float)kFieldY + 4, 1.5f,
                    (float)kFieldH - 8, kInk);
     }
 
-    // The text may run past either end of the field; there is no clipping in
-    // the Renderer interface, so paint the bar colour over the overflow.
-    r.drawRect(0, 0, (float)(kFieldX - 1), (float)kHeight, kBarBg);
-    r.drawRect((float)(kFieldX + fieldW + 1), 0, (float)windowWidth, (float)kHeight, kBarBg);
+    r.clearClip();
 }
 
 std::wstring AddressBar::normalizeInput(const std::wstring& input) {

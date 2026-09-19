@@ -87,6 +87,81 @@ void LayoutRoot::layoutText(const std::wstring& text, int x, int& y, int contain
     y += paraGap;
 }
 
+static std::wstring lowerCase(std::wstring s) {
+    for (auto& c : s) c = (wchar_t)towlower(c);
+    return s;
+}
+
+// First piece of text inside an element (used for <button> labels).
+static std::wstring firstText(Element* el) {
+    for (auto& child : el->children) {
+        if (child->type == Node::TEXT) return static_cast<TextNode*>(child.get())->text;
+        std::wstring t = firstText(static_cast<Element*>(child.get()));
+        if (!t.empty()) return t;
+    }
+    return L"";
+}
+
+// Places one <input> or <button> as a box of its own. Controls are laid out
+// as blocks like everything else here, so a label and its field end up on
+// separate rows.
+void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth) {
+    const int marginY = 6;
+    const int fieldHeight = 28, buttonHeight = 30, checkboxSize = 18;
+    const int maxWidth = std::max(containingWidth, 60);
+
+    std::wstring type = lowerCase(getAttr(e, L"type", L""));
+
+    LayoutBox box;
+    box.x = x;
+    box.fontSize = 14;
+    box.el = e;
+    box.form = currentForm;
+
+    if (e->tag == L"button") {
+        box.control = LayoutBox::Button;
+        box.text = firstText(e);
+        if (box.text.empty()) box.text = L"Button";
+    }
+    else if (type == L"submit" || type == L"button" || type == L"reset" || type == L"image") {
+        box.control = LayoutBox::Button;
+        box.text = getAttr(e, L"value", L"");
+        if (box.text.empty()) box.text = type == L"reset" ? L"Reset" : type == L"button" ? L"" : L"Submit";
+    }
+    else if (type == L"checkbox") {
+        box.control = LayoutBox::Checkbox;
+    }
+    else if (type == L"hidden" || type == L"radio" || type == L"file" ||
+             type == L"range" || type == L"color") {
+        return; // hidden takes no space; the rest aren't supported
+    }
+    else {
+        box.control = LayoutBox::TextField; // text, search, email, password, url, ...
+    }
+
+    switch (box.control) {
+    case LayoutBox::TextField: {
+        int chars = parseFontSize(getAttr(e, L"size", L""), 20);
+        box.width = std::min(std::max(chars * 8 + 16, 60), maxWidth);
+        box.height = fieldHeight;
+        break;
+    }
+    case LayoutBox::Button:
+        box.width = std::min(std::max((int)textWidth(box.text, box.fontSize) + 24, 40), maxWidth);
+        box.height = buttonHeight;
+        break;
+    default: // Checkbox
+        box.width = checkboxSize;
+        box.height = checkboxSize;
+        break;
+    }
+
+    y += marginY;
+    box.y = y;
+    boxes.push_back(box);
+    y += box.height + marginY;
+}
+
 void LayoutRoot::layout() {
     boxes.clear();
     if (!rootNode) return;
@@ -116,6 +191,11 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth) 
                 e->tag == L"title" || e->tag == L"meta" || e->tag == L"link" ||
                 e->tag == L"base" || e->tag == L"noscript")
                 continue;
+
+            if (e->tag == L"input" || e->tag == L"button") {
+                layoutControl(e, x, y, containingWidth);
+                continue;
+            }
 
             std::wstring style = getAttr(e, L"style", L"");
 
@@ -175,8 +255,11 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth) 
                 auto href = e->attrs.find(L"href");
                 if (href != e->attrs.end()) currentHref = href->second;
             }
+            Element* savedForm = currentForm;
+            if (e->tag == L"form") currentForm = e;
             layoutElement(e, x + padding, y, containingWidth - 2 * padding);
             currentHref = savedHref;
+            currentForm = savedForm;
 
             y += padding;
 

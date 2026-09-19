@@ -1,6 +1,7 @@
 #include "OpenGLRenderer.h"
 #include <vector>
 #include <algorithm>
+#include <cmath>
 
 OpenGLRenderer::~OpenGLRenderer() {
     for (auto& [size, font] : measureFonts) DeleteObject(font);
@@ -86,6 +87,7 @@ const TextTexture& OpenGLRenderer::getOrCreateTextTexture(const std::wstring& te
 }
 
 void OpenGLRenderer::beginFrame(int width, int height, float scrollY) {
+    frameHeight = height;
     glViewport(0, 0, width, height);
     glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -153,4 +155,18 @@ float OpenGLRenderer::measureText(const std::wstring& text, float fontSize) {
     GetTextExtentPoint32W(measureDC, text.c_str(), (int)text.size(), &sz);
     SelectObject(measureDC, old);
     return static_cast<float>(sz.cx);
+}
+
+// glScissor's origin is the bottom-left corner, our coordinates are top-left.
+void OpenGLRenderer::setClip(float x, float y, float w, float h) {
+    int left = (int)std::floor(x);
+    int top = (int)std::floor(y);
+    int right = (int)std::ceil(x + w);
+    int bottom = (int)std::ceil(y + h);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(left, frameHeight - bottom, std::max(right - left, 0), std::max(bottom - top, 0));
+}
+
+void OpenGLRenderer::clearClip() {
+    glDisable(GL_SCISSOR_TEST);
 }

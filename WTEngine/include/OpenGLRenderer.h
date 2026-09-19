@@ -29,9 +29,12 @@ public:
     void drawText(float x, float y, const std::wstring& text,
         float fontSize, Color color) override;
     float measureText(const std::wstring& text, float fontSize) override;
+    void setClip(float x, float y, float w, float h) override;
+    void clearClip() override;
 
 private:
     std::map<std::wstring, TextTexture> textCache;
+    int frameHeight = 0; // framebuffer height, for flipping scissor coordinates
     HDC measureDC = nullptr;
     std::map<int, HFONT> measureFonts; // font size -> font, for measureText
     const TextTexture& getOrCreateTextTexture(const std::wstring& text, float fontSize);
