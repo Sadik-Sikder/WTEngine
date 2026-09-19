@@ -10,6 +10,7 @@ private:
     size_t pos;
     std::wstring s;
     void skipSpace();
+    bool skipMarkup();
     bool startsWith(const std::wstring& token);
     std::wstring parseTagName();
     std::map<std::wstring, std::wstring> parseAttributes();
