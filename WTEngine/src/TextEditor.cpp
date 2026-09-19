@@ -13,7 +13,7 @@ void TextEditor::setText(const std::wstring& t) {
 }
 
 std::wstring TextEditor::display() const {
-    return masked_ ? std::wstring(text_.size(), L'•') : text_;
+    return masked_ ? std::wstring(text_.size(), (wchar_t)0x2022) : text_;
 }
 
 std::wstring TextEditor::selectedText() const {

@@ -143,6 +143,7 @@
     <ClInclude Include="include\AddressBar.h" />
     <ClInclude Include="include\DOM.h" />
     <ClInclude Include="include\Engine.h" />
+    <ClInclude Include="include\PageHistory.h" />
     <ClInclude Include="include\TextEditor.h" />
     <ClInclude Include="include\Fetcher.h" />
     <ClInclude Include="include\HTMLParser.h" />

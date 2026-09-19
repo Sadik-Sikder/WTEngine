@@ -28,6 +28,7 @@ public:
     void scroll(int delta);
     void render(Renderer& renderer, double timeSeconds = 0);
     int getDocumentHeight() const;
+    int getScrollY() const { return scrollY; }
 
     // Returns the href of the link under window-space point (x, y), or empty.
     std::wstring linkAt(int x, int y, Renderer& renderer) const;

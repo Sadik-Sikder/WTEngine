@@ -20,8 +20,9 @@ static std::wstring decodeEntities(const std::wstring& in) {
     if (in.find(L'&') == std::wstring::npos) return in;
     static const std::map<std::wstring, std::wstring> named = {
         { L"amp", L"&" }, { L"lt", L"<" }, { L"gt", L">" }, { L"quot", L"\"" },
-        { L"apos", L"'" }, { L"nbsp", L" " }, { L"copy", L"©" },
-        { L"mdash", L"—" }, { L"ndash", L"–" }, { L"hellip", L"…" } };
+        { L"apos", L"'" }, { L"nbsp", L" " }, { L"copy", std::wstring(1, (wchar_t)0x00A9) },
+        { L"mdash", std::wstring(1, (wchar_t)0x2014) }, { L"ndash", std::wstring(1, (wchar_t)0x2013) },
+        { L"hellip", std::wstring(1, (wchar_t)0x2026) } };
     std::wstring out;
     for (size_t i = 0; i < in.size(); i++) {
         if (in[i] == L'&') {

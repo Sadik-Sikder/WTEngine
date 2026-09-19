@@ -6,6 +6,7 @@
 #include "Engine.h"
 #include "Fetcher.h"
 #include "OpenGLRenderer.h"
+#include "PageHistory.h"
 
 static const wchar_t* kDefaultPage =
     L"<html><head><title>WTEngine</title></head><body>"
@@ -26,6 +27,8 @@ struct App {
     AddressBar bar;
     std::wstring currentUrl;
     std::wstring pendingUrl; // set by input callbacks, handled in the main loop
+    int pendingHistory = 0;  // -1 = go back, +1 = go forward (also handled in the main loop)
+    PageHistory history;
 };
 
 static std::string toUtf8(const std::wstring& w) {
@@ -55,22 +58,44 @@ static std::wstring escapeHtml(const std::wstring& in) {
     return out;
 }
 
-// Loads `url` into the engine (as a POST if `postBody` is given), or shows an
-// error page if the fetch fails.
+// Displays a history entry: loads its page, restores its scroll position, and
+// updates the window title and address bar.
+static void showEntry(App& app, const HistoryEntry& entry) {
+    app.currentUrl = entry.url;
+    app.engine->loadHTML(entry.html);
+    app.engine->scroll(-1000000000); // to the top...
+    app.engine->scroll(entry.scrollY); // ...then to where the user was (clamped)
+    glfwSetWindowTitle(app.window,
+                       toUtf8(entry.url.empty() ? L"WTEngine" : entry.url + L" - WTEngine").c_str());
+    app.bar.setText(entry.url);
+}
+
+// Visits a brand-new page: remembers where we were scrolled on the page we're
+// leaving, pushes the new page onto the history, and shows it.
+static void visitPage(App& app, const std::wstring& url, const std::wstring& html) {
+    app.history.saveScroll(app.engine->getScrollY());
+    app.history.visit(HistoryEntry{ url, html, 0 });
+    showEntry(app, *app.history.current());
+}
+
+// Loads `url` (as a POST if `postBody` is given), or an error page if the fetch fails.
 static void navigate(App& app, const std::wstring& url, const std::string* postBody = nullptr) {
     FetchResult res = fetchPage(url, postBody);
     if (res.ok) {
-        app.currentUrl = res.finalUrl.empty() ? url : res.finalUrl;
-        app.engine->loadHTML(res.html);
+        visitPage(app, res.finalUrl.empty() ? url : res.finalUrl, res.html);
     }
     else {
-        app.currentUrl = url;
-        app.engine->loadHTML(L"<html><body><div style='background:#ffd6d6;padding:8px'>Failed to load "
-                             + escapeHtml(url) + L"</div><div>" + escapeHtml(res.error) + L"</div></body></html>");
+        visitPage(app, url,
+                  L"<html><body><div style='background:#ffd6d6;padding:8px'>Failed to load "
+                  + escapeHtml(url) + L"</div><div>" + escapeHtml(res.error) + L"</div></body></html>");
     }
-    app.engine->scroll(-1000000000); // back to the top
-    glfwSetWindowTitle(app.window, toUtf8(app.currentUrl + L" - WTEngine").c_str());
-    app.bar.setText(app.currentUrl);
+}
+
+// Back (-1) or forward (+1) through the history; does nothing at either end.
+static void goHistory(App& app, int direction) {
+    app.history.saveScroll(app.engine->getScrollY());
+    const HistoryEntry* entry = direction < 0 ? app.history.back() : app.history.forward();
+    if (entry) showEntry(app, *entry);
 }
 
 // Sends a submitted form: GET puts the fields in the query string, POST in the body.
@@ -97,14 +122,23 @@ static void cursorInFramebuffer(GLFWwindow* window, int& x, int& y) {
 }
 
 static void onMouseButton(GLFWwindow* window, int button, int action, int) {
-    if (button != GLFW_MOUSE_BUTTON_LEFT || action != GLFW_PRESS) return;
+    if (action != GLFW_PRESS) return;
     App* app = static_cast<App*>(glfwGetWindowUserPointer(window));
+
+    // Mouse side buttons: back / forward
+    if (button == GLFW_MOUSE_BUTTON_4) { app->pendingHistory = -1; return; }
+    if (button == GLFW_MOUSE_BUTTON_5) { app->pendingHistory = 1; return; }
+    if (button != GLFW_MOUSE_BUTTON_LEFT) return;
 
     int x, y;
     cursorInFramebuffer(window, x, y);
 
-    // Click on the address bar: focus it / move the caret
+    // Click on the address bar: Back / Forward buttons, or focus the field
     if (y < AddressBar::kHeight) {
+        if (int nav = app->bar.navButtonAt(x, y)) {
+            app->pendingHistory = nav;
+            return;
+        }
         app->engine->blurInput();
         app->bar.onClick(x, *app->renderer, glfwGetTime());
         return;
@@ -138,6 +172,12 @@ static void onKey(GLFWwindow* window, int key, int, int action, int mods) {
     AddressBar& bar = app->bar;
     Engine& engine = *app->engine;
     bool ctrl = (mods & GLFW_MOD_CONTROL) != 0;
+
+    // Alt+Left / Alt+Right: back / forward (works even while typing in a field)
+    if ((mods & GLFW_MOD_ALT) && (key == GLFW_KEY_LEFT || key == GLFW_KEY_RIGHT)) {
+        app->pendingHistory = key == GLFW_KEY_LEFT ? -1 : 1;
+        return;
+    }
 
     // Ctrl+L / F6 jump to the address bar from anywhere
     if ((ctrl && key == GLFW_KEY_L) || key == GLFW_KEY_F6) {
@@ -231,9 +271,15 @@ int wmain(int argc, wchar_t** argv) {
     GLFWcursor* shownCursor = nullptr; // nullptr = default arrow
 
     if (argc > 1) navigate(app, argv[1]);
-    else engine.loadHTML(kDefaultPage);
+    else visitPage(app, L"", kDefaultPage);
 
     while (!glfwWindowShouldClose(window)) {
+        if (app.pendingHistory != 0) {
+            int direction = app.pendingHistory;
+            app.pendingHistory = 0;
+            goHistory(app, direction);
+        }
+
         if (!app.pendingUrl.empty()) {
             std::wstring url = std::move(app.pendingUrl);
             app.pendingUrl.clear();
@@ -253,6 +299,7 @@ int wmain(int argc, wchar_t** argv) {
         engine.onResize(width, height);
         renderer.beginFrame(width, height, 0);
         engine.render(renderer, glfwGetTime());
+        app.bar.setNavEnabled(app.history.canGoBack(), app.history.canGoForward());
         app.bar.draw(renderer, width, glfwGetTime()); // after the page so it covers overscroll
 
         // I-beam over the address bar and text fields, hand over links and
@@ -261,7 +308,7 @@ int wmain(int argc, wchar_t** argv) {
         cursorInFramebuffer(window, cx, cy);
         GLFWcursor* wanted = nullptr;
         if (cy < AddressBar::kHeight) {
-            wanted = ibeamCursor;
+            wanted = app.bar.navButtonAt(cx, cy) ? handCursor : ibeamCursor;
         }
         else {
             switch (engine.cursorAt(cx, cy, renderer)) {
