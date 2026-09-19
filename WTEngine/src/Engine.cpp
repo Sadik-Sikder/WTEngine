@@ -78,7 +78,7 @@ void Engine::doLayout() {
     }
 
     // Clamp scroll
-    int maxScroll = documentHeight - height;
+    int maxScroll = documentHeight - viewHeight();
     if (maxScroll < 0) maxScroll = 0;
 
     if (scrollY > maxScroll) scrollY = maxScroll;
@@ -92,7 +92,7 @@ int Engine::getDocumentHeight() const {
 void Engine::scroll(int delta) {
     scrollY += delta;
 
-    int maxScroll = documentHeight - height;
+    int maxScroll = documentHeight - viewHeight();
     if (maxScroll < 0) maxScroll = 0;
 
     scrollY = std::max(0, std::min(scrollY, maxScroll));
@@ -104,10 +104,10 @@ void Engine::render(Renderer& renderer) {
 
     for (const auto& b : layoutRoot.boxes) {
 
-        int screenY = b.y - scrollY;
+        int screenY = b.y - scrollY + topInset;
 
         // Cull boxes outside viewport
-        if (screenY + b.height < 0 || screenY > height)
+        if (screenY + b.height < topInset || screenY > height)
             continue;
 
         // Draw background
@@ -135,7 +135,8 @@ void Engine::render(Renderer& renderer) {
 }
 
 std::wstring Engine::linkAt(int x, int y, Renderer& renderer) const {
-    int docY = y + scrollY;
+    if (y < topInset) return L"";
+    int docY = y - topInset + scrollY;
 
     // Later boxes paint on top, so check them first.
     for (auto it = layoutRoot.boxes.rbegin(); it != layoutRoot.boxes.rend(); ++it) {
@@ -151,4 +152,9 @@ std::wstring Engine::linkAt(int x, int y, Renderer& renderer) const {
             return b.href;
     }
     return L"";
+}
+
+void Engine::setTopInset(int px) {
+    topInset = px;
+    doLayout(); // re-clamp scroll for the new viewport height
 }

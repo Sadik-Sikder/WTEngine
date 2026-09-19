@@ -2,6 +2,7 @@
 #include <GLFW/glfw3.h>
 #include <windows.h>
 #include <string>
+#include "AddressBar.h"
 #include "Engine.h"
 #include "Fetcher.h"
 #include "OpenGLRenderer.h"
@@ -17,6 +18,7 @@ struct App {
     GLFWwindow* window = nullptr;
     Engine* engine = nullptr;
     OpenGLRenderer* renderer = nullptr;
+    AddressBar bar;
     std::wstring currentUrl;
     std::wstring pendingUrl; // set by input callbacks, handled in the main loop
 };
@@ -26,6 +28,14 @@ static std::string toUtf8(const std::wstring& w) {
     int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
     std::string out(n, '\0');
     WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+static std::wstring fromUtf8(const char* s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0); // includes the terminator
+    if (n <= 1) return L"";
+    std::wstring out(n - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s, -1, out.data(), n);
     return out;
 }
 
@@ -54,6 +64,7 @@ static void navigate(App& app, const std::wstring& url) {
     }
     app.engine->scroll(-1000000000); // back to the top
     glfwSetWindowTitle(app.window, toUtf8(app.currentUrl + L" - WTEngine").c_str());
+    app.bar.setText(app.currentUrl);
 }
 
 // Cursor position in framebuffer pixels (matches the engine's coordinate space).
@@ -75,11 +86,66 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
 
     int x, y;
     cursorInFramebuffer(window, x, y);
+
+    // Click on the address bar: focus it / move the caret
+    if (y < AddressBar::kHeight) {
+        app->bar.onClick(x, *app->renderer);
+        return;
+    }
+
+    // Click anywhere else: leave the bar and discard unsent edits
+    if (app->bar.focused()) {
+        app->bar.blur();
+        app->bar.setText(app->currentUrl);
+    }
+
     std::wstring href = app->engine->linkAt(x, y, *app->renderer);
     if (href.empty()) return;
 
     std::wstring target = resolveUrl(app->currentUrl, href);
     if (!target.empty()) app->pendingUrl = target;
+}
+
+static void onChar(GLFWwindow* window, unsigned int codepoint) {
+    App* app = static_cast<App*>(glfwGetWindowUserPointer(window));
+    if (app->bar.focused()) app->bar.onChar(codepoint);
+}
+
+static void onKey(GLFWwindow* window, int key, int, int action, int mods) {
+    if (action == GLFW_RELEASE) return; // PRESS and REPEAT both edit
+    App* app = static_cast<App*>(glfwGetWindowUserPointer(window));
+    AddressBar& bar = app->bar;
+    bool ctrl = (mods & GLFW_MOD_CONTROL) != 0;
+
+    // Ctrl+L / F6 jump to the address bar from anywhere
+    if ((ctrl && key == GLFW_KEY_L) || key == GLFW_KEY_F6) {
+        bar.focus();
+        return;
+    }
+    if (!bar.focused()) return;
+
+    if (ctrl && key == GLFW_KEY_V) {
+        const char* clip = glfwGetClipboardString(window);
+        if (clip) bar.insert(fromUtf8(clip));
+    }
+    else if (ctrl && key == GLFW_KEY_A) {
+        bar.selectAll();
+    }
+    else if (ctrl && key == GLFW_KEY_C) {
+        if (bar.allSelected()) glfwSetClipboardString(window, toUtf8(bar.text()).c_str());
+    }
+    else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) {
+        std::wstring target = AddressBar::normalizeInput(bar.text());
+        bar.blur();
+        if (!target.empty()) app->pendingUrl = target;
+    }
+    else if (key == GLFW_KEY_ESCAPE) {
+        bar.blur();
+        bar.setText(app->currentUrl); // discard edits
+    }
+    else {
+        bar.onEditKey(key);
+    }
 }
 
 static void onScroll(GLFWwindow* window, double, double yoffset) {
@@ -109,9 +175,14 @@ int wmain(int argc, wchar_t** argv) {
     glfwSetWindowUserPointer(window, &app);
     glfwSetMouseButtonCallback(window, onMouseButton);
     glfwSetScrollCallback(window, onScroll);
+    glfwSetCharCallback(window, onChar);
+    glfwSetKeyCallback(window, onKey);
+
+    engine.setTopInset(AddressBar::kHeight); // page starts below the address bar
 
     GLFWcursor* handCursor = glfwCreateStandardCursor(GLFW_HAND_CURSOR);
-    bool handShown = false;
+    GLFWcursor* ibeamCursor = glfwCreateStandardCursor(GLFW_IBEAM_CURSOR);
+    GLFWcursor* shownCursor = nullptr; // nullptr = default arrow
 
     if (argc > 1) navigate(app, argv[1]);
     else engine.loadHTML(kDefaultPage);
@@ -133,14 +204,17 @@ int wmain(int argc, wchar_t** argv) {
         engine.onResize(width, height);
         renderer.beginFrame(width, height, 0);
         engine.render(renderer);
+        app.bar.draw(renderer, width, glfwGetTime()); // after the page so it covers overscroll
 
-        // Hand cursor while hovering a link
+        // I-beam over the address bar, hand over links, arrow elsewhere
         int cx, cy;
         cursorInFramebuffer(window, cx, cy);
-        bool overLink = !engine.linkAt(cx, cy, renderer).empty();
-        if (overLink != handShown) {
-            glfwSetCursor(window, overLink ? handCursor : nullptr);
-            handShown = overLink;
+        GLFWcursor* wanted = nullptr;
+        if (cy < AddressBar::kHeight) wanted = ibeamCursor;
+        else if (!engine.linkAt(cx, cy, renderer).empty()) wanted = handCursor;
+        if (wanted != shownCursor) {
+            glfwSetCursor(window, wanted);
+            shownCursor = wanted;
         }
 
         glfwSwapBuffers(window);
@@ -148,6 +222,7 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     glfwDestroyCursor(handCursor);
+    glfwDestroyCursor(ibeamCursor);
     glfwTerminate();
     return 0;
 }

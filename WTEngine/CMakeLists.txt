@@ -9,6 +9,7 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 
 add_executable(WTEngine
+    src/AddressBar.cpp
     src/Engine.cpp
     src/Fetcher.cpp
     src/HTMLParser.cpp

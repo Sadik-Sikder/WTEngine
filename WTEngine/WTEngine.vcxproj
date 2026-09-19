@@ -129,6 +129,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\AddressBar.cpp" />
     <ClCompile Include="src\Engine.cpp" />
     <ClCompile Include="src\Fetcher.cpp" />
     <ClCompile Include="src\HTMLParser.cpp" />
@@ -137,6 +138,7 @@
     <ClCompile Include="src\OpenGLRenderer.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="include\AddressBar.h" />
     <ClInclude Include="include\DOM.h" />
     <ClInclude Include="include\Engine.h" />
     <ClInclude Include="include\Fetcher.h" />
