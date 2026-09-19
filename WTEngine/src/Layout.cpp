@@ -26,6 +26,67 @@ int LayoutRoot::parseFontSize(const std::wstring& s, int def) {
     return def;
 }
 
+float LayoutRoot::textWidth(const std::wstring& text, int fontSize) {
+    if (measureText) return measureText(text, fontSize);
+    return text.size() * fontSize * 0.55f; // rough fallback
+}
+
+// Word-wraps `text` to `containingWidth`, emitting one box per line. Text has
+// no background of its own: it sits on whatever its container already painted.
+void LayoutRoot::layoutText(const std::wstring& text, int x, int& y, int containingWidth) {
+    const int fontSize = 14;
+    const int lineHeight = 22;
+    const int textInset = 4; // Engine::render draws text 4px inside its box
+    const int paraGap = 6;
+    // Keep a sane minimum so deeply nested content can't wrap per character.
+    const float maxWidth = (float)std::max(containingWidth - 2 * textInset, 40);
+
+    auto emit = [&](const std::wstring& line) {
+        LayoutBox box;
+        box.x = x;
+        box.y = y;
+        box.width = containingWidth;
+        box.height = lineHeight;
+        box.text = line;
+        box.href = currentHref;
+        box.fontSize = fontSize;
+        boxes.push_back(box);
+        y += lineHeight;
+    };
+
+    std::wstring line;
+    size_t i = 0;
+    while (i < text.size()) {
+        // Next word (a run of non-space characters)
+        while (i < text.size() && iswspace(text[i])) i++;
+        size_t start = i;
+        while (i < text.size() && !iswspace(text[i])) i++;
+        if (start == i) break;
+        std::wstring word = text.substr(start, i - start);
+
+        std::wstring candidate = line.empty() ? word : line + L" " + word;
+        if (textWidth(candidate, fontSize) <= maxWidth) {
+            line = candidate;
+            continue;
+        }
+
+        // Doesn't fit: flush the current line and start a new one.
+        if (!line.empty()) { emit(line); line.clear(); }
+
+        // A single word wider than the line gets broken by characters.
+        while (textWidth(word, fontSize) > maxWidth && word.size() > 1) {
+            size_t n = 1;
+            while (n < word.size() && textWidth(word.substr(0, n + 1), fontSize) <= maxWidth) n++;
+            emit(word.substr(0, n));
+            word.erase(0, n);
+        }
+        line = word;
+    }
+    if (!line.empty()) emit(line);
+
+    y += paraGap;
+}
+
 void LayoutRoot::layout() {
     boxes.clear();
     if (!rootNode) return;
@@ -43,22 +104,19 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth) 
         // Case 1: Text node (simple paragraph text)
         if (child->type == Node::TEXT) {
             auto tnode = static_cast<TextNode*>(child.get());
-            LayoutBox box;
-            box.x = x;
-            box.y = y;
-            box.width = containingWidth;
-            box.text = tnode->text;
-            box.fontSize = 14;
-            box.height = 22;
-            box.background = L"#ffffff"; // white background for text nodes
-            boxes.push_back(box);
-            y += box.height + 6;
+            layoutText(tnode->text, x, y, containingWidth);
         }
 
         //  Case 2: Element node (<div>, <p>, <span>, etc.)
         else if (child->type == Node::ELEMENT) {
             auto e = static_cast<Element*>(child.get());
-            std::wstring tag = e->tag;
+
+            // Non-visual elements produce no boxes and take no space.
+            if (e->tag == L"head" || e->tag == L"script" || e->tag == L"style" ||
+                e->tag == L"title" || e->tag == L"meta" || e->tag == L"link" ||
+                e->tag == L"base" || e->tag == L"noscript")
+                continue;
+
             std::wstring style = getAttr(e, L"style", L"");
 
             // default style values
@@ -84,45 +142,49 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth) 
                 trim(k); trim(v);
 
                 if (k == L"background" || k == L"background-color") bg = v;
-                else if (k == L"margin-top") marginTop = std::stoi(std::string(v.begin(), v.end()));
-                else if (k == L"margin-bottom") marginBottom = std::stoi(std::string(v.begin(), v.end()));
-                else if (k == L"padding") padding = std::stoi(std::string(v.begin(), v.end()));
+                else if (k == L"margin-top") marginTop = parseFontSize(v, 6);
+                else if (k == L"margin-bottom") marginBottom = parseFontSize(v, 6);
+                else if (k == L"padding") padding = parseFontSize(v, 6);
                 else if (k == L"font-size") fontSize = parseFontSize(v, 14);
             }
 
             y += marginTop;
+            int contentStartY = y;
 
-            // Combine all direct text children into one string
-            std::wstring combined;
-            for (auto& gc : e->children) {
-                if (gc->type == Node::TEXT)
-                    combined += static_cast<TextNode*>(gc.get())->text + L" ";
-                else if (gc->type == Node::ELEMENT) {
-                    auto gel = static_cast<Element*>(gc.get());
-                    // Inline elements like <span>
-                    if (gel->tag == L"span" && !gel->children.empty() && gel->children[0]->type == Node::TEXT)
-                        combined += static_cast<TextNode*>(gel->children[0].get())->text + L" ";
-                }
+            // Reserve a background box now (before laying out children) so it
+            // paints behind them, but only if this element actually declared
+            // one — plain structural wrappers like <html>/<body> get no box
+            // at all, they just position their children.
+            size_t bgIndex = static_cast<size_t>(-1);
+            if (!bg.empty()) {
+                LayoutBox box;
+                box.x = x;
+                box.y = contentStartY;
+                box.width = containingWidth;
+                box.height = 0; // filled in below once children are laid out
+                box.background = bg;
+                bgIndex = boxes.size();
+                boxes.push_back(box);
             }
 
-            // Create box for this element
-            LayoutBox box;
-            box.x = x;
-            box.y = y;
-            box.width = containingWidth;
-            box.fontSize = fontSize;
-            box.background = bg.empty() ? L"#e0e0e0" : bg;
-            box.text = combined.empty() ? (L"[" + tag + L"]") : combined;
+            y += padding;
 
-            // Estimate height (roughly 1 line per 30 chars)
-            int lines = std::max(1, (int)(box.text.size() / 30));
-            box.height = padding * 2 + lines * (fontSize + 6);
-
-            boxes.push_back(box);
-            y += box.height + marginBottom;
-
-            // Recurse into nested elements
+            // Recurse into nested elements/text
+            std::wstring savedHref = currentHref;
+            if (e->tag == L"a") {
+                auto href = e->attrs.find(L"href");
+                if (href != e->attrs.end()) currentHref = href->second;
+            }
             layoutElement(e, x + padding, y, containingWidth - 2 * padding);
+            currentHref = savedHref;
+
+            y += padding;
+
+            if (bgIndex != static_cast<size_t>(-1)) {
+                boxes[bgIndex].height = y - contentStartY;
+            }
+
+            y += marginBottom;
         }
     }
 }

@@ -130,6 +130,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\Engine.cpp" />
+    <ClCompile Include="src\Fetcher.cpp" />
     <ClCompile Include="src\HTMLParser.cpp" />
     <ClCompile Include="src\Layout.cpp" />
     <ClCompile Include="src\main.cpp" />
@@ -138,6 +139,7 @@
   <ItemGroup>
     <ClInclude Include="include\DOM.h" />
     <ClInclude Include="include\Engine.h" />
+    <ClInclude Include="include\Fetcher.h" />
     <ClInclude Include="include\HTMLParser.h" />
     <ClInclude Include="include\Layout.h" />
     <ClInclude Include="include\OpenGLRenderer.h" />

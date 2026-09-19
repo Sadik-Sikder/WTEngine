@@ -26,9 +26,18 @@ Color parseColor(const std::wstring& str) {
 Engine::Engine(int w, int h)
     : width(w), height(h) {
     layoutRoot.viewportWidth = width;
+    layoutRoot.measureText = [this](const std::wstring& text, int fontSize) {
+        return measurer ? measurer->measureText(text, (float)fontSize)
+                        : text.size() * fontSize * 0.55f;
+    };
 }
 
 Engine::~Engine() {}
+
+void Engine::setRenderer(Renderer* r) {
+    measurer = r;
+    doLayout(); // re-wrap with real text metrics
+}
 
 void Engine::loadHTML(const std::wstring& html) {
     parseAndBuild(html);
@@ -45,6 +54,7 @@ void Engine::parseAndBuild(const std::wstring& html) {
 }
 
 void Engine::onResize(int w, int h) {
+    if (w == width && h == height) return; // nothing to re-wrap
     width = w;
     height = h;
 
@@ -118,8 +128,27 @@ void Engine::render(Renderer& renderer) {
                 screenY + 4,
                 b.text,
                 b.fontSize > 0 ? b.fontSize : 14,
-                { 0, 0, 0, 1 } // black text
+                b.href.empty() ? Color{ 0, 0, 0, 1 } : Color{ 0.0f, 0.2f, 0.8f, 1.0f } // links are blue
             );
         }
     }
+}
+
+std::wstring Engine::linkAt(int x, int y, Renderer& renderer) const {
+    int docY = y + scrollY;
+
+    // Later boxes paint on top, so check them first.
+    for (auto it = layoutRoot.boxes.rbegin(); it != layoutRoot.boxes.rend(); ++it) {
+        const auto& b = *it;
+        if (b.href.empty() || b.text.empty()) continue;
+
+        // Text is drawn at (x + 4, y + 4) and is only as wide as its glyphs,
+        // so hit-test that area rather than the whole row.
+        float fontSize = b.fontSize > 0 ? b.fontSize : 14;
+        int textW = static_cast<int>(renderer.measureText(b.text, fontSize));
+        int left = b.x + 4, top = b.y + 4;
+        if (x >= left && x < left + textW && docY >= top && docY < top + b.height)
+            return b.href;
+    }
+    return L"";
 }

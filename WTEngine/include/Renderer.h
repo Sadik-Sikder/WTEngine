@@ -16,4 +16,5 @@ public:
     virtual void drawRect(float x, float y, float w, float h, Color color) = 0;
     virtual void drawText(float x, float y, const std::wstring& text,
         float fontSize, Color color) = 0;
+    virtual float measureText(const std::wstring& text, float fontSize) = 0;
 };
