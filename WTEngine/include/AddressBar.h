@@ -34,6 +34,12 @@ public:
     // succession selects the word under the pointer.
     void onClick(int x, Renderer& renderer, double timeSeconds);
 
+    // Back / Forward buttons drawn to the left of the field.
+    void setNavEnabled(bool canGoBack, bool canGoForward) { canBack_ = canGoBack; canForward_ = canGoForward; }
+    // Returns -1 (back) or +1 (forward) if window point (x, y) is on an enabled
+    // button, otherwise 0.
+    int navButtonAt(int x, int y) const;
+
     void draw(Renderer& renderer, int windowWidth, double timeSeconds);
 
     // Turns what the user typed into something fetchPage can load:
@@ -43,5 +49,7 @@ public:
 private:
     TextEditor ed_;
     bool focused_ = false;
+    bool canBack_ = false;
+    bool canForward_ = false;
     float scrollX_ = 0; // horizontal scroll of the text inside the field
 };

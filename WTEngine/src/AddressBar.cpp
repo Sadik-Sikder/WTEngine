@@ -8,9 +8,17 @@
 #include <cwctype>
 
 namespace {
-    const int kFieldX = 10;     // field's left edge
+    // Arrow glyphs are spelled as numbers so the source file encoding can not garble them.
+    const wchar_t kArrowLeft[] = { 0x2190, 0 };
+    const wchar_t kArrowRight[] = { 0x2192, 0 };
+
+    const int kNavSize = 28;    // Back / Forward buttons are kNavSize wide
+    const int kNavBackX = 10;
+    const int kNavFwdX = kNavBackX + kNavSize + 4;
+    const int kFieldX = kNavFwdX + kNavSize + 8; // field's left edge (right of the buttons)
     const int kFieldY = 6;
     const int kFieldH = 28;
+    const int kBarMargin = 10;  // gap to the window's right edge
     const int kTextPad = 8;     // gap between field edge and text
     const float kFontSize = 15;
     const int kTextTop = 4;     // text is drawn this far below the field's top
@@ -49,8 +57,15 @@ void AddressBar::onClick(int x, Renderer& renderer, double now) {
     else ed_.placeCaretAt(localX, renderer, kFontSize);
 }
 
+int AddressBar::navButtonAt(int x, int y) const {
+    if (y < kFieldY || y >= kFieldY + kFieldH) return 0;
+    if (canBack_ && x >= kNavBackX && x < kNavBackX + kNavSize) return -1;
+    if (canForward_ && x >= kNavFwdX && x < kNavFwdX + kNavSize) return 1;
+    return 0;
+}
+
 void AddressBar::draw(Renderer& r, int windowWidth, double t) {
-    const int fieldW = std::max(windowWidth - 2 * kFieldX, 50);
+    const int fieldW = std::max(windowWidth - kFieldX - kBarMargin, 50);
     const int viewW = fieldW - 2 * kTextPad; // visible text area
     const std::wstring& text = ed_.text();
 
@@ -64,6 +79,17 @@ void AddressBar::draw(Renderer& r, int windowWidth, double t) {
 
     // Bar background, then the field with a border
     r.drawRect(0, 0, (float)windowWidth, (float)kHeight, kBarBg);
+
+    // Back / Forward buttons: arrows, grayed out when there's nowhere to go
+    auto navButton = [&](int x, const wchar_t* arrow, bool enabled) {
+        r.drawRect((float)x - 1, (float)kFieldY - 1, (float)kNavSize + 2, (float)kFieldH + 2, kBorder);
+        r.drawRect((float)x, (float)kFieldY, (float)kNavSize, (float)kFieldH, kField);
+        float w = r.measureText(arrow, 16);
+        r.drawText(x + (kNavSize - w) / 2, (float)kFieldY + 3, arrow, 16, enabled ? kInk : kPlaceholder);
+    };
+    navButton(kNavBackX, kArrowLeft, canBack_);
+    navButton(kNavFwdX, kArrowRight, canForward_);
+
     r.drawRect((float)kFieldX - 1, (float)kFieldY - 1, (float)fieldW + 2, (float)kFieldH + 2,
                focused_ ? kBorderFocus : kBorder);
     r.drawRect((float)kFieldX, (float)kFieldY, (float)fieldW, (float)kFieldH, kField);

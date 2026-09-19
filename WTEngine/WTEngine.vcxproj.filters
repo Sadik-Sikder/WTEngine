@@ -53,6 +53,9 @@
     <ClInclude Include="include\Engine.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="include\PageHistory.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="include\TextEditor.h">
       <Filter>Header Files</Filter>
     </ClInclude>

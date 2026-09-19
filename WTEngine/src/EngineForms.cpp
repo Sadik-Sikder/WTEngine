@@ -234,7 +234,7 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
         }
         else {
             shown = attrOf(b.el, L"value");
-            if (isPassword(b.el)) shown.assign(shown.size(), L'•');
+            if (isPassword(b.el)) shown.assign(shown.size(), (wchar_t)0x2022); // bullet
         }
 
         r.setClip(fx + 1, fy + 1, fw - 2, fh - 2); // long text scrolls inside the field
