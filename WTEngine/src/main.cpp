@@ -10,8 +10,13 @@
 static const wchar_t* kDefaultPage =
     L"<html><head><title>WTEngine</title></head><body>"
     L"<div style='background:#cfe8ff;padding:8px'>Hello OpenGL!</div>"
-    L"<div style='padding:8px'>Pass a URL as the first argument, or click a link:</div>"
+    L"<div style='padding:8px'>Type a URL above, click a link, or try the form:</div>"
     L"<div><a href='https://example.com/'>https://example.com/</a></div>"
+    L"<form action='https://duckduckgo.com/html/' method='get'>"
+    L"<div>Search DuckDuckGo:</div>"
+    L"<input name='q' placeholder='Type a query and press Enter'>"
+    L"<input type='submit' value='Search'>"
+    L"</form>"
     L"</body></html>";
 
 struct App {
@@ -50,9 +55,10 @@ static std::wstring escapeHtml(const std::wstring& in) {
     return out;
 }
 
-// Loads `url` into the engine, or shows an error page if the fetch fails.
-static void navigate(App& app, const std::wstring& url) {
-    FetchResult res = fetchPage(url);
+// Loads `url` into the engine (as a POST if `postBody` is given), or shows an
+// error page if the fetch fails.
+static void navigate(App& app, const std::wstring& url, const std::string* postBody = nullptr) {
+    FetchResult res = fetchPage(url, postBody);
     if (res.ok) {
         app.currentUrl = res.finalUrl.empty() ? url : res.finalUrl;
         app.engine->loadHTML(res.html);
@@ -65,6 +71,16 @@ static void navigate(App& app, const std::wstring& url) {
     app.engine->scroll(-1000000000); // back to the top
     glfwSetWindowTitle(app.window, toUtf8(app.currentUrl + L" - WTEngine").c_str());
     app.bar.setText(app.currentUrl);
+}
+
+// Sends a submitted form: GET puts the fields in the query string, POST in the body.
+static void submitForm(App& app, const FormSubmission& form) {
+    std::wstring target = form.action.empty() ? app.currentUrl : resolveUrl(app.currentUrl, form.action);
+    if (target.rfind(L"http://", 0) != 0 && target.rfind(L"https://", 0) != 0)
+        return; // forms need a web page to send to (not a local file)
+
+    if (form.post) navigate(app, target, &form.body);
+    else navigate(app, withQuery(target, form.body));
 }
 
 // Cursor position in framebuffer pixels (matches the engine's coordinate space).
@@ -89,7 +105,8 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
 
     // Click on the address bar: focus it / move the caret
     if (y < AddressBar::kHeight) {
-        app->bar.onClick(x, *app->renderer);
+        app->engine->blurInput();
+        app->bar.onClick(x, *app->renderer, glfwGetTime());
         return;
     }
 
@@ -98,6 +115,9 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
         app->bar.blur();
         app->bar.setText(app->currentUrl);
     }
+
+    // Form controls first (focus a field, toggle a checkbox, press a button)
+    if (app->engine->onClick(x, y, glfwGetTime(), *app->renderer)) return;
 
     std::wstring href = app->engine->linkAt(x, y, *app->renderer);
     if (href.empty()) return;
@@ -109,42 +129,68 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
 static void onChar(GLFWwindow* window, unsigned int codepoint) {
     App* app = static_cast<App*>(glfwGetWindowUserPointer(window));
     if (app->bar.focused()) app->bar.onChar(codepoint);
+    else app->engine->onChar(codepoint);
 }
 
 static void onKey(GLFWwindow* window, int key, int, int action, int mods) {
     if (action == GLFW_RELEASE) return; // PRESS and REPEAT both edit
     App* app = static_cast<App*>(glfwGetWindowUserPointer(window));
     AddressBar& bar = app->bar;
+    Engine& engine = *app->engine;
     bool ctrl = (mods & GLFW_MOD_CONTROL) != 0;
 
     // Ctrl+L / F6 jump to the address bar from anywhere
     if ((ctrl && key == GLFW_KEY_L) || key == GLFW_KEY_F6) {
+        engine.blurInput();
         bar.focus();
         return;
     }
-    if (!bar.focused()) return;
 
-    if (ctrl && key == GLFW_KEY_V) {
+    // Keys go to whichever text field has focus: the address bar or a page input
+    bool inBar = bar.focused();
+    if (!inBar && !engine.hasFocusedInput()) return;
+
+    if (key == GLFW_KEY_TAB && !inBar) {
+        engine.focusNextInput((mods & GLFW_MOD_SHIFT) != 0);
+    }
+    else if (ctrl && key == GLFW_KEY_V) {
         const char* clip = glfwGetClipboardString(window);
-        if (clip) bar.insert(fromUtf8(clip));
+        if (clip) {
+            if (inBar) bar.insert(fromUtf8(clip));
+            else engine.insertText(fromUtf8(clip));
+        }
     }
     else if (ctrl && key == GLFW_KEY_A) {
-        bar.selectAll();
+        if (inBar) bar.selectAll();
+        else engine.selectAllInput();
     }
     else if (ctrl && key == GLFW_KEY_C) {
-        if (bar.allSelected()) glfwSetClipboardString(window, toUtf8(bar.text()).c_str());
+        std::wstring selection = inBar ? (bar.hasSelection() ? bar.selectedText() : L"")
+                                       : engine.focusedSelection();
+        if (!selection.empty()) glfwSetClipboardString(window, toUtf8(selection).c_str());
     }
     else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) {
-        std::wstring target = AddressBar::normalizeInput(bar.text());
-        bar.blur();
-        if (!target.empty()) app->pendingUrl = target;
+        if (inBar) {
+            std::wstring target = AddressBar::normalizeInput(bar.text());
+            bar.blur();
+            if (!target.empty()) app->pendingUrl = target;
+        }
+        else {
+            engine.submitFocused(); // queues the form; the main loop sends it
+        }
     }
     else if (key == GLFW_KEY_ESCAPE) {
-        bar.blur();
-        bar.setText(app->currentUrl); // discard edits
+        if (inBar) {
+            bar.blur();
+            bar.setText(app->currentUrl); // discard edits
+        }
+        else {
+            engine.blurInput();
+        }
     }
     else {
-        bar.onEditKey(key);
+        if (inBar) bar.onEditKey(key);
+        else engine.onEditKey(key);
     }
 }
 
@@ -194,6 +240,9 @@ int wmain(int argc, wchar_t** argv) {
             navigate(app, url);
         }
 
+        FormSubmission form;
+        if (engine.takeSubmission(form)) submitForm(app, form);
+
         int width, height;
         glfwGetFramebufferSize(window, &width, &height);
         glViewport(0, 0, width, height);
@@ -203,15 +252,24 @@ int wmain(int argc, wchar_t** argv) {
 
         engine.onResize(width, height);
         renderer.beginFrame(width, height, 0);
-        engine.render(renderer);
+        engine.render(renderer, glfwGetTime());
         app.bar.draw(renderer, width, glfwGetTime()); // after the page so it covers overscroll
 
-        // I-beam over the address bar, hand over links, arrow elsewhere
+        // I-beam over the address bar and text fields, hand over links and
+        // buttons, arrow elsewhere
         int cx, cy;
         cursorInFramebuffer(window, cx, cy);
         GLFWcursor* wanted = nullptr;
-        if (cy < AddressBar::kHeight) wanted = ibeamCursor;
-        else if (!engine.linkAt(cx, cy, renderer).empty()) wanted = handCursor;
+        if (cy < AddressBar::kHeight) {
+            wanted = ibeamCursor;
+        }
+        else {
+            switch (engine.cursorAt(cx, cy, renderer)) {
+            case Engine::Cursor::IBeam: wanted = ibeamCursor; break;
+            case Engine::Cursor::Hand:  wanted = handCursor;  break;
+            default: break;
+            }
+        }
         if (wanted != shownCursor) {
             glfwSetCursor(window, wanted);
             shownCursor = wanted;

@@ -11,6 +11,8 @@ endif()
 add_executable(WTEngine
     src/AddressBar.cpp
     src/Engine.cpp
+    src/EngineForms.cpp
+    src/TextEditor.cpp
     src/Fetcher.cpp
     src/HTMLParser.cpp
     src/Layout.cpp

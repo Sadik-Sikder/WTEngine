@@ -5,6 +5,15 @@
 #include <vector>
 #include "DOM.h"
 #include "Layout.h"
+#include "TextEditor.h"
+
+// A form the user submitted. The caller resolves `action` against the current
+// page's URL and performs the request.
+struct FormSubmission {
+    std::wstring action; // the form's action attribute (may be empty or relative)
+    bool post = false;
+    std::string body;    // application/x-www-form-urlencoded fields
+};
 
 class Renderer;
 class Engine {
@@ -17,11 +26,33 @@ public:
     void setRenderer(Renderer* r); // used to measure text for wrapping
     void setTopInset(int px);      // reserve space above the page (e.g. for the address bar)
     void scroll(int delta);
-    void render(Renderer& renderer);
+    void render(Renderer& renderer, double timeSeconds = 0);
     int getDocumentHeight() const;
 
     // Returns the href of the link under window-space point (x, y), or empty.
     std::wstring linkAt(int x, int y, Renderer& renderer) const;
+
+    // --- Form controls -------------------------------------------------
+    enum class Cursor { Arrow, Hand, IBeam };
+    Cursor cursorAt(int x, int y, Renderer& renderer) const;
+
+    // Handles a click at window (x, y): focuses a text field, toggles a
+    // checkbox, or presses a button. Returns true if a control was hit;
+    // otherwise any focused field loses focus.
+    bool onClick(int x, int y, double timeSeconds, Renderer& renderer);
+
+    bool hasFocusedInput() const { return focusedEl != nullptr; }
+    void blurInput();
+    void onChar(unsigned int codepoint);
+    void insertText(const std::wstring& s);
+    bool onEditKey(int key);
+    void selectAllInput();
+    std::wstring focusedSelection() const; // empty for password fields
+    void focusNextInput(bool backwards);   // Tab / Shift+Tab
+    void submitFocused();                  // Enter in a text field
+
+    // Retrieves (and clears) a submission queued by a button press or Enter.
+    bool takeSubmission(FormSubmission& out);
 
 private:
     int width, height, documentHeight = 0;
@@ -33,6 +64,21 @@ private:
     LayoutRoot layoutRoot;
     Renderer* measurer = nullptr;
 
+    // Form state. The focused field's text lives in `editor` while editing
+    // and is copied back to the element's "value" attribute after each edit.
+    Element* focusedEl = nullptr;
+    Element* focusedForm = nullptr;
+    TextEditor editor;
+    float inputScrollX = 0;
+    bool hasSubmission = false;
+    FormSubmission submission;
+
     void parseAndBuild(const std::wstring& html);
     void doLayout();
+
+    const LayoutBox* controlAt(int x, int y) const;
+    void focusInput(const LayoutBox& box);
+    void syncValue();
+    void queueSubmit(Element* form, Element* submitter);
+    void drawControl(Renderer& renderer, const LayoutBox& box, int screenY, double timeSeconds);
 };

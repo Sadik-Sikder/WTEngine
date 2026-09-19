@@ -17,4 +17,8 @@ public:
     virtual void drawText(float x, float y, const std::wstring& text,
         float fontSize, Color color) = 0;
     virtual float measureText(const std::wstring& text, float fontSize) = 0;
+
+    // Restrict drawing to a rectangle (window coordinates, y down) until clearClip().
+    virtual void setClip(float x, float y, float w, float h) = 0;
+    virtual void clearClip() = 0;
 };
