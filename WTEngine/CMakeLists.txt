@@ -10,6 +10,7 @@ endif()
 
 add_executable(WTEngine
     src/AddressBar.cpp
+    src/CSS.cpp
     src/Engine.cpp
     src/EngineForms.cpp
     src/TextEditor.cpp

@@ -1,5 +1,6 @@
 // HTMLParser.cpp
 #include "HTMLParser.h"
+#include "CSS.h"
 #include <cwctype>
 #include <set>
 
@@ -129,6 +130,7 @@ std::shared_ptr<Element> HTMLParser::parseElement() {
     if (isRawTextTag(name)) {
         // Skip everything up to the matching (case-insensitive) end tag.
         std::wstring closer = L"</" + name;
+        size_t start = pos; // raw content begins here
         size_t p = pos;
         while (p < s.size()) {
             p = s.find(L"</", p);
@@ -138,6 +140,11 @@ std::shared_ptr<Element> HTMLParser::parseElement() {
                 if (towlower(s[p + i]) != closer[i]) match = false;
             if (match) break;
             p += 2;
+        }
+        // <style> content is kept (as plain text, no entity decoding) so the
+        // stylesheet can be parsed later; script/title/textarea are dropped.
+        if (name == L"style" && p != std::wstring::npos && p > start) {
+            elem->children.push_back(std::make_shared<TextNode>(s.substr(start, p - start)));
         }
         if (p == std::wstring::npos) { pos = s.size(); return elem; }
         size_t gt = s.find(L'>', p);
@@ -198,6 +205,22 @@ std::shared_ptr<Node> HTMLParser::parseNode() {
     return nullptr;
 }
 
+// Collects the text of every <style> element under `el` (including `el`
+// itself), in document order, for the caller to parse as one stylesheet.
+static void collectStyleText(const std::shared_ptr<Element>& el, std::wstring& out) {
+    if (!el) return;
+    if (el->tag == L"style") {
+        for (auto& child : el->children) {
+            if (child->type == Node::TEXT) out += static_cast<TextNode*>(child.get())->text;
+        }
+        out += L"\n";
+        return;
+    }
+    for (auto& child : el->children) {
+        if (child->type == Node::ELEMENT) collectStyleText(std::static_pointer_cast<Element>(child), out);
+    }
+}
+
 // Searches an element and all its descendants (not just direct children)
 // for a <body> tag, since <body> is normally nested inside <html>.
 static std::shared_ptr<Element> findBody(const std::shared_ptr<Element>& el) {
@@ -241,5 +264,10 @@ std::shared_ptr<Document> HTMLParser::parse(const std::wstring& html) {
         for (auto& e : top) body->children.push_back(e);
         doc->body = body;
     }
+
+    std::wstring cssText;
+    for (auto& e : top) collectStyleText(e, cssText);
+    doc->styles = CSS::parseStylesheet(cssText);
+
     return doc;
 }

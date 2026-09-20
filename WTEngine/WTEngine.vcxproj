@@ -130,6 +130,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\AddressBar.cpp" />
+    <ClCompile Include="src\CSS.cpp" />
     <ClCompile Include="src\Engine.cpp" />
     <ClCompile Include="src\EngineForms.cpp" />
     <ClCompile Include="src\TextEditor.cpp" />
@@ -141,6 +142,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\AddressBar.h" />
+    <ClInclude Include="include\CSS.h" />
     <ClInclude Include="include\DOM.h" />
     <ClInclude Include="include\Engine.h" />
     <ClInclude Include="include\PageHistory.h" />

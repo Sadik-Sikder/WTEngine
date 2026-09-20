@@ -6,6 +6,10 @@ struct Color {
     float r, g, b, a;
 };
 
+// Parses a CSS-style "#rrggbb" color; anything else (empty, malformed, a
+// named color) falls back to light gray. Defined in Engine.cpp.
+Color parseColor(const std::wstring& str);
+
 class Renderer {
 public:
     virtual ~Renderer() = default;

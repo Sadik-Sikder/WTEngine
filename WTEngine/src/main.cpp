@@ -1,6 +1,8 @@
 #define NOMINMAX
 #include <GLFW/glfw3.h>
 #include <windows.h>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 #include <string>
 #include "AddressBar.h"
 #include "Engine.h"
@@ -239,11 +241,22 @@ static void onScroll(GLFWwindow* window, double, double yoffset) {
     app->engine->scroll(static_cast<int>(-yoffset * 40));
 }
 
+// The loop otherwise redraws as fast as it possibly can, spinning a CPU core
+// for no reason while sitting idle (and relying on whatever vsync default the
+// driver happens to pick). Capping it here makes the rate explicit and
+// independent of that.
+constexpr double kTargetFrameSeconds = 1.0 / 60.0;
+
 int wmain(int argc, wchar_t** argv) {
-    if (!glfwInit()) return -1;
+    // Windows' default scheduler tick is ~15.6ms, so a short Sleep() below
+    // tends to overshoot to the next tick; this asks for 1ms resolution so
+    // the frame cap actually lands near its target instead of running slow.
+    timeBeginPeriod(1);
+
+    if (!glfwInit()) { timeEndPeriod(1); return -1; }
 
     GLFWwindow* window = glfwCreateWindow(900, 600, "ToyEngine OpenGL", nullptr, nullptr);
-    if (!window) { glfwTerminate(); return -1; }
+    if (!window) { glfwTerminate(); timeEndPeriod(1); return -1; }
 
     glfwMakeContextCurrent(window);
     glEnable(GL_BLEND);
@@ -274,6 +287,8 @@ int wmain(int argc, wchar_t** argv) {
     else visitPage(app, L"", kDefaultPage);
 
     while (!glfwWindowShouldClose(window)) {
+        double frameStart = glfwGetTime();
+
         if (app.pendingHistory != 0) {
             int direction = app.pendingHistory;
             app.pendingHistory = 0;
@@ -324,10 +339,16 @@ int wmain(int argc, wchar_t** argv) {
 
         glfwSwapBuffers(window);
         glfwPollEvents();
+
+        // Sleep off whatever's left of the 1/60s budget, so the loop settles
+        // at ~60 iterations/sec instead of spinning as fast as it can.
+        double remaining = kTargetFrameSeconds - (glfwGetTime() - frameStart);
+        if (remaining > 0) Sleep(static_cast<DWORD>(remaining * 1000.0));
     }
 
     glfwDestroyCursor(handCursor);
     glfwDestroyCursor(ibeamCursor);
     glfwTerminate();
+    timeEndPeriod(1);
     return 0;
 }
