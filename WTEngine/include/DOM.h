@@ -4,6 +4,7 @@
 #include <vector>
 #include <memory>
 #include <map>
+#include "CSS.h"
 
 struct Node {
     enum Type { ELEMENT, TEXT } type;
@@ -26,5 +27,5 @@ struct Element : Node {
 struct Document {
     std::shared_ptr<Element> root;
     std::shared_ptr<Element> body;
+    std::vector<CSS::Rule> styles; // from every <style> block on the page
 };
-#pragma once

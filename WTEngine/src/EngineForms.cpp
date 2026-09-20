@@ -10,7 +10,7 @@
 
 namespace {
     const int kInputPad = 8;    // gap between a field's edge and its text
-    const float kFont = 14;
+    const float kDefaultFont = 14; // used only where a box has no fontSize (shouldn't normally happen)
 
     const Color kCtlBorder{ 0.60f, 0.62f, 0.66f, 1.0f };
     const Color kCtlFocus{ 0.20f, 0.45f, 0.90f, 1.0f };
@@ -127,9 +127,10 @@ bool Engine::onClick(int x, int y, double now, Renderer& renderer) {
     case LayoutBox::TextField: {
         bool isDouble = editor.registerClick(x, now);
         if (focusedEl != b->el) focusInput(*b);
+        float fs = b->fontSize > 0 ? (float)b->fontSize : kDefaultFont;
         float localX = x - (b->x + kInputPad) + inputScrollX;
-        if (isDouble) editor.selectWordAt(localX, renderer, kFont);
-        else editor.placeCaretAt(localX, renderer, kFont);
+        if (isDouble) editor.selectWordAt(localX, renderer, fs);
+        else editor.placeCaretAt(localX, renderer, fs);
         break;
     }
     case LayoutBox::Button:
@@ -222,11 +223,13 @@ bool Engine::takeSubmission(FormSubmission& out) {
 void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
     const float fx = (float)b.x, fy = (float)sy, fw = (float)b.width, fh = (float)b.height;
     const bool focused = b.el == focusedEl;
+    const float kFont = b.fontSize > 0 ? (float)b.fontSize : kDefaultFont;
+    const Color fill = b.background.empty() ? kWhite : parseColor(b.background);
 
     switch (b.control) {
     case LayoutBox::TextField: {
         r.drawRect(fx - 1, fy - 1, fw + 2, fh + 2, focused ? kCtlFocus : kCtlBorder);
-        r.drawRect(fx, fy, fw, fh, kWhite);
+        r.drawRect(fx, fy, fw, fh, fill);
 
         std::wstring shown;
         if (focused) {
@@ -271,7 +274,7 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
     }
     case LayoutBox::Button: {
         r.drawRect(fx - 1, fy - 1, fw + 2, fh + 2, kCtlBorder);
-        r.drawRect(fx, fy, fw, fh, kButtonFill);
+        r.drawRect(fx, fy, fw, fh, b.background.empty() ? kButtonFill : parseColor(b.background));
         r.setClip(fx + 1, fy + 1, fw - 2, fh - 2);
         float tw = r.measureText(b.text, kFont);
         r.drawText(fx + std::max((fw - tw) / 2, 4.0f), fy + 5, b.text, kFont, kInk);
@@ -280,7 +283,7 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
     }
     case LayoutBox::Checkbox: {
         r.drawRect(fx - 1, fy - 1, fw + 2, fh + 2, kCtlBorder);
-        r.drawRect(fx, fy, fw, fh, kWhite);
+        r.drawRect(fx, fy, fw, fh, fill);
         if (b.el->attrs.count(L"checked")) r.drawRect(fx + 4, fy + 4, fw - 8, fh - 8, kCtlFocus);
         break;
     }

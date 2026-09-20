@@ -4,6 +4,8 @@
 #include <string>
 #include <sstream>
 #include <algorithm>
+#include <cmath>
+#include <cwctype>
 
 std::wstring LayoutRoot::getAttr(Element* el, const std::wstring& key, const std::wstring& def) {
     if (!el) return def;
@@ -12,17 +14,55 @@ std::wstring LayoutRoot::getAttr(Element* el, const std::wstring& key, const std
     return it->second;
 }
 
+// Parses a plain pixel length, e.g. margin/padding values or "6" / "20px".
+// A unit this doesn't understand (a decimal, "1.5em", "50%", "2pt", ...)
+// falls back to `def` rather than silently truncating to a wrong number -
+// this used to read "1.5em" as the digits-only prefix "1" and return 1.
 int LayoutRoot::parseFontSize(const std::wstring& s, int def) {
-    if (s.empty()) return def;
-    try {
-        std::wstring num;
-        for (wchar_t c : s) {
-            if (c >= L'0' && c <= L'9') num.push_back(c);
-            else break;
-        }
-        if (!num.empty()) return std::stoi(num);
+    size_t a = 0, b = s.size();
+    while (a < b && iswspace(s[a])) a++;
+    while (b > a && iswspace(s[b - 1])) b--;
+    std::wstring v = s.substr(a, b - a);
+    if (v.empty()) return def;
+
+    size_t i = 0;
+    while (i < v.size() && v[i] >= L'0' && v[i] <= L'9') i++;
+    if (i == 0) return def; // doesn't start with a digit at all
+
+    std::wstring unit = v.substr(i);
+    if (!unit.empty() && unit != L"px") return def; // e.g. em/%/pt - not a plain pixel count
+
+    try { return std::stoi(v.substr(0, i)); }
+    catch (...) { return def; }
+}
+
+// font-size specifically also supports units relative to `baseFontSize` (the
+// inherited size): em/rem multiply it, % scales it - e.g. real pages commonly
+// write `h1 { font-size: 1.5em }`. Anything else unsupported (pt, vw, ...)
+// falls back to `def`.
+int LayoutRoot::resolveFontSize(const std::wstring& s, int baseFontSize, int def) {
+    size_t a = 0, b = s.size();
+    while (a < b && iswspace(s[a])) a++;
+    while (b > a && iswspace(s[b - 1])) b--;
+    std::wstring v = s.substr(a, b - a);
+    if (v.empty()) return def;
+
+    size_t i = 0;
+    bool sawDigit = false;
+    while (i < v.size() && ((v[i] >= L'0' && v[i] <= L'9') || v[i] == L'.')) {
+        if (v[i] != L'.') sawDigit = true;
+        i++;
     }
-    catch (...) {}
+    if (!sawDigit) return def;
+
+    double value;
+    try { value = std::stod(v.substr(0, i)); }
+    catch (...) { return def; }
+
+    std::wstring unit = v.substr(i);
+    if (unit.empty() || unit == L"px") return (int)std::lround(value);
+    if (unit == L"em" || unit == L"rem") return (int)std::lround(value * baseFontSize);
+    if (unit == L"%") return (int)std::lround(value * baseFontSize / 100.0);
     return def;
 }
 
@@ -33,9 +73,8 @@ float LayoutRoot::textWidth(const std::wstring& text, int fontSize) {
 
 // Word-wraps `text` to `containingWidth`, emitting one box per line. Text has
 // no background of its own: it sits on whatever its container already painted.
-void LayoutRoot::layoutText(const std::wstring& text, int x, int& y, int containingWidth) {
-    const int fontSize = 14;
-    const int lineHeight = 22;
+void LayoutRoot::layoutText(const std::wstring& text, int x, int& y, int containingWidth, int fontSize) {
+    const int lineHeight = fontSize + 8; // scales with the font instead of a fixed 22px
     const int textInset = 4; // Engine::render draws text 4px inside its box
     const int paraGap = 6;
     // Keep a sane minimum so deeply nested content can't wrap per character.
@@ -102,19 +141,59 @@ static std::wstring firstText(Element* el) {
     return L"";
 }
 
+// Computes the cascaded style properties layout uses, for both plain
+// elements and form controls: stylesheet rules first (least to most
+// specific, source order breaking ties), then inline style="" - which, per
+// CSS, always wins regardless of specificity.
+LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFontSize) {
+    ComputedStyle sv;
+    sv.fontSize = inheritedFontSize; // inherited unless a rule below overrides it
+
+    auto applyDecl = [&](const std::wstring& k, const std::wstring& v) {
+        if (k == L"background" || k == L"background-color") sv.background = v;
+        else if (k == L"margin-top") sv.marginTop = parseFontSize(v, 6);
+        else if (k == L"margin-bottom") sv.marginBottom = parseFontSize(v, 6);
+        else if (k == L"padding") sv.padding = parseFontSize(v, 6);
+        else if (k == L"font-size") sv.fontSize = resolveFontSize(v, inheritedFontSize, sv.fontSize);
+        else if (k == L"display") sv.displayNone = (v == L"none");
+    };
+
+    if (rules) {
+        std::vector<const CSS::Rule*> matched;
+        for (const auto& rule : *rules) {
+            if (CSS::matches(rule, ancestorStack, e)) matched.push_back(&rule);
+        }
+        std::stable_sort(matched.begin(), matched.end(),
+            [](const CSS::Rule* a, const CSS::Rule* b) {
+                if (a->specificity < b->specificity) return true;
+                if (b->specificity < a->specificity) return false;
+                return a->order < b->order;
+            });
+        for (const auto* rule : matched)
+            for (const auto& decl : rule->declarations) applyDecl(decl.first, decl.second);
+    }
+    for (const auto& decl : CSS::parseDeclarations(getAttr(e, L"style", L"")))
+        applyDecl(decl.first, decl.second);
+
+    return sv;
+}
+
 // Places one <input> or <button> as a box of its own. Controls are laid out
 // as blocks like everything else here, so a label and its field end up on
 // separate rows.
-void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth) {
-    const int marginY = 6;
-    const int fieldHeight = 28, buttonHeight = 30, checkboxSize = 18;
+void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth, const ComputedStyle& style) {
+    // Control heights scale with font-size so a bigger font doesn't clip.
+    const int fieldHeight = std::max(28, style.fontSize + 14);
+    const int buttonHeight = std::max(30, style.fontSize + 16);
+    const int checkboxSize = std::max(18, style.fontSize + 4);
     const int maxWidth = std::max(containingWidth, 60);
 
     std::wstring type = lowerCase(getAttr(e, L"type", L""));
 
     LayoutBox box;
     box.x = x;
-    box.fontSize = 14;
+    box.fontSize = style.fontSize;
+    box.background = style.background;
     box.el = e;
     box.form = currentForm;
 
@@ -156,22 +235,24 @@ void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth) {
         break;
     }
 
-    y += marginY;
+    y += style.marginTop;
     box.y = y;
     boxes.push_back(box);
-    y += box.height + marginY;
+    y += box.height + style.marginBottom;
 }
 
 void LayoutRoot::layout() {
     boxes.clear();
+    ancestorStack.clear();
     if (!rootNode) return;
 
     int y = 10;
-    layoutElement(static_cast<Element*>(rootNode), 10, y, viewportWidth - 20);
+    layoutElement(static_cast<Element*>(rootNode), 10, y, viewportWidth - 20, 14);
 }
 
-void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth) {
+void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, int inheritedFontSize) {
     if (!el) return;
+    ancestorStack.push_back(el); // `el` is an ancestor of every child laid out below
 
     // Loop over each child node
     for (auto& child : el->children) {
@@ -179,7 +260,7 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth) 
         // Case 1: Text node (simple paragraph text)
         if (child->type == Node::TEXT) {
             auto tnode = static_cast<TextNode*>(child.get());
-            layoutText(tnode->text, x, y, containingWidth);
+            layoutText(tnode->text, x, y, containingWidth, inheritedFontSize);
         }
 
         //  Case 2: Element node (<div>, <p>, <span>, etc.)
@@ -192,43 +273,15 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth) 
                 e->tag == L"base" || e->tag == L"noscript")
                 continue;
 
+            ComputedStyle sv = computeStyle(e, inheritedFontSize);
+            if (sv.displayNone) continue; // this element and its subtree take no space
+
             if (e->tag == L"input" || e->tag == L"button") {
-                layoutControl(e, x, y, containingWidth);
+                layoutControl(e, x, y, containingWidth, sv);
                 continue;
             }
 
-            std::wstring style = getAttr(e, L"style", L"");
-
-            // default style values
-            std::wstring bg = L"";
-            int marginTop = 6;
-            int marginBottom = 6;
-            int padding = 6;
-            int fontSize = 14;
-
-            // rudimentary inline style parser ---
-            std::wistringstream ss(style);
-            std::wstring token;
-            while (std::getline(ss, token, L';')) {
-                auto pos = token.find(L':');
-                if (pos == std::wstring::npos) continue;
-                std::wstring k = token.substr(0, pos);
-                std::wstring v = token.substr(pos + 1);
-
-                auto trim = [](std::wstring& t) {
-                    while (!t.empty() && iswspace(t.front())) t.erase(t.begin());
-                    while (!t.empty() && iswspace(t.back())) t.pop_back();
-                    };
-                trim(k); trim(v);
-
-                if (k == L"background" || k == L"background-color") bg = v;
-                else if (k == L"margin-top") marginTop = parseFontSize(v, 6);
-                else if (k == L"margin-bottom") marginBottom = parseFontSize(v, 6);
-                else if (k == L"padding") padding = parseFontSize(v, 6);
-                else if (k == L"font-size") fontSize = parseFontSize(v, 14);
-            }
-
-            y += marginTop;
+            y += sv.marginTop;
             int contentStartY = y;
 
             // Reserve a background box now (before laying out children) so it
@@ -236,18 +289,18 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth) 
             // one — plain structural wrappers like <html>/<body> get no box
             // at all, they just position their children.
             size_t bgIndex = static_cast<size_t>(-1);
-            if (!bg.empty()) {
+            if (!sv.background.empty()) {
                 LayoutBox box;
                 box.x = x;
                 box.y = contentStartY;
                 box.width = containingWidth;
                 box.height = 0; // filled in below once children are laid out
-                box.background = bg;
+                box.background = sv.background;
                 bgIndex = boxes.size();
                 boxes.push_back(box);
             }
 
-            y += padding;
+            y += sv.padding;
 
             // Recurse into nested elements/text
             std::wstring savedHref = currentHref;
@@ -257,17 +310,19 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth) 
             }
             Element* savedForm = currentForm;
             if (e->tag == L"form") currentForm = e;
-            layoutElement(e, x + padding, y, containingWidth - 2 * padding);
+            layoutElement(e, x + sv.padding, y, containingWidth - 2 * sv.padding, sv.fontSize);
             currentHref = savedHref;
             currentForm = savedForm;
 
-            y += padding;
+            y += sv.padding;
 
             if (bgIndex != static_cast<size_t>(-1)) {
                 boxes[bgIndex].height = y - contentStartY;
             }
 
-            y += marginBottom;
+            y += sv.marginBottom;
         }
     }
+
+    ancestorStack.pop_back();
 }
