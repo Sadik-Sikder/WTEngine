@@ -9,18 +9,24 @@
 
 // Simple layout box result
 struct LayoutBox {
-    // Interactive form controls get a box of their own; the Engine draws and
-    // handles them using `el` (their DOM element).
+    // Interactive form controls get a box of their own; the Engine draws
+    // and handles them using `el`.
     enum Control { NoControl, TextField, Button, Checkbox };
 
     int x, y, width, height;
     std::wstring background; // e.g. "#rrggbb"
     std::wstring text; // text inside (for leaf text-only boxes); a Button's label
     std::wstring href; // link target if this text is inside an <a href>
+    std::wstring imageSrc; // <img>'s raw (unresolved) src attribute; empty for non-image boxes
     int fontSize = 14;
 
     Control control = NoControl;
-    Element* el = nullptr;   // the control's element (NoControl: unused)
+    // The element this box was generated from: a control's own element,
+    // the element a background/image box belongs to, or (for a text box)
+    // the direct parent element of that text. Used for click hit-testing
+    // (Engine::dispatchClick) so addEventListener('click', ...) can find
+    // which element - and its ancestors, for bubbling - a click landed on.
+    Element* el = nullptr;
     Element* form = nullptr; // the enclosing <form>, if any
 };
 
@@ -37,6 +43,12 @@ struct LayoutRoot {
     // rough per-character estimate is used when unset.
     std::function<float(const std::wstring&, int)> measureText;
 
+    // Resolves an <img>'s raw `src`, fetching/decoding (and caching) it if
+    // not already cached, and returns its natural pixel size via (outW,
+    // outH). Used to size a box that doesn't give explicit width/height.
+    // Returns false if unset or the fetch/decode fails.
+    std::function<bool(const std::wstring& src, int& outW, int& outH)> loadImage;
+
     void layout(); // compute boxes from rootNode
 private:
     // `inheritedFontSize` is the size to use for `el`'s own direct text, and
@@ -47,7 +59,7 @@ private:
     int parseFontSize(const std::wstring& s, int def = 14);
     int resolveFontSize(const std::wstring& s, int baseFontSize, int def);
     float textWidth(const std::wstring& text, int fontSize);
-    void layoutText(const std::wstring& text, int x, int& y, int containingWidth, int fontSize);
+    void layoutText(const std::wstring& text, int x, int& y, int containingWidth, int fontSize, Element* owner);
 
     // The subset of an element's cascaded style that layout cares about -
     // computed once per element and shared by both plain elements and form
@@ -59,6 +71,7 @@ private:
     };
     ComputedStyle computeStyle(Element* e, int inheritedFontSize);
     void layoutControl(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
+    void layoutImage(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
 
     // Ancestors of the element layoutElement is currently iterating the
     // children of (root first); used to match descendant selectors ("a b").

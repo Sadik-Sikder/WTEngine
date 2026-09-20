@@ -7,6 +7,7 @@
 #include "AddressBar.h"
 #include "Engine.h"
 #include "Fetcher.h"
+#include "JSEngine.h"
 #include "OpenGLRenderer.h"
 #include "PageHistory.h"
 
@@ -64,7 +65,7 @@ static std::wstring escapeHtml(const std::wstring& in) {
 // updates the window title and address bar.
 static void showEntry(App& app, const HistoryEntry& entry) {
     app.currentUrl = entry.url;
-    app.engine->loadHTML(entry.html);
+    app.engine->loadHTML(entry.html, entry.url);
     app.engine->scroll(-1000000000); // to the top...
     app.engine->scroll(entry.scrollY); // ...then to where the user was (clamped)
     glfwSetWindowTitle(app.window,
@@ -156,7 +157,12 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
     if (app->engine->onClick(x, y, glfwGetTime(), *app->renderer)) return;
 
     std::wstring href = app->engine->linkAt(x, y, *app->renderer);
-    if (href.empty()) return;
+
+    // addEventListener('click', ...) listeners next; a listener calling
+    // event.preventDefault() suppresses the link navigation below (real
+    // sites routinely intercept nav clicks with a JS router this way).
+    bool prevented = app->engine->dispatchClick(x, y);
+    if (href.empty() || prevented) return;
 
     std::wstring target = resolveUrl(app->currentUrl, href);
     if (!target.empty()) app->pendingUrl = target;
@@ -252,6 +258,8 @@ int wmain(int argc, wchar_t** argv) {
     // tends to overshoot to the next tick; this asks for 1ms resolution so
     // the frame cap actually lands near its target instead of running slow.
     timeBeginPeriod(1);
+
+    runJSEngineSmokeTest(); // Phase 0 check: quickjs-ng is vendored and runs correctly
 
     if (!glfwInit()) { timeEndPeriod(1); return -1; }
 

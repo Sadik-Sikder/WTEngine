@@ -3,12 +3,14 @@
 #include "Fetcher.h"
 #include <windows.h>
 #include <wininet.h>
+#include <wincrypt.h>
 #include <cwctype>
 #include <fstream>
 #include <iterator>
 #include <vector>
 
 #pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "crypt32.lib")
 
 static bool isHttpUrl(const std::wstring& url) {
     return url.rfind(L"http://", 0) == 0 || url.rfind(L"https://", 0) == 0;
@@ -153,6 +155,68 @@ static FetchResult readLocalFile(const std::wstring& path) {
 FetchResult fetchPage(const std::wstring& url, const std::string* postBody) {
     if (!isHttpUrl(url)) return readLocalFile(url); // a POST body makes no sense for a file
     return postBody ? postHttp(url, *postBody) : fetchHttp(url);
+}
+
+// Decodes a "data:[<mediatype>];base64,<data>" URI's payload. Only the
+// base64 form is supported (what every image-embedding tool produces);
+// anything else (a bare percent-encoded data: URI) is rejected.
+static bool decodeDataUri(const std::wstring& uri, std::vector<unsigned char>& outBytes) {
+    size_t comma = uri.find(L',');
+    if (comma == std::wstring::npos) return false;
+
+    std::wstring meta = uri.substr(5, comma - 5); // between "data:" and ','
+    if (meta.find(L";base64") == std::wstring::npos) return false;
+
+    std::string b64 = wideToUtf8(uri.substr(comma + 1));
+
+    DWORD outLen = 0;
+    if (!CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64,
+                              nullptr, &outLen, nullptr, nullptr)) {
+        return false;
+    }
+    outBytes.resize(outLen);
+    if (!CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64,
+                              outBytes.data(), &outLen, nullptr, nullptr)) {
+        return false;
+    }
+    outBytes.resize(outLen);
+    return true;
+}
+
+bool fetchBytes(const std::wstring& url, std::vector<unsigned char>& outBytes) {
+    outBytes.clear();
+
+    if (url.rfind(L"data:", 0) == 0) return decodeDataUri(url, outBytes);
+
+    if (!isHttpUrl(url)) {
+        std::ifstream in(url, std::ios::binary);
+        if (!in) return false;
+        outBytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        return true;
+    }
+
+    InetHandle session(InternetOpenW(L"WTEngine/0.1", INTERNET_OPEN_TYPE_PRECONFIG,
+                                     nullptr, nullptr, 0));
+    if (!session.h) return false;
+
+    InetHandle request(InternetOpenUrlW(
+        session.h, url.c_str(), nullptr, 0,
+        INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE |
+        INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTP | INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTPS, 0));
+    if (!request.h) return false;
+
+    DWORD status = 0, statusSize = sizeof(status);
+    if (HttpQueryInfoW(request.h, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
+                       &status, &statusSize, nullptr) && status >= 400) {
+        return false;
+    }
+
+    char buf[8192];
+    DWORD got = 0;
+    while (InternetReadFile(request.h, buf, sizeof(buf), &got) && got > 0) {
+        outBytes.insert(outBytes.end(), buf, buf + got);
+    }
+    return true;
 }
 
 std::wstring resolveUrl(const std::wstring& baseUrl, const std::wstring& href) {

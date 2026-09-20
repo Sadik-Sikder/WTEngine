@@ -141,9 +141,11 @@ std::shared_ptr<Element> HTMLParser::parseElement() {
             if (match) break;
             p += 2;
         }
-        // <style> content is kept (as plain text, no entity decoding) so the
-        // stylesheet can be parsed later; script/title/textarea are dropped.
-        if (name == L"style" && p != std::wstring::npos && p > start) {
+        // <style> and <script> content is kept (as plain text, no entity
+        // decoding - decoding would corrupt JS source, e.g. turning "&&"
+        // into "&") so it can be parsed/run later; title/textarea are
+        // dropped, since nothing reads an Element's raw text today.
+        if ((name == L"style" || name == L"script") && p != std::wstring::npos && p > start) {
             elem->children.push_back(std::make_shared<TextNode>(s.substr(start, p - start)));
         }
         if (p == std::wstring::npos) { pos = s.size(); return elem; }
@@ -168,7 +170,7 @@ std::shared_ptr<Element> HTMLParser::parseElement() {
         if (s[pos] == L'<') {
             if (pos + 1 < s.size() && s[pos + 1] == L'/') continue;
             auto child = parseElement();
-            if (child) elem->children.push_back(child);
+            if (child) { child->parent = elem.get(); elem->children.push_back(child); }
             else { pos++; }
         }
         else {
@@ -239,8 +241,12 @@ std::shared_ptr<Document> HTMLParser::parse(const std::wstring& html) {
     s = html; pos = 0;
     auto doc = std::make_shared<Document>();
     // find <body> element and set it as body; we'll create a fake root if needed
-    // simple strategy: parse top-level elements and search for body
-    std::vector<std::shared_ptr<Element>> top;
+    // simple strategy: parse top-level nodes and search for body. Bare text
+    // alongside top-level elements is rare in a full document (real markup
+    // wraps everything in <html>/<body>) but matters for a fragment parse
+    // (innerHTML=) with no wrapper at all - kept as a top-level TextNode
+    // rather than dropped, so e.g. `el.innerHTML = "plain text"` works.
+    std::vector<std::shared_ptr<Node>> top;
     while (pos < s.size()) {
         skipSpace();
         if (skipMarkup()) continue;
@@ -251,22 +257,31 @@ std::shared_ptr<Document> HTMLParser::parse(const std::wstring& html) {
             auto el = parseElement();
             if (el) top.push_back(el);
         }
-        else break;
+        else {
+            auto text = parseText();
+            if (!text.empty()) top.push_back(std::make_shared<TextNode>(text));
+        }
     }
     // find body anywhere in the parsed tree (it's usually nested inside <html>)
-    for (auto& e : top) {
-        auto found = findBody(e);
+    for (auto& n : top) {
+        if (n->type != Node::ELEMENT) continue;
+        auto found = findBody(std::static_pointer_cast<Element>(n));
         if (found) { doc->body = found; break; }
     }
     if (!doc->body) {
-        // create synthetic body merging top-level elements
+        // create synthetic body merging top-level nodes
         auto body = std::make_shared<Element>(L"body");
-        for (auto& e : top) body->children.push_back(e);
+        for (auto& n : top) {
+            if (n->type == Node::ELEMENT) static_cast<Element*>(n.get())->parent = body.get();
+            body->children.push_back(n);
+        }
         doc->body = body;
     }
 
     std::wstring cssText;
-    for (auto& e : top) collectStyleText(e, cssText);
+    for (auto& n : top) {
+        if (n->type == Node::ELEMENT) collectStyleText(std::static_pointer_cast<Element>(n), cssText);
+    }
     doc->styles = CSS::parseStylesheet(cssText);
 
     return doc;

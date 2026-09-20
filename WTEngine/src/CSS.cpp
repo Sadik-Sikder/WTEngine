@@ -91,22 +91,6 @@ bool parseCompound(const std::wstring& token, CompoundSelector& out) {
     return true;
 }
 
-// Parses one selector (already split out of a comma-separated group) into a
-// descendant chain. False if any part of it is unsupported.
-bool parseSelector(const std::wstring& selector, std::vector<CompoundSelector>& chain) {
-    std::wistringstream ss(selector);
-    std::wstring token;
-    while (ss >> token) {
-        for (wchar_t c : token) {
-            if (!isSelectorChar(c)) return false; // a combinator (>,+,~) or other unsupported syntax
-        }
-        CompoundSelector cs;
-        if (!parseCompound(token, cs)) return false;
-        chain.push_back(std::move(cs));
-    }
-    return !chain.empty();
-}
-
 Specificity specificityOf(const std::vector<CompoundSelector>& chain) {
     Specificity sp;
     for (const auto& cs : chain) {
@@ -173,6 +157,25 @@ bool compoundMatches(const CompoundSelector& cs, Element* el) {
 }
 
 } // namespace
+
+// Parses one selector (already split out of a comma-separated group, when
+// called from parseStylesheet) into a descendant chain. False if any part
+// of it is unsupported. isSelectorChar/parseCompound are anonymous-
+// namespace helpers above, but that only restricts them from other
+// translation units - they're still visible here, in the rest of this file.
+bool parseSelector(const std::wstring& selector, std::vector<CompoundSelector>& chain) {
+    std::wistringstream ss(selector);
+    std::wstring token;
+    while (ss >> token) {
+        for (wchar_t c : token) {
+            if (!isSelectorChar(c)) return false; // a combinator (>,+,~) or other unsupported syntax
+        }
+        CompoundSelector cs;
+        if (!parseCompound(token, cs)) return false;
+        chain.push_back(std::move(cs));
+    }
+    return !chain.empty();
+}
 
 std::vector<std::pair<std::wstring, std::wstring>> parseDeclarations(const std::wstring& block) {
     std::vector<std::pair<std::wstring, std::wstring>> out;
