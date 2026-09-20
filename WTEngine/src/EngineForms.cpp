@@ -4,6 +4,8 @@
 #include "Engine.h"
 #include "Renderer.h"
 #include "Fetcher.h"
+#include "JSBinding.h"
+#include "JSEngine.h"
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
@@ -146,6 +148,29 @@ bool Engine::onClick(int x, int y, double now, Renderer& renderer) {
         break;
     }
     return true;
+}
+
+bool Engine::dispatchClick(int x, int y) {
+    if (!jsEngine) return false;
+    if (y < topInset) return false;
+    int docY = y - topInset + scrollY;
+
+    // Topmost (last-painted) box wins, same hit-test style as controlAt -
+    // a bounding-box check rather than linkAt's tighter glyph-width check,
+    // since a click listener's target usually covers its whole box (e.g. a
+    // <div onclick>), not just the visible text inside it.
+    Element* target = nullptr;
+    for (auto it = layoutRoot.boxes.rbegin(); it != layoutRoot.boxes.rend(); ++it) {
+        const auto& b = *it;
+        if (!b.el) continue;
+        if (x >= b.x && x < b.x + b.width && docY >= b.y && docY < b.y + b.height) {
+            target = b.el;
+            break;
+        }
+    }
+    if (!target) return false;
+
+    return ::dispatchClick(jsEngine->context(), target);
 }
 
 void Engine::onChar(unsigned int cp) {

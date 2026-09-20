@@ -73,7 +73,7 @@ float LayoutRoot::textWidth(const std::wstring& text, int fontSize) {
 
 // Word-wraps `text` to `containingWidth`, emitting one box per line. Text has
 // no background of its own: it sits on whatever its container already painted.
-void LayoutRoot::layoutText(const std::wstring& text, int x, int& y, int containingWidth, int fontSize) {
+void LayoutRoot::layoutText(const std::wstring& text, int x, int& y, int containingWidth, int fontSize, Element* owner) {
     const int lineHeight = fontSize + 8; // scales with the font instead of a fixed 22px
     const int textInset = 4; // Engine::render draws text 4px inside its box
     const int paraGap = 6;
@@ -89,6 +89,7 @@ void LayoutRoot::layoutText(const std::wstring& text, int x, int& y, int contain
         box.text = line;
         box.href = currentHref;
         box.fontSize = fontSize;
+        box.el = owner;
         boxes.push_back(box);
         y += lineHeight;
     };
@@ -241,6 +242,39 @@ void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth, c
     y += box.height + style.marginBottom;
 }
 
+// Places an <img> as a box of its own. Explicit width/height attributes
+// always win (per-axis - a mismatched aspect ratio between an explicit
+// width and a natural height is the page's problem, same as real browsers);
+// an unset axis uses the image's natural decoded size, fetching/decoding it
+// now via `loadImage` so the box gets the real size instead of a guess. A
+// fixed placeholder covers the case where that fetch/decode fails.
+void LayoutRoot::layoutImage(Element* e, int x, int& y, int containingWidth, const ComputedStyle& style) {
+    const int defaultWidth = 200, defaultHeight = 150;
+    std::wstring src = getAttr(e, L"src", L"");
+
+    int naturalW = 0, naturalH = 0;
+    bool haveNatural = loadImage && !src.empty() && loadImage(src, naturalW, naturalH);
+
+    std::wstring wAttr = getAttr(e, L"width", L"");
+    std::wstring hAttr = getAttr(e, L"height", L"");
+    int width = !wAttr.empty() ? parseFontSize(wAttr, defaultWidth) : (haveNatural ? naturalW : defaultWidth);
+    int height = !hAttr.empty() ? parseFontSize(hAttr, defaultHeight) : (haveNatural ? naturalH : defaultHeight);
+
+    LayoutBox box;
+    box.x = x;
+    box.fontSize = style.fontSize;
+    box.background = style.background;
+    box.imageSrc = src;
+    box.width = std::min(width, std::max(containingWidth, 1));
+    box.height = height;
+    box.el = e;
+
+    y += style.marginTop;
+    box.y = y;
+    boxes.push_back(box);
+    y += box.height + style.marginBottom;
+}
+
 void LayoutRoot::layout() {
     boxes.clear();
     ancestorStack.clear();
@@ -260,7 +294,7 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
         // Case 1: Text node (simple paragraph text)
         if (child->type == Node::TEXT) {
             auto tnode = static_cast<TextNode*>(child.get());
-            layoutText(tnode->text, x, y, containingWidth, inheritedFontSize);
+            layoutText(tnode->text, x, y, containingWidth, inheritedFontSize, el);
         }
 
         //  Case 2: Element node (<div>, <p>, <span>, etc.)
@@ -268,9 +302,13 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
             auto e = static_cast<Element*>(child.get());
 
             // Non-visual elements produce no boxes and take no space.
+            // <noscript> is deliberately not in this list: unlike the others
+            // its content is meant to be shown when JS isn't available -
+            // exactly WTEngine's situation, since it has no JS engine at
+            // all - so it's laid out like a normal container below instead.
             if (e->tag == L"head" || e->tag == L"script" || e->tag == L"style" ||
                 e->tag == L"title" || e->tag == L"meta" || e->tag == L"link" ||
-                e->tag == L"base" || e->tag == L"noscript")
+                e->tag == L"base")
                 continue;
 
             ComputedStyle sv = computeStyle(e, inheritedFontSize);
@@ -278,6 +316,11 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
 
             if (e->tag == L"input" || e->tag == L"button") {
                 layoutControl(e, x, y, containingWidth, sv);
+                continue;
+            }
+
+            if (e->tag == L"img") {
+                layoutImage(e, x, y, containingWidth, sv);
                 continue;
             }
 
@@ -296,6 +339,7 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
                 box.width = containingWidth;
                 box.height = 0; // filled in below once children are laid out
                 box.background = sv.background;
+                box.el = e;
                 bgIndex = boxes.size();
                 boxes.push_back(box);
             }

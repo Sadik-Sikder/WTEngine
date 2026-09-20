@@ -1,6 +1,7 @@
 // Fetcher.h
 #pragma once
 #include <string>
+#include <vector>
 
 struct FetchResult {
     bool ok = false;
@@ -12,6 +13,10 @@ struct FetchResult {
 // Loads a page from an http(s):// URL, or from a local file path.
 // With `postBody` (already form-encoded), sends it as an HTTP POST instead.
 FetchResult fetchPage(const std::wstring& url, const std::string* postBody = nullptr);
+
+// Fetches raw bytes from an http(s) URL or local file path, with no text
+// decoding — used for binary resources like images. Returns false on failure.
+bool fetchBytes(const std::wstring& url, std::vector<unsigned char>& outBytes);
 
 // Resolves `href` against `baseUrl`. Returns an empty string for links that
 // can't be navigated to (fragments, javascript:, mailto:, non-http bases).

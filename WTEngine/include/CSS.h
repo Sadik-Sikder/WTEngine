@@ -36,6 +36,13 @@ struct Rule {
     int order = 0; // source order, to break specificity ties
 };
 
+// Parses one selector (e.g. "div.card#id", "#target", ".foo bar") into a
+// descendant chain - the same grammar parseStylesheet uses for each
+// comma-separated selector in a rule, exposed standalone for matching
+// outside of stylesheet application (e.g. querySelector). False if the
+// chain ends up empty (unsupported syntax, or an empty selector).
+bool parseSelector(const std::wstring& selector, std::vector<CompoundSelector>& chain);
+
 // Parses the text of one or more <style> blocks into rules. Understands
 // tag/.class/#id/* selectors, compounds (div.card), comma-separated groups,
 // and plain descendant combinators ("a b" - not necessarily a direct

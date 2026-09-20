@@ -21,6 +21,11 @@ struct Element : Node {
     std::wstring tag;
     std::map<std::wstring, std::wstring> attrs;
     std::vector<std::shared_ptr<Node>> children;
+    // Non-owning; set by whoever attaches this element (HTMLParser during
+    // parsing, or the DOM-mutating JS bindings). Used to bubble a click
+    // event up through ancestors. nullptr for an unattached element (just
+    // created via createElement, or just removed via removeChild).
+    Element* parent = nullptr;
     Element(const std::wstring& t) : Node(ELEMENT), tag(t) {}
 };
 
