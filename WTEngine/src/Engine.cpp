@@ -17,8 +17,11 @@
 // Minimal color struct for OpenGL
 
 Color parseColor(const std::wstring& str) {
-    if (str.empty() || str[0] != L'#' || str.size() != 7) {
-        // default light gray
+    bool valid = str.size() == 7 && str[0] == L'#';
+    for (size_t i = 1; valid && i < str.size(); i++) valid = iswxdigit(str[i]) != 0;
+
+    if (!valid) {
+        // default light gray (also for "#gggggg", which std::stoi below would throw on)
         return { 0.94f, 0.94f, 0.94f, 1.0f };
     }
 
