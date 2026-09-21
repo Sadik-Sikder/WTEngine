@@ -71,58 +71,144 @@ float LayoutRoot::textWidth(const std::wstring& text, int fontSize) {
     return text.size() * fontSize * 0.55f; // rough fallback
 }
 
-// Word-wraps `text` to `containingWidth`, emitting one box per line. Text has
-// no background of its own: it sits on whatever its container already painted.
-void LayoutRoot::layoutText(const std::wstring& text, int x, int& y, int containingWidth, int fontSize, Element* owner) {
-    const int lineHeight = fontSize + 8; // scales with the font instead of a fixed 22px
-    const int textInset = 4; // Engine::render draws text 4px inside its box
-    const int paraGap = 6;
-    // Keep a sane minimum so deeply nested content can't wrap per character.
-    const float maxWidth = (float)std::max(containingWidth - 2 * textInset, 40);
-
-    auto emit = [&](const std::wstring& line) {
-        LayoutBox box;
-        box.x = x;
-        box.y = y;
-        box.width = containingWidth;
-        box.height = lineHeight;
-        box.text = line;
-        box.href = currentHref;
-        box.fontSize = fontSize;
-        box.el = owner;
-        boxes.push_back(box);
-        y += lineHeight;
+// Tags treated as inline-level by default: their text/content flows onto
+// the same line as their surrounding siblings instead of starting a block
+// of its own. Everything else defaults to block, matching the engine's
+// original (pre-inline) universal-block behavior.
+static bool isInlineTag(const std::wstring& tag) {
+    static const std::wstring kInline[] = {
+        L"a", L"span", L"b", L"strong", L"i", L"em", L"u", L"small", L"code",
+        L"sub", L"sup", L"mark", L"label", L"abbr", L"cite", L"q"
     };
+    for (const auto& t : kInline) if (tag == t) return true;
+    return false;
+}
 
-    std::wstring line;
+// Splits `text` on whitespace and appends one InlineItem per word, sharing
+// `fontSize`/`href`/`owner` - the same tokenization layoutInlineRun's
+// predecessor (layoutText) used to wrap a single string.
+void LayoutRoot::appendWords(const std::wstring& text, int fontSize, const std::wstring& href,
+                              Element* owner, std::vector<InlineItem>& out) {
     size_t i = 0;
     while (i < text.size()) {
-        // Next word (a run of non-space characters)
         while (i < text.size() && iswspace(text[i])) i++;
         size_t start = i;
         while (i < text.size() && !iswspace(text[i])) i++;
         if (start == i) break;
-        std::wstring word = text.substr(start, i - start);
+        out.push_back({ text.substr(start, i - start), fontSize, href, owner, false });
+    }
+}
 
-        std::wstring candidate = line.empty() ? word : line + L" " + word;
-        if (textWidth(candidate, fontSize) <= maxWidth) {
-            line = candidate;
+// Flattens `el`'s inline-level content (text nodes and nested inline
+// elements like <a>/<b>) into a single flat item list, so a run of mixed
+// text and inline markup - e.g. "Hello <a>link</a> world" - line-breaks as
+// one paragraph instead of three separate blocks. A <br> becomes a forced
+// break; a block-level element found here (invalid-ish nesting, e.g.
+// <a><div>) is flattened into the run rather than specially promoted, since
+// that combination is rare and not worth the extra complexity.
+void LayoutRoot::collectInline(Element* el, int inheritedFontSize, std::vector<InlineItem>& out) {
+    ancestorStack.push_back(el);
+
+    for (auto& child : el->children) {
+        if (child->type == Node::TEXT) {
+            auto tnode = static_cast<TextNode*>(child.get());
+            appendWords(tnode->text, inheritedFontSize, currentHref, el, out);
             continue;
         }
 
-        // Doesn't fit: flush the current line and start a new one.
-        if (!line.empty()) { emit(line); line.clear(); }
+        auto e = static_cast<Element*>(child.get());
+        if (e->tag == L"head" || e->tag == L"script" || e->tag == L"style" ||
+            e->tag == L"title" || e->tag == L"meta" || e->tag == L"link" ||
+            e->tag == L"base")
+            continue;
 
-        // A single word wider than the line gets broken by characters.
-        while (textWidth(word, fontSize) > maxWidth && word.size() > 1) {
-            size_t n = 1;
-            while (n < word.size() && textWidth(word.substr(0, n + 1), fontSize) <= maxWidth) n++;
-            emit(word.substr(0, n));
-            word.erase(0, n);
+        if (e->tag == L"br") {
+            out.push_back({ L"", inheritedFontSize, L"", nullptr, true });
+            continue;
         }
-        line = word;
+
+        ComputedStyle sv = computeStyle(e, inheritedFontSize);
+        if (sv.display == Display::None) continue;
+
+        std::wstring savedHref = currentHref;
+        if (e->tag == L"a") {
+            auto href = e->attrs.find(L"href");
+            if (href != e->attrs.end()) currentHref = href->second;
+        }
+        collectInline(e, sv.fontSize, out);
+        currentHref = savedHref;
     }
-    if (!line.empty()) emit(line);
+
+    ancestorStack.pop_back();
+}
+
+// Word-wraps a flattened inline run (see collectInline) to `containingWidth`,
+// emitting one LayoutBox per item per line - not one box per line - since
+// items on the same line can differ in font size, href, or owning element
+// (e.g. a link in the middle of a sentence). Generalizes what layoutText
+// used to do for a single homogeneously-styled string.
+void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, int& y, int containingWidth) {
+    const int textInset = 4; // Engine::render draws text 4px inside its box
+    const int paraGap = 6;
+    const float maxWidth = (float)std::max(containingWidth - 2 * textInset, 40);
+
+    struct Placed { InlineItem item; float offset; };
+    std::vector<Placed> line;
+    float lineWidth = 0;
+
+    auto emitLine = [&]() {
+        if (line.empty()) return;
+        int lineHeight = 0;
+        for (auto& p : line) lineHeight = std::max(lineHeight, p.item.fontSize);
+        lineHeight += 8;
+        for (auto& p : line) {
+            LayoutBox box;
+            box.x = x + (int)std::lround(p.offset);
+            box.y = y;
+            box.width = (int)std::lround(textWidth(p.item.word, p.item.fontSize));
+            box.height = lineHeight;
+            box.text = p.item.word;
+            box.href = p.item.href;
+            box.fontSize = p.item.fontSize;
+            box.el = p.item.owner;
+            boxes.push_back(box);
+        }
+        y += lineHeight;
+        line.clear();
+        lineWidth = 0;
+    };
+
+    for (const auto& raw : items) {
+        if (raw.isBreak) { emitLine(); continue; }
+        if (raw.word.empty()) continue;
+
+        InlineItem item = raw;
+        float wordWidth = textWidth(item.word, item.fontSize);
+
+        // A word wider than the line on its own gets broken by characters,
+        // one fragment per line, before whatever's left of it (now short
+        // enough) falls through to the normal wrapping below.
+        while (wordWidth > maxWidth && item.word.size() > 1) {
+            if (!line.empty()) emitLine();
+            size_t n = 1;
+            while (n < item.word.size() && textWidth(item.word.substr(0, n + 1), item.fontSize) <= maxWidth) n++;
+            InlineItem fragment = item;
+            fragment.word = item.word.substr(0, n);
+            line.push_back({ fragment, 0 });
+            emitLine();
+            item.word.erase(0, n);
+            wordWidth = textWidth(item.word, item.fontSize);
+        }
+        if (item.word.empty()) continue;
+
+        float spaceWidth = line.empty() ? 0 : textWidth(L" ", item.fontSize);
+        if (!line.empty() && lineWidth + spaceWidth + wordWidth > maxWidth) emitLine();
+
+        float offset = line.empty() ? 0 : lineWidth + spaceWidth;
+        lineWidth = offset + wordWidth;
+        line.push_back({ item, offset });
+    }
+    emitLine();
 
     y += paraGap;
 }
@@ -149,6 +235,7 @@ static std::wstring firstText(Element* el) {
 LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFontSize) {
     ComputedStyle sv;
     sv.fontSize = inheritedFontSize; // inherited unless a rule below overrides it
+    sv.display = isInlineTag(e->tag) ? Display::Inline : Display::Block;
 
     auto applyDecl = [&](const std::wstring& k, const std::wstring& v) {
         if (k == L"background" || k == L"background-color") sv.background = v;
@@ -156,7 +243,11 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         else if (k == L"margin-bottom") sv.marginBottom = parseFontSize(v, 6);
         else if (k == L"padding") sv.padding = parseFontSize(v, 6);
         else if (k == L"font-size") sv.fontSize = resolveFontSize(v, inheritedFontSize, sv.fontSize);
-        else if (k == L"display") sv.displayNone = (v == L"none");
+        else if (k == L"display") {
+            if (v == L"none") sv.display = Display::None;
+            else if (v == L"inline" || v == L"inline-block") sv.display = Display::Inline;
+            else if (v == L"block") sv.display = Display::Block;
+        }
     };
 
     if (rules) {
@@ -203,6 +294,9 @@ void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth, c
         box.text = firstText(e);
         if (box.text.empty()) box.text = L"Button";
     }
+    else if (e->tag == L"select") {
+        box.control = LayoutBox::Select;
+    }
     else if (type == L"submit" || type == L"button" || type == L"reset" || type == L"image") {
         box.control = LayoutBox::Button;
         box.text = getAttr(e, L"value", L"");
@@ -229,6 +323,10 @@ void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth, c
     case LayoutBox::Button:
         box.width = std::min(std::max((int)textWidth(box.text, box.fontSize) + 24, 40), maxWidth);
         box.height = buttonHeight;
+        break;
+    case LayoutBox::Select:
+        box.width = std::min(160, maxWidth);
+        box.height = fieldHeight;
         break;
     default: // Checkbox
         box.width = checkboxSize;
@@ -288,13 +386,25 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
     if (!el) return;
     ancestorStack.push_back(el); // `el` is an ancestor of every child laid out below
 
+    // Consecutive text/inline-level children (e.g. "Hello <a>link</a> world")
+    // are buffered here so they word-wrap together as one flowing run,
+    // instead of each one starting a block of its own. A block-level child,
+    // or the end of `el`'s children, flushes whatever's pending so far.
+    std::vector<InlineItem> pendingInline;
+    auto flushInline = [&]() {
+        if (!pendingInline.empty()) {
+            layoutInlineRun(pendingInline, x, y, containingWidth);
+            pendingInline.clear();
+        }
+    };
+
     // Loop over each child node
     for (auto& child : el->children) {
 
         // Case 1: Text node (simple paragraph text)
         if (child->type == Node::TEXT) {
             auto tnode = static_cast<TextNode*>(child.get());
-            layoutText(tnode->text, x, y, containingWidth, inheritedFontSize, el);
+            appendWords(tnode->text, inheritedFontSize, currentHref, el, pendingInline);
         }
 
         //  Case 2: Element node (<div>, <p>, <span>, etc.)
@@ -311,18 +421,43 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
                 e->tag == L"base")
                 continue;
 
-            ComputedStyle sv = computeStyle(e, inheritedFontSize);
-            if (sv.displayNone) continue; // this element and its subtree take no space
+            if (e->tag == L"br") {
+                pendingInline.push_back({ L"", inheritedFontSize, L"", nullptr, true });
+                continue;
+            }
 
-            if (e->tag == L"input" || e->tag == L"button") {
+            ComputedStyle sv = computeStyle(e, inheritedFontSize);
+            if (sv.display == Display::None) continue; // this element and its subtree take no space
+
+            if (e->tag == L"input" || e->tag == L"button" || e->tag == L"select") {
+                flushInline();
                 layoutControl(e, x, y, containingWidth, sv);
                 continue;
             }
 
             if (e->tag == L"img") {
+                flushInline();
                 layoutImage(e, x, y, containingWidth, sv);
                 continue;
             }
+
+            if (sv.display == Display::Inline) {
+                // Joins the current run rather than starting a block: its
+                // text (and any nested inline content) flows onto the same
+                // line as its surrounding siblings.
+                std::wstring savedHref = currentHref;
+                if (e->tag == L"a") {
+                    auto href = e->attrs.find(L"href");
+                    if (href != e->attrs.end()) currentHref = href->second;
+                }
+                collectInline(e, sv.fontSize, pendingInline);
+                currentHref = savedHref;
+                continue;
+            }
+
+            // Block-level: close out any pending inline run first so it
+            // renders above this block, in document order.
+            flushInline();
 
             y += sv.marginTop;
             int contentStartY = y;
@@ -368,5 +503,6 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
         }
     }
 
+    flushInline();
     ancestorStack.pop_back();
 }

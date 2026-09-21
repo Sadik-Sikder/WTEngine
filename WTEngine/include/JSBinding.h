@@ -10,6 +10,8 @@ struct ListenerStorage; // opaque; holds registered addEventListener callbacks -
                         // definition (and quickjs.h) stays confined to JSBinding.cpp, out of every
                         // Engine.h includer. Same forward-declare-and-define-elsewhere shape as
                         // Engine's own unique_ptr<JSEngine>.
+struct TimerStorage;    // opaque, same treatment as ListenerStorage: holds pending setTimeout/
+                        // setInterval callbacks (JSValues), so quickjs.h stays out of Engine.h too.
 
 // Per-page state the DOM bindings need beyond what's reachable from a
 // wrapped node's own opaque pointer:
@@ -34,6 +36,7 @@ struct DOMBindingState {
     std::vector<std::shared_ptr<Node>> detachedNodes;
     bool domDirty = false;
     std::unique_ptr<ListenerStorage> listeners;
+    std::unique_ptr<TimerStorage> timers; // pending setTimeout/setInterval callbacks
 };
 
 // Installs `document` (wrapping `documentRoot` - pass the page's <body>)
@@ -49,3 +52,9 @@ void installDOMBindings(JSContext* ctx, Element* documentRoot, DOMBindingState* 
 // (e.g. following a link) for this click. Does not support
 // stopPropagation(): every ancestor's listeners always run.
 bool dispatchClick(JSContext* ctx, Element* target);
+
+// Fires any setTimeout/setInterval callback due by `nowSeconds` - the same
+// clock Engine::render's `timeSeconds` parameter already uses (glfwGetTime()
+// via main.cpp). Called once per frame from Engine::render, the same
+// per-frame polling pattern already used for domDirty/imageGeneration.
+void fireDueTimers(JSContext* ctx, double nowSeconds);

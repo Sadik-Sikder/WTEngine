@@ -68,6 +68,17 @@ std::wstring JSEngine::eval(const std::wstring& code) {
         const char* msg = JS_ToCString(ctx, exc);
         out = L"Error: " + utf8ToWide(msg);
         JS_FreeCString(ctx, msg);
+
+        // Error objects quickjs throws carry a "stack" string (source
+        // position, call frames) that JS_ToCString(exc) alone doesn't
+        // include - append it so a logged error is actually traceable back
+        // to the script/line that threw, not just its message.
+        JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
+        const char* stackStr = JS_ToCString(ctx, stack);
+        if (stackStr && *stackStr) out += L"\n" + utf8ToWide(stackStr);
+        JS_FreeCString(ctx, stackStr);
+        JS_FreeValue(ctx, stack);
+
         JS_FreeValue(ctx, exc);
     }
     else {

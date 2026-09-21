@@ -6,6 +6,7 @@
 #include "CSS.h"
 #include "HTMLParser.h"
 #include <windows.h>
+#include <algorithm>
 #include <cwctype>
 #include <map>
 
@@ -63,7 +64,32 @@ struct ListenerStorage {
     }
 };
 
-DOMBindingState::DOMBindingState() : listeners(std::make_unique<ListenerStorage>()) {}
+// ---------------------------------------------------------------------
+// Pending setTimeout/setInterval callbacks. Owns a JSValue per timer (like
+// ListenerStorage owns one per click listener), freed either when the timer
+// fires/is cleared or, for whatever's left, in the destructor - same
+// per-navigation reset as ListenerStorage via DOMBindingState's move
+// assignment.
+struct Timer {
+    int id;
+    JSValue callback;
+    double periodSeconds; // one-shot delay, or repeat period for setInterval
+    double nextFire;      // absolute engine-clock time this timer is next due
+    bool repeating;
+};
+struct TimerStorage {
+    std::vector<Timer> timers;
+    int nextId = 1;
+    double now = 0; // last time seen via fireDueTimers; baseline new timers schedule against
+    JSContext* ctx = nullptr;
+    ~TimerStorage() {
+        if (!ctx) return;
+        for (auto& t : timers) JS_FreeValue(ctx, t.callback);
+    }
+};
+
+DOMBindingState::DOMBindingState()
+    : listeners(std::make_unique<ListenerStorage>()), timers(std::make_unique<TimerStorage>()) {}
 DOMBindingState::~DOMBindingState() = default;
 DOMBindingState::DOMBindingState(DOMBindingState&&) noexcept = default;
 DOMBindingState& DOMBindingState::operator=(DOMBindingState&&) noexcept = default;
@@ -492,6 +518,84 @@ bool dispatchClick(JSContext* ctx, Element* target) {
     return prevented;
 }
 
+// --- setTimeout / setInterval / clearTimeout / clearInterval -----------
+// Globals, not Node methods - registered directly on the global object in
+// installDOMBindings below. setTimeout and setInterval share one magic-
+// tagged function (magic 0 = one-shot, 1 = repeating), the same mechanism
+// already used for id/className (js_get_attr_magic/js_set_attr_magic)
+// below, and the same pattern quickjs-ng's own quickjs-libc.c uses for its
+// os.setTimeout/os.setInterval. clearTimeout/clearInterval both map to one
+// function, matching quickjs-libc.c doing the same for os.clearTimeout/
+// os.clearInterval.
+
+static JSValue js_setTimer(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv, int magic) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state || argc < 1 || !JS_IsFunction(ctx, argv[0])) return JS_NewInt32(ctx, 0);
+
+    double delayMs = 0;
+    if (argc >= 2) JS_ToFloat64(ctx, &delayMs, argv[1]);
+    double delaySeconds = std::max(delayMs, 0.0) / 1000.0;
+
+    TimerStorage& ts = *state->timers;
+    int id = ts.nextId++;
+    ts.timers.push_back({ id, JS_DupValue(ctx, argv[0]), delaySeconds, ts.now + delaySeconds, magic == 1 });
+    return JS_NewInt32(ctx, id);
+}
+
+static JSValue js_clearTimer(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state || argc < 1) return JS_UNDEFINED;
+    int32_t id = 0;
+    JS_ToInt32(ctx, &id, argv[0]);
+
+    auto& v = state->timers->timers;
+    auto it = std::find_if(v.begin(), v.end(), [&](const Timer& t) { return t.id == id; });
+    if (it != v.end()) {
+        JS_FreeValue(ctx, it->callback);
+        v.erase(it);
+    }
+    return JS_UNDEFINED;
+}
+
+void fireDueTimers(JSContext* ctx, double nowSeconds) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state) return;
+    TimerStorage& ts = *state->timers;
+    ts.now = nowSeconds;
+
+    // Snapshot which timers are due first, then re-look-up each by id right
+    // before calling it - same iterate-a-copy defense dispatchClick uses
+    // above, since a callback can cancel another pending timer (or itself)
+    // mid-batch. A timer scheduled by a callback during this pass (e.g.
+    // setTimeout(fn, 0) called from inside another timer) is never in this
+    // snapshot, so it can't fire until a later frame - no same-frame
+    // recursion risk.
+    std::vector<int> dueIds;
+    for (auto& t : ts.timers) if (t.nextFire <= nowSeconds) dueIds.push_back(t.id);
+
+    for (int id : dueIds) {
+        auto it = std::find_if(ts.timers.begin(), ts.timers.end(), [&](const Timer& t) { return t.id == id; });
+        if (it == ts.timers.end()) continue; // cancelled by an earlier callback in this same batch
+
+        JSValue fn = JS_DupValue(ctx, it->callback); // survives `it` being erased/reallocated below
+        bool repeating = it->repeating;
+        double period = it->periodSeconds;
+
+        JSValue result = JS_Call(ctx, fn, JS_UNDEFINED, 0, nullptr);
+        if (JS_IsException(result)) JS_FreeValue(ctx, JS_GetException(ctx)); // swallow; keep firing the rest
+        JS_FreeValue(ctx, result);
+        JS_FreeValue(ctx, fn);
+
+        it = std::find_if(ts.timers.begin(), ts.timers.end(), [&](const Timer& t) { return t.id == id; });
+        if (it == ts.timers.end()) continue; // cleared itself (or was cleared) during its own call
+        if (repeating) it->nextFire = nowSeconds + period; // resync to now, not backlog-catch-up
+        else {
+            JS_FreeValue(ctx, it->callback);
+            ts.timers.erase(it);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 
 static const JSCFunctionListEntry js_node_proto_funcs[] = {
@@ -515,9 +619,17 @@ static const JSCFunctionListEntry js_node_proto_funcs[] = {
     JS_CFUNC_DEF("addEventListener", 2, js_addEventListener),
 };
 
+static const JSCFunctionListEntry js_global_funcs[] = {
+    JS_CFUNC_MAGIC_DEF("setTimeout", 2, js_setTimer, 0),
+    JS_CFUNC_MAGIC_DEF("setInterval", 2, js_setTimer, 1),
+    JS_CFUNC_DEF("clearTimeout", 1, js_clearTimer),
+    JS_CFUNC_DEF("clearInterval", 1, js_clearTimer),
+};
+
 void installDOMBindings(JSContext* ctx, Element* documentRoot, DOMBindingState* state) {
     JS_SetContextOpaque(ctx, state);
     state->listeners->ctx = ctx; // so ~ListenerStorage can free stored callbacks
+    state->timers->ctx = ctx;    // so ~TimerStorage can free stored callbacks
 
     JSRuntime* rt = JS_GetRuntime(ctx);
     JS_NewClassID(rt, &js_node_class_id);
@@ -535,5 +647,15 @@ void installDOMBindings(JSContext* ctx, Element* documentRoot, DOMBindingState* 
 
     JSValue global = JS_GetGlobalObject(ctx);
     JS_SetPropertyStr(ctx, global, "document", wrapNode(ctx, documentRoot));
+    JS_SetPropertyFunctionList(ctx, global, js_global_funcs, countof(js_global_funcs));
+    // Real browsers make `window` and the global object the same thing -
+    // `window.foo` and a bare global `foo` read/write the identical
+    // property, and top-level `var`s become properties of both. Aliasing it
+    // this way (rather than a separate wrapper object) gets that for free:
+    // window.document, window.setTimeout, etc. all already work since
+    // they're already global properties, and `window.onload = fn` at least
+    // no longer throws (it just isn't fired - documented gap, no "page
+    // finished loading" event exists yet).
+    JS_SetPropertyStr(ctx, global, "window", JS_DupValue(ctx, global));
     JS_FreeValue(ctx, global);
 }

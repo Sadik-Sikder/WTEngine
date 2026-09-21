@@ -90,6 +90,14 @@ private:
     bool hasSubmission = false;
     FormSubmission submission;
 
+    // The <select> currently showing its dropdown, or nullptr. openSelectBox
+    // is a snapshot of that select's own closed box (doc-space x/y/width/
+    // height/fontSize), captured when opened - it anchors the dropdown's
+    // position and its option rows' hit-testing, since the dropdown itself
+    // isn't part of layoutRoot.boxes (see drawOpenSelect).
+    Element* openSelect = nullptr;
+    LayoutBox openSelectBox;
+
     void parseAndBuild(const std::wstring& html);
     void doLayout();
 
@@ -98,4 +106,5 @@ private:
     void syncValue();
     void queueSubmit(Element* form, Element* submitter);
     void drawControl(Renderer& renderer, const LayoutBox& box, int screenY, double timeSeconds);
+    void drawOpenSelect(Renderer& renderer); // draws openSelect's dropdown rows, if one is open
 };
