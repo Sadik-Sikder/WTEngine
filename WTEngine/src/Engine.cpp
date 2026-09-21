@@ -102,8 +102,13 @@ static bool isClassicScript(Element* scriptEl) {
 // a script can't document.write() more markup mid-parse, since parsing has
 // already finished by the time any script runs).
 void Engine::runScripts() {
+    // Drop the previous page's state FIRST, while its JS runtime still exists:
+    // domState holds JSValues (click listeners, pending timers) that must be
+    // freed against their own runtime, and quickjs asserts if a runtime is
+    // destroyed while any value is still alive. So: state, then old realm, then new.
+    domState = DOMBindingState{};
+    jsEngine.reset();
     jsEngine = std::make_unique<JSEngine>(); // fresh realm per page
-    domState = DOMBindingState{};            // drop the previous page's detached nodes too
     if (!document || !document->body) return;
 
     installDOMBindings(jsEngine->context(), document->body.get(), &domState);
