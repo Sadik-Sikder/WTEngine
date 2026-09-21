@@ -41,7 +41,10 @@ public:
 
     // Handles a click at window (x, y): focuses a text field, toggles a
     // checkbox, or presses a button. Returns true if a control was hit;
-    // otherwise any focused field loses focus.
+    // otherwise any focused field loses focus. When a control is hit, its
+    // addEventListener('click', ...) listeners (and its ancestors', via
+    // bubbling) run first, and event.preventDefault() cancels the toggle /
+    // submit / dropdown - so the caller must not also call dispatchClick.
     bool onClick(int x, int y, double timeSeconds, Renderer& renderer);
 
     // Fires any addEventListener('click', ...) registered on the element

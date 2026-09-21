@@ -90,6 +90,19 @@ namespace {
         return type == L"submit" || type == L"image";
     }
 
+    // True if `target` is still somewhere under `root`. Compared by pointer
+    // only (never dereferenced), so it's safe to ask about an element a script
+    // may have just freed - e.g. by replacing its parent's innerHTML.
+    bool treeContains(const Element* root, const Element* target) {
+        if (root == target) return true;
+        for (auto& child : root->children) {
+            if (child->type == Node::ELEMENT &&
+                treeContains(static_cast<const Element*>(child.get()), target))
+                return true;
+        }
+        return false;
+    }
+
     void appendField(std::string& body, const std::wstring& name, const std::wstring& value) {
         if (name.empty()) return; // unnamed controls aren't submitted
         if (!body.empty()) body.push_back('&');
@@ -198,6 +211,21 @@ bool Engine::onClick(int x, int y, double now, Renderer& renderer) {
         return false;
     }
 
+    // Run addEventListener('click') handlers first, bubbling up from the
+    // control like any other click. preventDefault() then cancels the
+    // control's own action below (toggle, submit, open the dropdown) - but not
+    // focusing a text field, matching browsers, where click's preventDefault
+    // doesn't stop focus.
+    bool prevented = jsEngine && ::dispatchClick(jsEngine->context(), b->el);
+
+    // A handler that rewrote the page (innerHTML=, removeChild, ...) may have
+    // freed the control we're about to act on; if so there's nothing left to do.
+    if (domState.domDirty && document && document->body &&
+        !treeContains(document->body.get(), b->el)) {
+        blurInput();
+        return true;
+    }
+
     switch (b->control) {
     case LayoutBox::TextField: {
         bool isDouble = editor.registerClick(x, now);
@@ -210,15 +238,17 @@ bool Engine::onClick(int x, int y, double now, Renderer& renderer) {
     }
     case LayoutBox::Button:
         blurInput();
-        if (b->form && isSubmitButton(b->el)) queueSubmit(b->form, b->el);
+        if (!prevented && b->form && isSubmitButton(b->el)) queueSubmit(b->form, b->el);
         break;
     case LayoutBox::Checkbox:
         blurInput();
+        if (prevented) break;
         if (b->el->attrs.count(L"checked")) b->el->attrs.erase(L"checked");
         else b->el->attrs[L"checked"] = L"";
         break;
     case LayoutBox::Select:
         blurInput();
+        if (prevented) break;
         openSelect = b->el;
         openSelectBox = *b;
         break;
