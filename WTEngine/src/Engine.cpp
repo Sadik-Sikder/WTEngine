@@ -141,6 +141,7 @@ void Engine::parseAndBuild(const std::wstring& html) {
     focusedEl = nullptr;
     focusedForm = nullptr;
     hasSubmission = false;
+    openSelect = nullptr;
 
     HTMLParser parser;
     document = parser.parse(html);
@@ -166,6 +167,12 @@ void Engine::onResize(int w, int h) {
 void Engine::doLayout() {
     if (!document || !document->body)
         return;
+
+    // Any relayout can move a select's box, invalidating openSelectBox's
+    // snapshot - simplest safe rule is a dropdown doesn't survive a
+    // relayout, loosely matching how a native select popup also closes on
+    // scroll/resize in a real browser.
+    openSelect = nullptr;
 
     layoutRoot.boxes.clear();
     layoutRoot.layout();
@@ -211,6 +218,10 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
         lastImageGeneration = gen;
         doLayout();
     }
+
+    // A setTimeout/setInterval callback may mutate the DOM below (sets
+    // domDirty, same as any other script), so this runs before that check.
+    if (jsEngine) fireDueTimers(jsEngine->context(), timeSeconds);
 
     // A script mutated the DOM (appendChild, textContent=, setAttribute,
     // innerHTML=, ...) since the last layout - re-layout to pick it up.
@@ -261,6 +272,8 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
             );
         }
     }
+
+    drawOpenSelect(renderer); // on top of the page, same treatment main.cpp gives AddressBar
 }
 
 std::wstring Engine::linkAt(int x, int y, Renderer& renderer) const {

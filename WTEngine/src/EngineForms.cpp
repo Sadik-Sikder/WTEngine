@@ -36,6 +36,53 @@ namespace {
         return lower(attrOf(el, L"type")) == L"password";
     }
 
+    // --- <select>/<option> helpers -----------------------------------
+    // A <select>'s selection lives in the DOM the same way a checkbox's
+    // does (attrs["checked"] there, attrs["selected"] on the chosen
+    // <option> here) - so the closed box's label is read live at draw
+    // time below, never baked into a LayoutBox, and picking an option
+    // never needs a re-layout.
+
+    std::vector<Element*> selectOptions(const Element* selectEl) {
+        std::vector<Element*> out;
+        for (auto& child : selectEl->children) {
+            if (child->type != Node::ELEMENT) continue;
+            auto* e = static_cast<Element*>(child.get());
+            if (e->tag == L"option") out.push_back(e);
+        }
+        return out;
+    }
+
+    // No option explicitly marked selected -> the first one, matching how
+    // real HTML defaults an unmarked <select>.
+    Element* selectedOption(const Element* selectEl) {
+        Element* first = nullptr;
+        for (Element* opt : selectOptions(selectEl)) {
+            if (!first) first = opt;
+            if (opt->attrs.count(L"selected")) return opt;
+        }
+        return first;
+    }
+
+    std::wstring optionLabel(const Element* optionEl) {
+        for (auto& child : optionEl->children) {
+            if (child->type == Node::TEXT) return static_cast<TextNode*>(child.get())->text;
+        }
+        return L"";
+    }
+
+    std::wstring optionValue(const Element* optionEl) {
+        auto it = optionEl->attrs.find(L"value");
+        return it != optionEl->attrs.end() ? it->second : optionLabel(optionEl);
+    }
+
+    void chooseOption(Element* selectEl, Element* optionEl) {
+        for (Element* opt : selectOptions(selectEl)) {
+            if (opt == optionEl) opt->attrs[L"selected"] = L"";
+            else opt->attrs.erase(L"selected");
+        }
+    }
+
     // <button> defaults to submit; <input> only when type=submit/image.
     bool isSubmitButton(const Element* el) {
         std::wstring type = lower(attrOf(el, L"type"));
@@ -76,6 +123,9 @@ namespace {
             }
             else if (c->tag == L"button") {
                 if (c == submitter) appendField(body, name, attrOf(c, L"value"));
+            }
+            else if (c->tag == L"select") {
+                if (Element* opt = selectedOption(c)) appendField(body, name, optionValue(opt));
             }
 
             collectFields(c, submitter, body);
@@ -119,6 +169,29 @@ void Engine::syncValue() {
 }
 
 bool Engine::onClick(int x, int y, double now, Renderer& renderer) {
+    if (openSelect) {
+        // Consume this click no matter where it lands - picks an option if
+        // it hit one of the dropdown's rows, otherwise just dismisses it
+        // (clicking outside a native <select> popup doesn't also activate
+        // whatever's underneath).
+        if (y >= topInset) {
+            int docY = y - topInset + scrollY;
+            int rowHeight = std::max(24, openSelectBox.fontSize + 10);
+            int rowY = openSelectBox.y + openSelectBox.height;
+            std::vector<Element*> opts = selectOptions(openSelect);
+            for (size_t i = 0; i < opts.size(); i++) {
+                int top = rowY + (int)i * rowHeight;
+                if (x >= openSelectBox.x && x < openSelectBox.x + openSelectBox.width &&
+                    docY >= top && docY < top + rowHeight) {
+                    chooseOption(openSelect, opts[i]);
+                    break;
+                }
+            }
+        }
+        openSelect = nullptr;
+        return true;
+    }
+
     const LayoutBox* b = controlAt(x, y);
     if (!b) {
         blurInput();
@@ -143,6 +216,11 @@ bool Engine::onClick(int x, int y, double now, Renderer& renderer) {
         blurInput();
         if (b->el->attrs.count(L"checked")) b->el->attrs.erase(L"checked");
         else b->el->attrs[L"checked"] = L"";
+        break;
+    case LayoutBox::Select:
+        blurInput();
+        openSelect = b->el;
+        openSelectBox = *b;
         break;
     default:
         break;
@@ -312,7 +390,51 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
         if (b.el->attrs.count(L"checked")) r.drawRect(fx + 4, fy + 4, fw - 8, fh - 8, kCtlFocus);
         break;
     }
+    case LayoutBox::Select: {
+        // Border/fill like TextField, clipped label like Button - the
+        // closed box always shows whichever <option> is currently
+        // selected, read live rather than baked in at layout time (see
+        // chooseOption/selectedOption), so picking one never needs a
+        // re-layout.
+        r.drawRect(fx - 1, fy - 1, fw + 2, fh + 2, openSelect == b.el ? kCtlFocus : kCtlBorder);
+        r.drawRect(fx, fy, fw, fh, fill);
+        r.setClip(fx + 1, fy + 1, fw - 2, fh - 2);
+        if (Element* opt = selectedOption(b.el)) r.drawText(fx + kInputPad, fy + 4, optionLabel(opt), kFont, kInk);
+        r.clearClip();
+        break;
+    }
     default:
         break;
+    }
+}
+
+// Draws openSelect's dropdown, if one is open: a bordered list positioned
+// right below its closed box (openSelectBox, captured when it was opened -
+// see Engine::onClick), one row per <option>, the selected one highlighted.
+// This isn't part of layoutRoot.boxes - it's transient UI state, not
+// document flow - so it's drawn as a final overlay pass, the same "on top
+// of the page" treatment main.cpp gives AddressBar.
+void Engine::drawOpenSelect(Renderer& r) {
+    if (!openSelect) return;
+
+    const LayoutBox& b = openSelectBox;
+    const float fx = (float)b.x;
+    const float fy = (float)(b.y - scrollY + topInset + b.height);
+    const float fw = (float)b.width;
+    const float kFont = b.fontSize > 0 ? (float)b.fontSize : kDefaultFont;
+    const float rowHeight = (float)std::max(24, b.fontSize + 10);
+
+    std::vector<Element*> opts = selectOptions(openSelect);
+    Element* selected = selectedOption(openSelect);
+    const float listHeight = rowHeight * (float)opts.size();
+
+    r.drawRect(fx - 1, fy - 1, fw + 2, listHeight + 2, kCtlBorder);
+    r.drawRect(fx, fy, fw, listHeight, kWhite);
+    for (size_t i = 0; i < opts.size(); i++) {
+        float rowY = fy + (float)i * rowHeight;
+        if (opts[i] == selected) r.drawRect(fx, rowY, fw, rowHeight, kSelection);
+        r.setClip(fx + 1, rowY + 1, fw - 2, rowHeight - 2);
+        r.drawText(fx + kInputPad, rowY + (rowHeight - kFont) / 2, optionLabel(opts[i]), kFont, kInk);
+        r.clearClip();
     }
 }

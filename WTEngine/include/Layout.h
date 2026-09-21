@@ -11,7 +11,7 @@
 struct LayoutBox {
     // Interactive form controls get a box of their own; the Engine draws
     // and handles them using `el`.
-    enum Control { NoControl, TextField, Button, Checkbox };
+    enum Control { NoControl, TextField, Button, Checkbox, Select };
 
     int x, y, width, height;
     std::wstring background; // e.g. "#rrggbb"
@@ -59,15 +59,33 @@ private:
     int parseFontSize(const std::wstring& s, int def = 14);
     int resolveFontSize(const std::wstring& s, int baseFontSize, int def);
     float textWidth(const std::wstring& text, int fontSize);
-    void layoutText(const std::wstring& text, int x, int& y, int containingWidth, int fontSize, Element* owner);
+
+    // One word of flowing inline content (from a text node, or from an
+    // inline-level element like <a>/<b> flattened into its container's
+    // run - see collectInline), tagged with the style it should render
+    // with. isBreak marks a <br>: a forced line break with no text of its
+    // own.
+    struct InlineItem {
+        std::wstring word;
+        int fontSize = 14;
+        std::wstring href;
+        Element* owner = nullptr;
+        bool isBreak = false;
+    };
+    // Splits `text` on whitespace, appending one InlineItem per word.
+    void appendWords(const std::wstring& text, int fontSize, const std::wstring& href,
+                      Element* owner, std::vector<InlineItem>& out);
+    void collectInline(Element* el, int inheritedFontSize, std::vector<InlineItem>& out);
+    void layoutInlineRun(const std::vector<InlineItem>& items, int x, int& y, int containingWidth);
 
     // The subset of an element's cascaded style that layout cares about -
     // computed once per element and shared by both plain elements and form
     // controls, so both respond to the same CSS/inline styling.
+    enum class Display { Block, Inline, None };
     struct ComputedStyle {
         std::wstring background;
         int marginTop = 6, marginBottom = 6, padding = 6, fontSize = 14;
-        bool displayNone = false;
+        Display display = Display::Block;
     };
     ComputedStyle computeStyle(Element* e, int inheritedFontSize);
     void layoutControl(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
