@@ -266,7 +266,15 @@ std::shared_ptr<Document> HTMLParser::parse(const std::wstring& html) {
     for (auto& n : top) {
         if (n->type != Node::ELEMENT) continue;
         auto found = findBody(std::static_pointer_cast<Element>(n));
-        if (found) { doc->body = found; break; }
+        if (found) {
+            doc->body = found;
+            // <body>'s `parent` points at the element that contains it (normally
+            // <html>), which is owned only by `top` and would be freed when this
+            // function returns - leaving click bubbling (which walks `parent`
+            // up past <body>) reading freed memory. Keep it alive on the Document.
+            doc->root = std::static_pointer_cast<Element>(n);
+            break;
+        }
     }
     if (!doc->body) {
         // create synthetic body merging top-level nodes

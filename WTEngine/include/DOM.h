@@ -30,6 +30,8 @@ struct Element : Node {
 };
 
 struct Document {
+    // The top-level element that contains `body` (normally <html>). Its main
+    // job is ownership: body->parent points at it, and it must outlive parsing.
     std::shared_ptr<Element> root;
     std::shared_ptr<Element> body;
     std::vector<CSS::Rule> styles; // from every <style> block on the page
