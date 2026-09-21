@@ -153,7 +153,8 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
         app->bar.setText(app->currentUrl);
     }
 
-    // Form controls first (focus a field, toggle a checkbox, press a button)
+    // Form controls first (focus a field, toggle a checkbox, press a button).
+    // onClick runs their JS click listeners itself, so a control hit ends here.
     if (app->engine->onClick(x, y, glfwGetTime(), *app->renderer)) return;
 
     std::wstring href = app->engine->linkAt(x, y, *app->renderer);
