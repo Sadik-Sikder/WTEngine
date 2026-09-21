@@ -58,6 +58,24 @@ JSEngine::~JSEngine() {
     if (rt) JS_FreeRuntime(rt);
 }
 
+void runPendingJobs(JSContext* ctx) {
+    JSRuntime* rt = JS_GetRuntime(ctx);
+    for (;;) {
+        JSContext* jobCtx = nullptr;
+        int status = JS_ExecutePendingJob(rt, &jobCtx);
+        if (status == 0) break; // queue is empty
+        if (status < 0) {       // a job threw; log it and keep draining
+            JSValue exc = JS_GetException(jobCtx);
+            const char* msg = JS_ToCString(jobCtx, exc);
+            std::wstring line = L"[promise] Error: " + utf8ToWide(msg) + L"\n";
+            wprintf(L"%ls", line.c_str());
+            OutputDebugStringW(line.c_str());
+            JS_FreeCString(jobCtx, msg);
+            JS_FreeValue(jobCtx, exc);
+        }
+    }
+}
+
 std::wstring JSEngine::eval(const std::wstring& code) {
     std::string src = wideToUtf8(code);
     JSValue result = JS_Eval(ctx, src.c_str(), src.size(), "<eval>", JS_EVAL_TYPE_GLOBAL);
@@ -87,6 +105,7 @@ std::wstring JSEngine::eval(const std::wstring& code) {
         JS_FreeCString(ctx, str);
     }
     JS_FreeValue(ctx, result);
+    runPendingJobs(ctx); // promise callbacks the script queued run right after it, before the next script
     return out;
 }
 

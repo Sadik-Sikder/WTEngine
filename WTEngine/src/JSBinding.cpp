@@ -1,6 +1,7 @@
 // JSBinding.cpp
 #define NOMINMAX
 #include "JSBinding.h"
+#include "JSEngine.h"
 #include "quickjs.h"
 #include "DOM.h"
 #include "CSS.h"
@@ -510,6 +511,7 @@ bool dispatchClick(JSContext* ctx, Element* target) {
             JSValue result = JS_Call(ctx, fn, JS_UNDEFINED, 1, &eventObj);
             if (JS_IsException(result)) JS_FreeValue(ctx, JS_GetException(ctx)); // swallow; keep bubbling
             JS_FreeValue(ctx, result);
+            runPendingJobs(ctx); // this listener's promise callbacks, like a microtask checkpoint
         }
     }
 
@@ -585,6 +587,7 @@ void fireDueTimers(JSContext* ctx, double nowSeconds) {
         if (JS_IsException(result)) JS_FreeValue(ctx, JS_GetException(ctx)); // swallow; keep firing the rest
         JS_FreeValue(ctx, result);
         JS_FreeValue(ctx, fn);
+        runPendingJobs(ctx); // this callback's promise continuations, before the next timer
 
         it = std::find_if(ts.timers.begin(), ts.timers.end(), [&](const Timer& t) { return t.id == id; });
         if (it == ts.timers.end()) continue; // cleared itself (or was cleared) during its own call
