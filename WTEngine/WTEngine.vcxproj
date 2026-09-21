@@ -105,13 +105,14 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>D:\WTEngine\WTEngine\WTEngine\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)third_party\quickjs-ng;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>D:\WTEngine\WTEngine\WTEngine\libs\glfw;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>glfw3.lib;opengl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)libs\glfw;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>glfw3.lib;opengl32.lib;wininet.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -122,10 +123,14 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)third_party\quickjs-ng;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>$(ProjectDir)libs\glfw;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>glfw3.lib;opengl32.lib;wininet.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -136,9 +141,29 @@
     <ClCompile Include="src\TextEditor.cpp" />
     <ClCompile Include="src\Fetcher.cpp" />
     <ClCompile Include="src\HTMLParser.cpp" />
+    <ClCompile Include="src\JSBinding.cpp" />
+    <ClCompile Include="src\JSEngine.cpp" />
     <ClCompile Include="src\Layout.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\OpenGLRenderer.cpp" />
+  </ItemGroup>
+  <!-- The vendored quickjs-ng engine, compiled straight into this project. Mirrors the
+       "qjs" target in third_party/quickjs-ng/CMakeLists.txt (only these four files, C11 with
+       MSVC's C11 atomics). CMake builds the same thing as a static library instead. -->
+  <ItemGroup>
+    <ClCompile Include="third_party\quickjs-ng\dtoa.c" />
+    <ClCompile Include="third_party\quickjs-ng\libregexp.c" />
+    <ClCompile Include="third_party\quickjs-ng\libunicode.c" />
+    <ClCompile Include="third_party\quickjs-ng\quickjs.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Update="third_party\quickjs-ng\*.c">
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <AdditionalOptions>/experimental:c11atomics %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>QUICKJS_NG_BUILD;_GNU_SOURCE;WIN32_LEAN_AND_MEAN;_WIN32_WINNT=0x0601;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <SDLCheck>false</SDLCheck>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\AddressBar.h" />
@@ -149,6 +174,8 @@
     <ClInclude Include="include\TextEditor.h" />
     <ClInclude Include="include\Fetcher.h" />
     <ClInclude Include="include\HTMLParser.h" />
+    <ClInclude Include="include\JSBinding.h" />
+    <ClInclude Include="include\JSEngine.h" />
     <ClInclude Include="include\Layout.h" />
     <ClInclude Include="include\OpenGLRenderer.h" />
     <ClInclude Include="include\Renderer.h" />

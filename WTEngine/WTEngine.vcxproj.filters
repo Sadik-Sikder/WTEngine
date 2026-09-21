@@ -9,6 +9,9 @@
       <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
       <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
     </Filter>
+    <Filter Include="quickjs-ng">
+      <UniqueIdentifier>{5B1E7C1A-3D0B-4E55-9C43-6A0D2F8E7B10}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Resource Files">
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
@@ -36,6 +39,12 @@
     <ClCompile Include="src\HTMLParser.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\JSBinding.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\JSEngine.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\Layout.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -44,6 +53,18 @@
     </ClCompile>
     <ClCompile Include="src\OpenGLRenderer.cpp">
       <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="third_party\quickjs-ng\dtoa.c">
+      <Filter>quickjs-ng</Filter>
+    </ClCompile>
+    <ClCompile Include="third_party\quickjs-ng\libregexp.c">
+      <Filter>quickjs-ng</Filter>
+    </ClCompile>
+    <ClCompile Include="third_party\quickjs-ng\libunicode.c">
+      <Filter>quickjs-ng</Filter>
+    </ClCompile>
+    <ClCompile Include="third_party\quickjs-ng\quickjs.c">
+      <Filter>quickjs-ng</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -69,6 +90,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\HTMLParser.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\JSBinding.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\JSEngine.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\Layout.h">
