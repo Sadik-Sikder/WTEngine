@@ -413,9 +413,9 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
 
             // Non-visual elements produce no boxes and take no space.
             // <noscript> is deliberately not in this list: unlike the others
-            // its content is meant to be shown when JS isn't available -
-            // exactly WTEngine's situation, since it has no JS engine at
-            // all - so it's laid out like a normal container below instead.
+            // its content is meant to be shown when JS isn't available. The
+            // engine does run scripts now, but it doesn't distinguish the two
+            // cases, so <noscript> is laid out like a normal container below.
             if (e->tag == L"head" || e->tag == L"script" || e->tag == L"style" ||
                 e->tag == L"title" || e->tag == L"meta" || e->tag == L"link" ||
                 e->tag == L"base")
