@@ -27,6 +27,13 @@ private:
     struct JSContext* ctx = nullptr;
 };
 
+// Runs every queued promise job (.then/.catch callbacks, async/await
+// continuations) until the queue is empty, like a browser's microtask
+// checkpoint. quickjs never runs these on its own, so call this after
+// anything that can run JS: a script's eval, a timer callback, an event
+// listener. A job that throws is logged and the rest still run.
+void runPendingJobs(struct JSContext* ctx);
+
 // Phase 0 acceptance check: evaluates a trivial expression and reports the
 // result via stdout and OutputDebugStringW. Superseded once a later phase
 // adds real per-page script execution.
