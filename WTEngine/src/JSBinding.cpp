@@ -6,6 +6,7 @@
 #include "DOM.h"
 #include "CSS.h"
 #include "HTMLParser.h"
+#include "Fetcher.h"
 #include <windows.h>
 #include <algorithm>
 #include <cwctype>
@@ -599,6 +600,89 @@ void fireDueTimers(JSContext* ctx, double nowSeconds) {
     }
 }
 
+// --- location: reading the page's URL, and JS-driven navigation --------
+
+// Resolves `href` against the page's own URL (so a relative href works,
+// same as an <a href> click) and queues it for Engine::takeNavigation to
+// pick up next frame - the same "set a flag, let the main loop act on it"
+// pattern already used for a form submission. Silently does nothing for
+// an unresolvable href (a fragment, javascript:, a relative href on a
+// local-file page, ...), same as a plain link click in that situation.
+static void queueNavigation(JSContext* ctx, const std::wstring& href, bool replace) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state) return;
+    std::wstring resolved = resolveUrl(state->pageUrl, href);
+    if (resolved.empty()) return;
+    state->navigationUrl = resolved;
+    state->navigationReplace = replace;
+    state->navigationPending = true;
+}
+
+static JSValue js_location_get_href(JSContext* ctx, JSValueConst /*this_val*/) {
+    DOMBindingState* state = bindingState(ctx);
+    return jsStr(ctx, state ? state->pageUrl : L"");
+}
+
+static JSValue js_location_set_href(JSContext* ctx, JSValueConst /*this_val*/, JSValueConst val) {
+    const char* s = JS_ToCString(ctx, val);
+    std::wstring href = utf8ToWide(s);
+    JS_FreeCString(ctx, s);
+    queueNavigation(ctx, href, false);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_location_replace(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    queueNavigation(ctx, argStr(ctx, argc, argv, 0), true); // like real replace(): no Back-button stop
+    return JS_UNDEFINED;
+}
+
+static JSValue js_location_assign(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    queueNavigation(ctx, argStr(ctx, argc, argv, 0), false);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_location_reload(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
+    if (DOMBindingState* state = bindingState(ctx)) queueNavigation(ctx, state->pageUrl, true);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_location_toString(JSContext* ctx, JSValueConst this_val, int /*argc*/, JSValueConst* /*argv*/) {
+    return js_location_get_href(ctx, this_val);
+}
+
+static const JSCFunctionListEntry js_location_proto_funcs[] = {
+    JS_CGETSET_DEF("href", js_location_get_href, js_location_set_href),
+    JS_CFUNC_DEF("replace", 1, js_location_replace),
+    JS_CFUNC_DEF("assign", 1, js_location_assign),
+    JS_CFUNC_DEF("reload", 0, js_location_reload),
+    JS_CFUNC_DEF("toString", 0, js_location_toString),
+};
+
+// window.location / the bare global `location` (window aliases the global
+// object, so these are the same property): built fresh on every read as a
+// plain object with the function list above installed directly onto it.
+// No dedicated JS class is needed - unlike Node/Event, none of these
+// methods read `this_val`'s own opaque data, only bindingState(ctx) - so
+// there's nothing that needs to survive between one read of `location`
+// and the next.
+static JSValue js_get_location(JSContext* ctx, JSValueConst /*this_val*/) {
+    JSValue obj = JS_NewObject(ctx);
+    if (!JS_IsException(obj))
+        JS_SetPropertyFunctionList(ctx, obj, js_location_proto_funcs, countof(js_location_proto_funcs));
+    return obj;
+}
+
+// `window.location = "..."` / a bare `location = "..."` assignment -
+// coerces the whole right-hand side to a URL string and navigates, the
+// same as setting location.href.
+static JSValue js_set_location(JSContext* ctx, JSValueConst /*this_val*/, JSValueConst val) {
+    const char* s = JS_ToCString(ctx, val);
+    std::wstring href = utf8ToWide(s);
+    JS_FreeCString(ctx, s);
+    queueNavigation(ctx, href, false);
+    return JS_UNDEFINED;
+}
+
 // ---------------------------------------------------------------------
 
 static const JSCFunctionListEntry js_node_proto_funcs[] = {
@@ -627,6 +711,7 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_MAGIC_DEF("setInterval", 2, js_setTimer, 1),
     JS_CFUNC_DEF("clearTimeout", 1, js_clearTimer),
     JS_CFUNC_DEF("clearInterval", 1, js_clearTimer),
+    JS_CGETSET_DEF("location", js_get_location, js_set_location),
 };
 
 void installDOMBindings(JSContext* ctx, Element* documentRoot, DOMBindingState* state) {
@@ -660,5 +745,15 @@ void installDOMBindings(JSContext* ctx, Element* documentRoot, DOMBindingState* 
     // no longer throws (it just isn't fired - documented gap, no "page
     // finished loading" event exists yet).
     JS_SetPropertyStr(ctx, global, "window", JS_DupValue(ctx, global));
+    // WTEngine has no <iframe>/frame support, so every page is its own
+    // top-level window - self/parent/top all legitimately equal window
+    // itself here, same as they would for a real un-framed page. This is
+    // what lets a script like `window.parent.location.replace(url)` work -
+    // a common redirect-trampoline pattern (DuckDuckGo's own search-result
+    // click-through links use exactly this): window.parent resolves to
+    // window, whose .location is the accessor set up above.
+    JS_SetPropertyStr(ctx, global, "self", JS_DupValue(ctx, global));
+    JS_SetPropertyStr(ctx, global, "parent", JS_DupValue(ctx, global));
+    JS_SetPropertyStr(ctx, global, "top", JS_DupValue(ctx, global));
     JS_FreeValue(ctx, global);
 }

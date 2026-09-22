@@ -33,6 +33,16 @@ public:
         forward_.clear(); // a new page invalidates the "future"
     }
 
+    // Like visit(), but overwrites the current page in place instead of
+    // pushing it onto back_ - for a navigation that shouldn't leave a
+    // Back-button stop of its own, e.g. JS location.replace() (real
+    // browsers give that exact method its name for exactly this reason).
+    void replaceCurrent(HistoryEntry entry) {
+        current_ = std::move(entry);
+        hasCurrent_ = true;
+        forward_.clear(); // same as visit(): a new page invalidates the "future"
+    }
+
     bool canGoBack() const { return !back_.empty(); }
     bool canGoForward() const { return !forward_.empty(); }
 

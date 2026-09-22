@@ -108,6 +108,7 @@ void Engine::runScripts() {
     // freed against their own runtime, and quickjs asserts if a runtime is
     // destroyed while any value is still alive. So: state, then old realm, then new.
     domState = DOMBindingState{};
+    domState.pageUrl = pageBaseUrl; // so location.href/.replace()/.assign() have a base
     jsEngine.reset();
     jsEngine = std::make_unique<JSEngine>(); // fresh realm per page
     if (!document || !document->body) return;
@@ -205,6 +206,16 @@ static void loadLinkedStylesheets(Document* doc, const std::wstring& baseUrl) {
                             std::make_move_iterator(extra.begin()),
                             std::make_move_iterator(extra.end()));
     }
+}
+
+bool Engine::takeNavigation(std::wstring& outUrl, bool& outReplace) {
+    if (!domState.navigationPending) return false;
+    outUrl = std::move(domState.navigationUrl);
+    outReplace = domState.navigationReplace;
+    domState.navigationPending = false;
+    domState.navigationUrl.clear();
+    domState.navigationReplace = false;
+    return true;
 }
 
 void Engine::parseAndBuild(const std::wstring& html) {

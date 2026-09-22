@@ -66,6 +66,14 @@ public:
     // Retrieves (and clears) a submission queued by a button press or Enter.
     bool takeSubmission(FormSubmission& out);
 
+    // Retrieves (and clears) a navigation requested by JS - location.href=,
+    // .replace(), .assign(), .reload(), or a bare `location = url` /
+    // `window.location = url` assignment. `outReplace` is true for
+    // .replace()/.reload() - the caller should then overwrite the current
+    // history entry instead of pushing a new one (see
+    // PageHistory::replaceCurrent).
+    bool takeNavigation(std::wstring& outUrl, bool& outReplace);
+
 private:
     int width, height, documentHeight = 0;
     int scrollY = 0;

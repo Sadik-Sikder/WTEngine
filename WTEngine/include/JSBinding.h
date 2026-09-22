@@ -1,5 +1,6 @@
 // JSBinding.h
 #pragma once
+#include <string>
 #include <vector>
 #include <memory>
 
@@ -37,6 +38,19 @@ struct DOMBindingState {
     bool domDirty = false;
     std::unique_ptr<ListenerStorage> listeners;
     std::unique_ptr<TimerStorage> timers; // pending setTimeout/setInterval callbacks
+
+    // The page's own URL - set by Engine::runScripts before any script
+    // runs. Used to resolve a relative URL passed to location.href=/
+    // .replace()/.assign(), and as location.href's own value.
+    std::wstring pageUrl;
+
+    // Set by location.href=/.replace()/.assign()/.reload(), or a bare
+    // `location = url` / `window.location = url` assignment.
+    // Engine::takeNavigation polls this once per frame, the same pattern
+    // already used for domDirty and a queued form submission.
+    bool navigationPending = false;
+    std::wstring navigationUrl;
+    bool navigationReplace = false; // true for .replace()/.reload() - see PageHistory::replaceCurrent
 };
 
 // Installs `document` (wrapping `documentRoot` - pass the page's <body>)
