@@ -324,7 +324,25 @@ quickjs never runs promise jobs on its own; the host must pump them. `runPending
 ### What JS can see
 Everything is installed by `installDOMBindings`.
 
-**Globals:** `document` (a wrapper around `<body>`), `window` (an alias of the global object), `console`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`.
+**Globals:** `document` (a wrapper around `<body>`), `window` (an alias of the global object), `self`/`parent`/`top` (all also aliases of the global object - WTEngine has no `<iframe>`/frame support, so every page legitimately *is* its own top-level, un-framed window, exactly like `self === parent === top === window` for a real un-framed page), `location`, `console`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`.
+
+### `location` and JS-driven navigation
+`window.location` (and the bare global `location`, since `window` aliases the global object) is a plain object, rebuilt fresh on every read - none of its members use their own opaque state, they all go through the current page's `DOMBindingState` (`bindingState(ctx)`), so nothing needs to survive between one read of `location` and the next:
+
+| Member | Behaviour |
+|---|---|
+| `.href` (get/set) | Reads the current page's URL; setting it queues a navigation |
+| `.replace(url)` | Queues a navigation that **overwrites** the current history entry (no Back-button stop) |
+| `.assign(url)` | Queues a normal navigation (a new Back-button stop), same as `.href =` |
+| `.reload()` | Re-navigates to the current URL, `.replace()`-style |
+| `.toString()` | Same as reading `.href` |
+| `window.location = "..."` / bare `location = "..."` | Same as `.href =` |
+
+A relative URL is resolved against the page's own URL with `resolveUrl` - same rule `<img src>`/`<script src>` follow, so it only works on an `http(s)` page - and an unresolvable one (a fragment, `javascript:`, ...) is silently dropped, same as a plain `<a href>` click in that situation.
+
+**Plumbing:** setting `location` doesn't navigate immediately - it sets `DOMBindingState::navigationPending`/`navigationUrl`/`navigationReplace` (`queueNavigation` in `JSBinding.cpp`), the same "set a flag, let the main loop act on it next frame" pattern already used for a queued form submission. `Engine::takeNavigation` (polled once per frame in `main.cpp`, alongside `takeSubmission`) retrieves and clears it; `main.cpp`'s `navigate()` takes a `replace` parameter that selects `PageHistory::replaceCurrent` (overwrite in place) over the normal `visit` (push) - this is what makes `location.replace()` behave like the real thing instead of just being `.assign()` under a different name.
+
+**Why this exists:** a page whose script does `location.href = url` (or the equivalent `.replace()`/`.assign()`) to navigate - extremely common for redirect trampolines, auth callbacks, and click-through/tracking links - would previously throw (`location` didn't exist at all) and go nowhere. DuckDuckGo's own search-result links are exactly this: clicking one lands on `duckduckgo.com/l/?uddg=<target>`, a near-blank page whose entire content is `window.parent.location.replace(target)` (`window.parent` needed fixing too, for the same reason - a real page's own `.parent` is itself, not `undefined`).
 
 **One `Node` class** covers both elements and text nodes:
 
@@ -427,13 +445,13 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 
 **JavaScript**
 - Unhandled promise rejections are silent (no rejection tracker), and errors thrown inside `.then` callbacks become rejections, so they are only visible if you add a `.catch`.
-- No `fetch`/`XMLHttpRequest`, `localStorage`, `location`, `DOMContentLoaded`/`load` events (`window.onload = fn` is accepted but never fired), `element.style`, `element.value`, `innerHTML` getter, `removeEventListener`, `stopPropagation`, or events other than `click`.
+- No `fetch`/`XMLHttpRequest`, `localStorage`, `DOMContentLoaded`/`load` events (`window.onload = fn` is accepted but never fired), `element.style`, `element.value`, `innerHTML` getter, `removeEventListener`, `stopPropagation`, or events other than `click`. (`location` itself is supported - §11.)
 - ES modules (`type="module"`) are skipped.
 - Re-parenting an already-attached node (`appendChild` of an existing element) silently does nothing.
 - No `submit` event on forms (§12).
 
 **Engine**
-- Page navigation and external script/stylesheet fetches block the UI thread.
+- Page navigation and external script/stylesheet fetches block the UI thread - and, worse, `Fetcher.cpp`'s WinINet calls set no explicit timeout, so a slow or stalled server can hang the *entire application* (unresponsive, un-closeable except by killing the process) for as long as WinINet is willing to wait, which observationally can be a long time. Not yet investigated: whether this is specific to certain hosts/response sizes or general. Fixing it likely means an explicit `InternetSetOption` timeout, and/or moving page fetches to a background thread the way image loading already works (`OpenGLRenderer`'s loader pool).
 - Layout is a full re-layout on every change; no incremental layout.
 - The text-texture cache grows without bound.
 - Dropdown lists are not clipped to the window and don't scroll.
