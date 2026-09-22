@@ -78,6 +78,7 @@ src/                       include/
   JSBinding.cpp              JSBinding.h     — DOM/timers/events exposed to JS
   AddressBar.cpp             AddressBar.h
   TextEditor.cpp             TextEditor.h    — caret + selection for one line
+  PageLoader.cpp             PageLoader.h    — background page fetch, §5
                              PageHistory.h   — back/forward stacks (header only)
 third_party/quickjs-ng/    vendored JS engine, built unmodified
 libs/glfw/                 prebuilt glfw3.lib
@@ -120,14 +121,20 @@ The key design choice: **layout produces a flat, absolute-positioned list of box
 Each iteration (capped at ~60 fps with `Sleep`):
 
 1. **Apply pending actions** set by input callbacks: history back/forward (`pendingHistory`), navigation (`pendingUrl`), and a queued form submission (`engine.takeSubmission`). Callbacks never navigate directly; they set a flag and the loop does it. That keeps fetching out of the callback stack.
-2. Clear, set the viewport, `engine.onResize()`.
-3. `renderer.beginFrame()` then `engine.render()` — draws the page.
-4. `bar.draw()` — drawn **after** the page so it covers content scrolled under it.
-5. Choose the cursor (I-beam over text fields/address bar, hand over links/buttons/nav buttons).
-6. Swap buffers, poll events, sleep the remainder of the 16.6 ms budget.
+2. `applyFinishedNavigation` — shows a background page fetch's result the moment it's ready (below).
+3. Clear, set the viewport, `engine.onResize()`.
+4. `renderer.beginFrame()` then `engine.render()` — draws the page.
+5. `bar.draw()` — drawn **after** the page so it covers content scrolled under it.
+6. Choose the cursor (I-beam over text fields/address bar, hand over links/buttons/nav buttons).
+7. Swap buffers, poll events, sleep the remainder of the 16.6 ms budget.
 
-### Navigation
-- `navigate(url, postBody?)` → `fetchPage()`; on success `visitPage(finalUrl, html)`, on failure it shows a generated red error page.
+### Navigation (`PageLoader`)
+Page fetching is **backgrounded**: `navigate(url, postBody?)` doesn't call `fetchPage()` itself, it calls `app.pageLoader.start(url, postBody, replace)`, which launches a detached `std::thread` to do the actual `fetchPage()` call and returns immediately - so the frame loop, and the window's message pump with it, keeps running while a fetch is in flight, however long it takes. `applyFinishedNavigation` polls `pageLoader.poll(...)` once per frame; the moment a result is ready, it shows the page (`visitPage`) or a generated red error page, exactly as if the fetch had been synchronous.
+
+- **Why:** a single blocking `fetchPage()` call used to freeze the *entire application* - unresponsive, un-closeable except by killing the process - for as long as the underlying WinINet call took. Observed cause: a real site whose IPv6 route is black-holed makes WinINet wait through the OS's full TCP connect timeout (~20-30s) before falling back to the working IPv4 address, and nothing bounded that wait.
+- **Superseding:** starting a new fetch (or `goHistory`'s Back/Forward, which calls `pageLoader.cancel()`) abandons whatever was previously in flight. Its thread keeps running fetchPage() to completion regardless - cheaper than trying to interrupt a blocking WinINet call - but its result is just never read once nothing points at it anymore. See `PageLoader.h`'s comments for how this is made thread-safe (the tricky part: not destroying the result slot's mutex while a `lock_guard` still holds it - a real bug caught during development via a Debug-CRT "unlock of unowned mutex" assertion).
+- **Timeout:** `poll()` also gives up on a fetch that's been running longer than 8 seconds, reporting it as failed ("Timed out") from the application's side - independent of whatever WinINet or the OS is still doing with the underlying connection. This turned out to be necessary, not just a nicety: shortening WinINet's own timeout options (`INTERNET_OPTION_CONNECT_TIMEOUT` etc.) didn't reliably shorten how long a stuck connection attempt actually took.
+- **Scope:** only the top-level page fetch goes through `PageLoader`. A page's own `<script src>` and `<link rel=stylesheet>` fetches (`Engine::runScripts`/`Engine::parseAndBuild`) still run synchronously once that page's HTML is already in hand - a smaller, separate blocking window not addressed here (same host as the page that just loaded, so usually already known reachable).
 - `visitPage` saves the scroll offset of the page being left, pushes a new `HistoryEntry`, then `showEntry`.
 - `showEntry` calls `engine.loadHTML(html, url)`, restores the scroll position, and updates the window title and address bar. (The window title is the URL — `<title>` content is discarded by the parser.)
 - `goHistory(±1)` re-displays a stored entry **from its saved HTML** — no network request, and a POSTed result is not re-sent.
@@ -451,7 +458,8 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 - No `submit` event on forms (§12).
 
 **Engine**
-- Page navigation and external script/stylesheet fetches block the UI thread - and, worse, `Fetcher.cpp`'s WinINet calls set no explicit timeout, so a slow or stalled server can hang the *entire application* (unresponsive, un-closeable except by killing the process) for as long as WinINet is willing to wait, which observationally can be a long time. Not yet investigated: whether this is specific to certain hosts/response sizes or general. Fixing it likely means an explicit `InternetSetOption` timeout, and/or moving page fetches to a background thread the way image loading already works (`OpenGLRenderer`'s loader pool).
+- Page navigation itself no longer blocks the UI thread (`PageLoader`, §5) and gives up after 8s if a fetch is stuck. External script/stylesheet fetches (`<script src>`, `<link rel=stylesheet>`) still do block, once a page's own HTML is already in hand - a smaller remaining window, not yet backgrounded.
+- In one specific environment (a sandboxed dev/test session), a stuck low-level connection attempt (a black-holed IPv6 route) still appeared to freeze the whole process for a while even with `PageLoader` in place, despite the 8s timeout demonstrably firing correctly when the same code path was tested with no networking involved (a plain background sleep). That points at something *outside* the application - most likely network-connection monitoring in that sandbox - rather than a flaw in `PageLoader` itself, but it means the fix's real-world effectiveness against a truly stuck connection hasn't been confirmed outside that one environment. Worth re-testing on a normal machine.
 - Layout is a full re-layout on every change; no incremental layout.
 - The text-texture cache grows without bound.
 - Dropdown lists are not clipped to the window and don't scroll.
