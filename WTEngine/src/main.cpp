@@ -10,6 +10,7 @@
 #include "JSEngine.h"
 #include "OpenGLRenderer.h"
 #include "PageHistory.h"
+#include "PageLoader.h"
 
 static const wchar_t* kDefaultPage =
     L"<html><head><title>WTEngine</title></head><body>"
@@ -32,6 +33,7 @@ struct App {
     std::wstring pendingUrl; // set by input callbacks, handled in the main loop
     int pendingHistory = 0;  // -1 = go back, +1 = go forward (also handled in the main loop)
     PageHistory history;
+    PageLoader pageLoader; // fetches navigate()'s target in the background; see applyFinishedNavigation
 };
 
 static std::string toUtf8(const std::wstring& w) {
@@ -90,11 +92,26 @@ static void replacePage(App& app, const std::wstring& url, const std::wstring& h
     showEntry(app, *app.history.current());
 }
 
-// Loads `url` (as a POST if `postBody` is given), or an error page if the
-// fetch fails. `replace` selects replacePage over visitPage (see above).
+// Starts fetching `url` in the background (as a POST if `postBody` is
+// given) - see PageLoader. Superseding whatever was previously in flight
+// (a second navigate() call, or goHistory()'s Back/Forward) is fine and
+// expected; nothing shows until applyFinishedNavigation picks up a result.
+// `replace` is carried through to it unchanged.
 static void navigate(App& app, const std::wstring& url, const std::string* postBody = nullptr,
                      bool replace = false) {
-    FetchResult res = fetchPage(url, postBody);
+    app.pageLoader.start(url, postBody, replace);
+}
+
+// Called once per frame: shows a navigate()-started fetch's result the
+// moment it's ready - the actual page, or a "Failed to load" page if the
+// fetch failed. Does nothing while no fetch has finished (including while
+// none is in flight at all).
+static void applyFinishedNavigation(App& app) {
+    FetchResult res;
+    std::wstring url;
+    bool replace = false;
+    if (!app.pageLoader.poll(res, url, replace)) return;
+
     auto show = replace ? replacePage : visitPage;
     if (res.ok) {
         show(app, res.finalUrl.empty() ? url : res.finalUrl, res.html);
@@ -107,7 +124,11 @@ static void navigate(App& app, const std::wstring& url, const std::string* postB
 }
 
 // Back (-1) or forward (+1) through the history; does nothing at either end.
+// Cancels any in-flight background navigation first - Back/Forward always
+// wins over a load that was already on its way, and redisplays cached
+// HTML instantly regardless, so there's nothing worth waiting for anyway.
 static void goHistory(App& app, int direction) {
+    app.pageLoader.cancel();
     app.history.saveScroll(app.engine->getScrollY());
     const HistoryEntry* entry = direction < 0 ? app.history.back() : app.history.forward();
     if (entry) showEntry(app, *entry);
@@ -304,6 +325,10 @@ int wmain(int argc, wchar_t** argv) {
     GLFWcursor* ibeamCursor = glfwCreateStandardCursor(GLFW_IBEAM_CURSOR);
     GLFWcursor* shownCursor = nullptr; // nullptr = default arrow
 
+    // A command-line URL starts loading in the background (see navigate());
+    // the window opens blank and applyFinishedNavigation shows it once
+    // ready, same as any other navigation. The built-in default page needs
+    // no fetch, so it shows immediately.
     if (argc > 1) navigate(app, argv[1]);
     else visitPage(app, L"", kDefaultPage);
 
@@ -328,6 +353,8 @@ int wmain(int argc, wchar_t** argv) {
         std::wstring navUrl;
         bool navReplace = false;
         if (engine.takeNavigation(navUrl, navReplace)) navigate(app, navUrl, nullptr, navReplace);
+
+        applyFinishedNavigation(app); // shows a navigate()-started fetch's result once it's ready
 
         int width, height;
         glfwGetFramebufferSize(window, &width, &height);

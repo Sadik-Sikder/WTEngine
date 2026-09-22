@@ -54,6 +54,9 @@
     <ClCompile Include="src\OpenGLRenderer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\PageLoader.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="third_party\quickjs-ng\dtoa.c">
       <Filter>quickjs-ng</Filter>
     </ClCompile>
@@ -102,6 +105,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\OpenGLRenderer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\PageLoader.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\Renderer.h">
