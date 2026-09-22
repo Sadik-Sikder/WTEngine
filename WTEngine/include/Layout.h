@@ -96,13 +96,21 @@ private:
     // The subset of an element's cascaded style that layout cares about -
     // computed once per element and shared by both plain elements and form
     // controls, so both respond to the same CSS/inline styling.
-    enum class Display { Block, Inline, None };
+    enum class Display { Block, Inline, None, Grid };
     // Only meaningful with an explicit `width` set; ContentBox (the CSS
     // default) means `width` names the content box, so padding/border add
     // to it - BorderBox means `width` already includes them. See
     // layoutElement's box-model math for how each is turned into an
     // outer/content width.
     enum class BoxSizing { ContentBox, BorderBox };
+    // One track of a `grid-template-columns` list: either a fixed pixel
+    // width, or a share of whatever width is left after every fixed track
+    // and gap is subtracted (a "fr" unit - e.g. "1fr 2fr" splits the
+    // remainder 1:2).
+    struct GridTrack {
+        bool isFr;
+        float value;
+    };
     struct ComputedStyle {
         std::wstring background;
         int marginTop = 6, marginBottom = 6, marginLeft = 0, marginRight = 0;
@@ -113,6 +121,11 @@ private:
         BoxSizing boxSizing = BoxSizing::ContentBox;
         int fontSize = 14;
         Display display = Display::Block;
+        // Only meaningful with display:grid. Empty means no explicit
+        // grid-template-columns was set - layoutGrid then falls back to one
+        // full-width column, so items still stack rather than disappear.
+        std::vector<GridTrack> gridTemplateColumns;
+        int rowGap = 0, columnGap = 0; // from `gap`/`row-gap`/`column-gap`
     };
     ComputedStyle computeStyle(Element* e, int inheritedFontSize, int containingWidth);
     // Splits a shorthand value like "4px 8px" on whitespace and expands it
@@ -121,8 +134,25 @@ private:
     // to parse, fall back to `def`.
     void parseBoxShorthand(const std::wstring& v, int containingWidth, int def,
                             int& top, int& right, int& bottom, int& left);
+    // Parses a grid-template-columns value (see the .cpp for exactly what's
+    // supported: px/%/fr tracks and repeat(N, <track>); an unsupported
+    // keyword like auto or minmax() becomes 1fr, so the track *count* an
+    // author wrote is always honored even where the sizing isn't).
+    std::vector<GridTrack> parseGridTemplateColumns(const std::wstring& v, int containingWidth);
     void layoutControl(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
     void layoutImage(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
+    // The box-model + content treatment layoutElement gives any block-level
+    // child (background/border box, margin/padding, then recurse into
+    // children or - if `style.display` is Grid - into layoutGrid). Factored
+    // out so layoutGrid can give each grid item the exact same treatment,
+    // for one specific element, without duplicating the box-model math.
+    void layoutBlockChild(Element* e, int x, int& y, int containingWidth, const ComputedStyle& style);
+    // Places `el`'s children into a grid instead of flowing them vertically:
+    // resolves grid-template-columns into pixel column widths, then places
+    // items in row-major order (grid-auto-flow: row, the default; explicit
+    // grid-column/grid-row placement isn't supported), one full row at a
+    // time so each row's height can be the tallest item placed in it.
+    void layoutGrid(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
 
     // Ancestors of the element layoutElement is currently iterating the
     // children of (root first); used to match descendant selectors ("a b").
