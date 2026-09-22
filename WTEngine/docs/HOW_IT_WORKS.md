@@ -197,12 +197,15 @@ A hand-written, forgiving, single-pass recursive-descent parser. All text is `st
 | Property | Handling |
 |---|---|
 | `background`, `background-color` | Kept as a string; only `#rrggbb` is understood |
-| `margin-top`, `margin-bottom` | Plain px integer (default 6) |
-| `padding` | Single px value, applied to all four sides (default 6) |
+| `margin`, `padding` | Shorthand: 1/2/3/4 space-separated values, expanded per the usual CSS rule (`T`, `T/R`, `T/R-L/B`, `T/R/B/L`) |
+| `margin-top/right/bottom/left`, `padding-top/right/bottom/left` | Individually, px or `%` (of the containing block's width - CSS's rule for percentage margin/padding on every side, top/bottom included) |
+| `width` | px or `%` of the containing block's width; unset (or `auto`) fills the container, as always |
+| `border`, `border-width`, `border-color` | `border: 1px solid #rrggbb`-style shorthand, or the longhands. The style keyword (`solid`/`dashed`/…) is accepted but ignored - every border draws the same way |
+| `box-sizing` | `content-box` (default) or `border-box`; see §9 |
 | `font-size` | px, `em`, `rem`, `%` (relative to the inherited size); inherited by children |
 | `display` | `none`, `block`, `inline`, `inline-block` (treated as inline) |
 
-Everything else (`color`, `width`, `height`, `border`, `float`, `position`, flex/grid, `font-weight`, …) is parsed and ignored. Text is always black; links are always blue.
+Everything else (`color`, `height`, `float`, `position`, flex/grid, `font-weight`, …) is parsed and ignored. Text is always black; links are always blue. `em`/`rem` aren't supported for `width`/`margin`/`padding`/`border-width` (only `font-size` resolves those) - use px or `%`.
 
 `CSS::parseSelector` and `CSS::matches` are also reused by JS `querySelector`.
 
@@ -211,7 +214,17 @@ Everything else (`color`, `width`, `height`, `border`, `float`, `position`, flex
 `LayoutRoot::layout()` starts at `<body>` at `(10, 10)` with width `viewportWidth − 20` and walks the DOM once, appending to `boxes`.
 
 ### `LayoutBox`
-`x, y, width, height` (document space), plus optional `background`, `text`, `href`, `imageSrc`, `fontSize`, `control` (`TextField | Button | Checkbox | Select`), `el` (source element) and `form` (enclosing `<form>`). One struct serves as a background rectangle, a single word of text, an image, or a form control.
+`x, y, width, height` (document space), plus optional `background`, `borderWidth`/`borderColor`, `text`, `href`, `imageSrc`, `fontSize`, `control` (`TextField | Button | Checkbox | Select`), `el` (source element) and `form` (enclosing `<form>`). One struct serves as a background/border rectangle, a single word of text, an image, or a form control.
+
+### The box model (`ComputedStyle`, `layoutElement`'s block branch)
+`ComputedStyle` carries the full box model for an ordinary block element: `marginTop/Right/Bottom/Left`, `paddingTop/Right/Bottom/Left`, `width` (`-1` = auto), `borderWidth`/`borderColor`, and `boxSizing` (`ContentBox` | `BorderBox`). `layoutElement`'s block branch turns these into two widths before laying out children:
+
+- **`outerWidth`** - what actually gets painted (the border/background edge). With `width` unset, it's `containingWidth - marginLeft - marginRight`, same as always. With `width` set: under `content-box` (the default), `width` names the *content* box, so outer = `width + padding + 2×border`; under `border-box`, `width` already *is* the outer size.
+- **`contentWidth`** - `outerWidth` minus padding and border, and what children are actually laid out into (`layoutElement(e, boxX + border + paddingLeft, y, contentWidth, ...)`).
+
+A background/border box is reserved (as today) before recursing into children, sized to `outerWidth`, with its height patched in afterwards once the children's natural height is known. This still means **explicit CSS `height` isn't supported** - a box is always exactly as tall as its content, `overflow: visible`-style clipping/`height` isn't modeled. `width`/`border`/`box-sizing` currently apply to plain block elements only, not to `<input>`/`<button>`/`<select>` (§`layoutControl`, unchanged) or `<img>` (§`layoutImage`, unchanged) - those keep their own fixed/intrinsic sizing.
+
+`Engine::render` paints a border as four thin rects forming a hollow frame (not one filled rect), so a border with no background still lets whatever's behind the box show through the middle, then paints the background inset by the border width.
 
 ### Algorithm (`layoutElement`)
 For each child:
@@ -221,7 +234,7 @@ For each child:
 - **`<input>`, `<button>`, `<select>`** → flush inline, then `layoutControl`.
 - **`<img>`** → flush inline, then `layoutImage`.
 - **Inline element** (`a span b strong i em u small code sub sup mark label abbr cite q`, or `display:inline`) → `collectInline` flattens its text and nested inline children into the same run. `<a href>` sets `currentHref` for its words.
-- **Block element** → flush inline, add `margin-top`, reserve a background box if it has a background (height patched afterwards), add `padding`, recurse, add padding and `margin-bottom`. `<form>` sets `currentForm` for the subtree.
+- **Block element** → flush inline, resolve the box model above, add `margin-top`, reserve a background/border box if it has either (height patched afterwards), add `border` + `padding-top`, recurse, add `padding-bottom` + `border` and `margin-bottom`. `<form>` sets `currentForm` for the subtree.
 
 ### Inline runs (`layoutInlineRun`)
 Greedy word wrapping. Each word gets its own `LayoutBox` (so words on one line can differ in size, link, or owner). Line height = tallest font on the line + 8. A word wider than a line is split by characters. A 6 px gap follows each run.
@@ -389,7 +402,7 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 - `<title>` is discarded, so the window title is the URL.
 - Colours: only `#rrggbb`. Named colours (`red`), `#rgb`, `rgb(...)` and malformed values (e.g. `#gggggg`) all fall back to light gray. (`parseColor` validates the hex digits, so bad input can't crash the engine.)
 - No external stylesheets (`<link rel=stylesheet>` is ignored), no `@media`, no pseudo-classes, attribute selectors or child/sibling combinators.
-- Only the properties in §8 are honoured; there is no box model beyond margin-top/bottom and uniform padding, no widths, floats, positioning, flex/grid, borders, or text colour/weight.
+- Only the properties in §8 are honoured. `width`/`border`/`box-sizing` work for plain block elements (not for form controls or `<img>`); `height` is not supported at all (boxes are always exactly as tall as their content). No floats, positioning, flex/grid, or text colour/weight. Border is always solid-colored; `border-radius`/`border-style` aren't read.
 - Radio buttons, file inputs, `<textarea>` (content dropped), and multi-line inputs are not supported. A `<select>` shows only direct `<option>` children (no `<optgroup>`).
 
 **JavaScript**
