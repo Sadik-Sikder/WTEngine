@@ -251,13 +251,25 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
             continue;
         }
 
-        // Draw background
+        // Draw border: four thin rects forming a hollow frame, not one
+        // filled rect, so a box with a border but no background still shows
+        // whatever's behind it through the middle - like a real CSS border.
+        if (b.borderWidth > 0) {
+            Color bc = parseColor(b.borderColor);
+            int bw = b.borderWidth;
+            renderer.drawRect(b.x, screenY, b.width, bw, bc);                          // top
+            renderer.drawRect(b.x, screenY + b.height - bw, b.width, bw, bc);          // bottom
+            renderer.drawRect(b.x, screenY, bw, b.height, bc);                         // left
+            renderer.drawRect(b.x + b.width - bw, screenY, bw, b.height, bc);          // right
+        }
+
+        // Draw background, inset by the border so it fills only the middle
         if (!b.background.empty()) {
             renderer.drawRect(
-                b.x,
-                screenY,
-                b.width,
-                b.height,
+                b.x + b.borderWidth,
+                screenY + b.borderWidth,
+                b.width - 2 * b.borderWidth,
+                b.height - 2 * b.borderWidth,
                 parseColor(b.background)
             );
         }
