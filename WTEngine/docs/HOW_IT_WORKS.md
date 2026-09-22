@@ -202,10 +202,12 @@ A hand-written, forgiving, single-pass recursive-descent parser. All text is `st
 | `width` | px or `%` of the containing block's width; unset (or `auto`) fills the container, as always |
 | `border`, `border-width`, `border-color` | `border: 1px solid #rrggbb`-style shorthand, or the longhands. The style keyword (`solid`/`dashed`/…) is accepted but ignored - every border draws the same way |
 | `box-sizing` | `content-box` (default) or `border-box`; see §9 |
+| `grid-template-columns` | Space-separated px/`%`/`fr` tracks, and `repeat(N, <track>)`; see §9's Grid subsection |
+| `gap`, `row-gap`, `column-gap` | `gap: <row>` or `gap: <row> <column>`, px or `%` |
 | `font-size` | px, `em`, `rem`, `%` (relative to the inherited size); inherited by children |
-| `display` | `none`, `block`, `inline`, `inline-block` (treated as inline) |
+| `display` | `none`, `block`, `inline`, `inline-block` (treated as inline), `grid` |
 
-Everything else (`color`, `height`, `float`, `position`, flex/grid, `font-weight`, …) is parsed and ignored. Text is always black; links are always blue. `em`/`rem` aren't supported for `width`/`margin`/`padding`/`border-width` (only `font-size` resolves those) - use px or `%`.
+Everything else (`color`, `height`, `float`, `position`, flex, `font-weight`, …) is parsed and ignored. Text is always black; links are always blue. `em`/`rem` aren't supported for `width`/`margin`/`padding`/`border-width`/grid tracks/`gap` (only `font-size` resolves those) - use px or `%`.
 
 `CSS::parseSelector` and `CSS::matches` are also reused by JS `querySelector`.
 
@@ -220,11 +222,21 @@ Everything else (`color`, `height`, `float`, `position`, flex/grid, `font-weight
 `ComputedStyle` carries the full box model for an ordinary block element: `marginTop/Right/Bottom/Left`, `paddingTop/Right/Bottom/Left`, `width` (`-1` = auto), `borderWidth`/`borderColor`, and `boxSizing` (`ContentBox` | `BorderBox`). `layoutElement`'s block branch turns these into two widths before laying out children:
 
 - **`outerWidth`** - what actually gets painted (the border/background edge). With `width` unset, it's `containingWidth - marginLeft - marginRight`, same as always. With `width` set: under `content-box` (the default), `width` names the *content* box, so outer = `width + padding + 2×border`; under `border-box`, `width` already *is* the outer size.
-- **`contentWidth`** - `outerWidth` minus padding and border, and what children are actually laid out into (`layoutElement(e, boxX + border + paddingLeft, y, contentWidth, ...)`).
+- **`contentWidth`** - `outerWidth` minus padding and border, and what children are actually laid out into.
 
-A background/border box is reserved (as today) before recursing into children, sized to `outerWidth`, with its height patched in afterwards once the children's natural height is known. This still means **explicit CSS `height` isn't supported** - a box is always exactly as tall as its content, `overflow: visible`-style clipping/`height` isn't modeled. `width`/`border`/`box-sizing` currently apply to plain block elements only, not to `<input>`/`<button>`/`<select>` (§`layoutControl`, unchanged) or `<img>` (§`layoutImage`, unchanged) - those keep their own fixed/intrinsic sizing.
+This box-model computation - and reserving the background/border box, sized to `outerWidth`, height patched in once the content's natural height is known - is factored into `layoutBlockChild(e, x, y, containingWidth, style)`, called once per block-level child from `layoutElement`'s loop and, for each grid item, from `layoutGrid` (below). Once the box model is resolved, `layoutBlockChild` recurses into `layoutElement(e, ...)` as always - unless `style.display == Grid`, in which case it calls `layoutGrid(e, ...)` instead.
+
+This still means **explicit CSS `height` isn't supported** - a box is always exactly as tall as its content, `overflow: visible`-style clipping/`height` isn't modeled. `width`/`border`/`box-sizing` currently apply to plain block and grid-item elements only, not to `<input>`/`<button>`/`<select>` (`layoutControl`, unchanged) or `<img>` (`layoutImage`, unchanged) - those keep their own fixed/intrinsic sizing.
 
 `Engine::render` paints a border as four thin rects forming a hollow frame (not one filled rect), so a border with no background still lets whatever's behind the box show through the middle, then paints the background inset by the border width.
+
+### Grid (`layoutGrid`)
+`display: grid` on a block-level element runs `layoutGrid` instead of the usual vertical flow, but only for *that element's own children* - everything above (the grid container's own margin/padding/border/background) is unchanged, since `layoutBlockChild` handles that identically for a block or a grid container.
+
+1. **Columns**: `grid-template-columns` is parsed (`parseGridTemplateColumns`) into a list of `GridTrack { isFr, value }` - a fixed px/`%` width, or an `fr` share. `repeat(N, <track>)` is expanded textually first (`"repeat(3, 1fr)"` → `"1fr 1fr 1fr"`); a track keyword this doesn't understand (`auto`, `minmax(...)`, `fit-content(...)`) becomes `1fr`, so the *number* of columns an author wrote is always honored even where the sizing isn't. No `grid-template-columns` at all falls back to one column spanning the full width (items stack, rather than the grid disappearing). Column pixel widths: sum the fixed tracks and the gaps, split what's left among the `fr` tracks proportionally.
+2. **Items**: `el`'s direct element children (skipping the usual non-visual tags and any `display: none`) are placed into cells row-major, wrapping to a new row after `numCols` items - `grid-auto-flow: row`, the CSS default. **Not supported:** explicit placement (`grid-column`/`grid-row`), `grid-template-areas`, `grid-template-rows`, alignment properties, and a bare (non-element) text node directly inside a grid container is dropped rather than becoming an anonymous item.
+3. **Row height**: a row's height depends on every item in it, which `layoutElement`'s single top-to-bottom `y` sweep can't express - so each row is laid out fully before any of it is placed. Every item in the row is laid out once, into a scratch `boxes` vector at local `(0, 0)` (`std::swap(boxes, scratch)` redirects every `boxes.push_back` anywhere in that call - `layoutControl`, `layoutImage`, or `layoutBlockChild` for a plain item, chosen the same way `layoutElement`'s loop would) to discover its natural height; once every item in the row has been measured, the row's height is the tallest of them, and each item's saved boxes are translated by `(columnX, rowY)` and appended to the real `boxes`. A grid item that would otherwise be `display: inline` (e.g. a bare `<span>`) is "blockified" first, matching real CSS - there's no flowing paragraph for it to join inside a cell.
+4. `ancestorStack` gets `el` (the grid container) pushed for the whole function, so a descendant selector matching a grid item still sees the container as an ancestor, exactly as it would for a plain block's children.
 
 ### Algorithm (`layoutElement`)
 For each child:
@@ -234,7 +246,7 @@ For each child:
 - **`<input>`, `<button>`, `<select>`** → flush inline, then `layoutControl`.
 - **`<img>`** → flush inline, then `layoutImage`.
 - **Inline element** (`a span b strong i em u small code sub sup mark label abbr cite q`, or `display:inline`) → `collectInline` flattens its text and nested inline children into the same run. `<a href>` sets `currentHref` for its words.
-- **Block element** → flush inline, resolve the box model above, add `margin-top`, reserve a background/border box if it has either (height patched afterwards), add `border` + `padding-top`, recurse, add `padding-bottom` + `border` and `margin-bottom`. `<form>` sets `currentForm` for the subtree.
+- **Block element** (or `display: grid`) → flush inline, then `layoutBlockChild`: resolve the box model above, add `margin-top`, reserve a background/border box if it has either (height patched afterwards), add `border` + `padding-top`, recurse into `layoutElement` (or `layoutGrid`, above, if `display: grid`), add `padding-bottom` + `border` and `margin-bottom`. `<form>` sets `currentForm` for the subtree either way.
 
 ### Inline runs (`layoutInlineRun`)
 Greedy word wrapping. Each word gets its own `LayoutBox` (so words on one line can differ in size, link, or owner). Line height = tallest font on the line + 8. A word wider than a line is split by characters. A 6 px gap follows each run.
@@ -402,7 +414,8 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 - `<title>` is discarded, so the window title is the URL.
 - Colours: only `#rrggbb`. Named colours (`red`), `#rgb`, `rgb(...)` and malformed values (e.g. `#gggggg`) all fall back to light gray. (`parseColor` validates the hex digits, so bad input can't crash the engine.)
 - No external stylesheets (`<link rel=stylesheet>` is ignored), no `@media`, no pseudo-classes, attribute selectors or child/sibling combinators.
-- Only the properties in §8 are honoured. `width`/`border`/`box-sizing` work for plain block elements (not for form controls or `<img>`); `height` is not supported at all (boxes are always exactly as tall as their content). No floats, positioning, flex/grid, or text colour/weight. Border is always solid-colored; `border-radius`/`border-style` aren't read.
+- Only the properties in §8 are honoured. `width`/`border`/`box-sizing` work for plain block and grid-item elements (not for form controls or `<img>`); `height` is not supported at all (boxes are always exactly as tall as their content). No floats, positioning, flexbox, or text colour/weight. Border is always solid-colored; `border-radius`/`border-style` aren't read.
+- Grid supports column tracks (px/%/fr, `repeat()`), `gap`, and row-major auto-placement only. Not supported: explicit item placement (`grid-column`/`grid-row`), `grid-template-rows`, `grid-template-areas`, `justify-*`/`align-*`, and subgrid. A bare text node directly inside a grid container is dropped rather than becoming an anonymous item.
 - Radio buttons, file inputs, `<textarea>` (content dropped), and multi-line inputs are not supported. A `<select>` shows only direct `<option>` children (no `<optgroup>`).
 
 **JavaScript**
