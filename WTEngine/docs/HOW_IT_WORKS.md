@@ -178,7 +178,7 @@ A hand-written, forgiving, single-pass recursive-descent parser. All text is `st
 - **Entities:** `&amp; &lt; &gt; &quot; &apos; &nbsp; &copy; &mdash; &ndash; &hellip;` plus numeric `&#N;` / `&#xH;` (BMP only). Decoded in text nodes and attribute values.
 - **Text nodes** are whitespace-trimmed at both ends; empty ones are discarded.
 - **Body discovery:** `findBody` looks anywhere in the tree for `<body>`. If there is none, a synthetic `<body>` wraps all top-level nodes. This is what makes `innerHTML` work: the fragment is parsed as a whole "document" and its synthetic body's children are reused.
-- **Stylesheets:** all `<style>` text is concatenated and parsed once into `Document::styles`.
+- **Stylesheets:** all `<style>` text is concatenated and parsed once into `Document::styles`. `<link rel="stylesheet" href="...">` isn't touched here at all (`<link>` is just a void tag to the parser) - see `Engine::parseAndBuild` in §10 for where those get fetched.
 
 **Important simplification:** an end tag closes the *current* element regardless of its name (`endName` is read but never compared). There are no implied end tags either (an unclosed `<p>`, `<li>` etc. swallows following siblings until some end tag appears). Well-formed pages work; sloppy ones will nest oddly.
 
@@ -271,9 +271,16 @@ Text is measured through a `std::function` set by `Engine` that calls `Renderer:
 **State:** `document`, `layoutRoot`, `scrollY`, `topInset`, `documentHeight`, the per-page JS realm (`jsEngine` + `domState`), and the form/focus state.
 
 ### `loadHTML(html, baseUrl)`
-1. `parseAndBuild` — clears focus/submission/dropdown state, parses, points `layoutRoot` at the new body and rules.
+1. `parseAndBuild` — clears focus/submission/dropdown state, parses, fetches linked stylesheets (below), points `layoutRoot` at the new body and rules.
 2. `runScripts` — see §11.
 3. `doLayout`.
+
+### Linked stylesheets (`loadLinkedStylesheets`, in `parseAndBuild`)
+`<style>` blocks are the only CSS source `HTMLParser` itself understands (§7). Right after parsing, `parseAndBuild` walks the parsed tree (`document->root` if set, else `document->body`) for every `<link rel="stylesheet" href="...">`, in document order, and for each: resolves the href with `resolveUrl` (so a relative href only works against an `http(s)` page - same rule `<img src>` and `<script src>` already follow), fetches it with `fetchPage` (blocking, like a script fetch), and parses the response text with `CSS::parseStylesheet` - straight text parsing, so `fetchPage` never needing to know or care that this particular response happens to be CSS rather than HTML. The resulting rules are appended to `document->styles`, after whatever `<style>` blocks already produced.
+
+Each stylesheet's own rules come back from `parseStylesheet` numbered from 0 (it has no idea it's one of several sources), so before appending, `loadLinkedStylesheets` shifts every rule's `order` up by `document->styles.size()` - the count of rules already collected - keeping specificity ties resolved in a sensible combined order across sources.
+
+**Simplification:** every linked stylesheet's rules end up ordered after every inline `<style>` block's rules, regardless of their true relative position in the markup. Correct for the overwhelmingly common case (stylesheet links in `<head>`, any inline overrides after them); wrong only if a page deliberately puts an overriding `<style>` block *before* its `<link rel=stylesheet>` and relies on that ordering to win a specificity tie.
 
 ### `doLayout()`
 Clears any open dropdown, runs `layoutRoot.layout()`, recomputes `documentHeight` (max box bottom), and clamps `scrollY`.
@@ -413,7 +420,7 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 - Sloppy HTML nests wrongly (any end tag closes the current element; no implied end tags).
 - `<title>` is discarded, so the window title is the URL.
 - Colours: only `#rrggbb`. Named colours (`red`), `#rgb`, `rgb(...)` and malformed values (e.g. `#gggggg`) all fall back to light gray. (`parseColor` validates the hex digits, so bad input can't crash the engine.)
-- No external stylesheets (`<link rel=stylesheet>` is ignored), no `@media`, no pseudo-classes, attribute selectors or child/sibling combinators.
+- External stylesheets (`<link rel=stylesheet>`) are fetched and applied, but always cascade after every inline `<style>` block regardless of true document order (§10). No `@media`, no pseudo-classes, attribute selectors or child/sibling combinators.
 - Only the properties in §8 are honoured. `width`/`border`/`box-sizing` work for plain block and grid-item elements (not for form controls or `<img>`); `height` is not supported at all (boxes are always exactly as tall as their content). No floats, positioning, flexbox, or text colour/weight. Border is always solid-colored; `border-radius`/`border-style` aren't read.
 - Grid supports column tracks (px/%/fr, `repeat()`), `gap`, and row-major auto-placement only. Not supported: explicit item placement (`grid-column`/`grid-row`), `grid-template-rows`, `grid-template-areas`, `justify-*`/`align-*`, and subgrid. A bare text node directly inside a grid container is dropped rather than becoming an anonymous item.
 - Radio buttons, file inputs, `<textarea>` (content dropped), and multi-line inputs are not supported. A `<select>` shows only direct `<option>` children (no `<optgroup>`).
@@ -426,7 +433,7 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 - No `submit` event on forms (§12).
 
 **Engine**
-- Page navigation and external script fetches block the UI thread.
+- Page navigation and external script/stylesheet fetches block the UI thread.
 - Layout is a full re-layout on every change; no incremental layout.
 - The text-texture cache grows without bound.
 - Dropdown lists are not clipped to the window and don't scroll.
