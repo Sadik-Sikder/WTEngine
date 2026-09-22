@@ -81,16 +81,28 @@ static void visitPage(App& app, const std::wstring& url, const std::wstring& htm
     showEntry(app, *app.history.current());
 }
 
-// Loads `url` (as a POST if `postBody` is given), or an error page if the fetch fails.
-static void navigate(App& app, const std::wstring& url, const std::string* postBody = nullptr) {
+// Like visitPage, but replaces the current history entry instead of pushing
+// a new one - for a navigation that shouldn't be a Back-button stop of its
+// own (JS location.replace()/.reload() - see PageHistory::replaceCurrent).
+static void replacePage(App& app, const std::wstring& url, const std::wstring& html) {
+    app.history.saveScroll(app.engine->getScrollY());
+    app.history.replaceCurrent(HistoryEntry{ url, html, 0 });
+    showEntry(app, *app.history.current());
+}
+
+// Loads `url` (as a POST if `postBody` is given), or an error page if the
+// fetch fails. `replace` selects replacePage over visitPage (see above).
+static void navigate(App& app, const std::wstring& url, const std::string* postBody = nullptr,
+                     bool replace = false) {
     FetchResult res = fetchPage(url, postBody);
+    auto show = replace ? replacePage : visitPage;
     if (res.ok) {
-        visitPage(app, res.finalUrl.empty() ? url : res.finalUrl, res.html);
+        show(app, res.finalUrl.empty() ? url : res.finalUrl, res.html);
     }
     else {
-        visitPage(app, url,
-                  L"<html><body><div style='background:#ffd6d6;padding:8px'>Failed to load "
-                  + escapeHtml(url) + L"</div><div>" + escapeHtml(res.error) + L"</div></body></html>");
+        show(app, url,
+             L"<html><body><div style='background:#ffd6d6;padding:8px'>Failed to load "
+             + escapeHtml(url) + L"</div><div>" + escapeHtml(res.error) + L"</div></body></html>");
     }
 }
 
@@ -312,6 +324,10 @@ int wmain(int argc, wchar_t** argv) {
 
         FormSubmission form;
         if (engine.takeSubmission(form)) submitForm(app, form);
+
+        std::wstring navUrl;
+        bool navReplace = false;
+        if (engine.takeNavigation(navUrl, navReplace)) navigate(app, navUrl, nullptr, navReplace);
 
         int width, height;
         glfwGetFramebufferSize(window, &width, &height);
