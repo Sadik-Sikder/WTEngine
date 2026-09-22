@@ -327,11 +327,25 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
                 }
             }
         }
+        else if (k == L"grid-template-columns") sv.gridTemplateColumns = parseGridTemplateColumns(v, containingWidth);
+        else if (k == L"row-gap") sv.rowGap = resolveLength(v, containingWidth, 0);
+        else if (k == L"column-gap") sv.columnGap = resolveLength(v, containingWidth, 0);
+        else if (k == L"gap" || k == L"grid-gap") {
+            // "gap: <row>" sets both; "gap: <row> <column>" sets them
+            // separately, in that order - same order real CSS uses.
+            std::wistringstream ss(v);
+            std::wstring t1, t2;
+            ss >> t1;
+            int g1 = resolveLength(t1, containingWidth, 0);
+            if (ss >> t2) { sv.rowGap = g1; sv.columnGap = resolveLength(t2, containingWidth, 0); }
+            else { sv.rowGap = sv.columnGap = g1; }
+        }
         else if (k == L"font-size") sv.fontSize = resolveFontSize(v, inheritedFontSize, sv.fontSize);
         else if (k == L"display") {
             if (v == L"none") sv.display = Display::None;
             else if (v == L"inline" || v == L"inline-block") sv.display = Display::Inline;
             else if (v == L"block") sv.display = Display::Block;
+            else if (v == L"grid") sv.display = Display::Grid;
         }
     };
 
@@ -353,6 +367,48 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         applyDecl(decl.first, decl.second);
 
     return sv;
+}
+
+// See the declaration in Layout.h for what's supported. repeat(N, <track>)
+// is expanded textually first (e.g. "repeat(3, 1fr)" -> "1fr 1fr 1fr"),
+// then the result is just a space-separated list of px/%/fr tokens.
+std::vector<LayoutRoot::GridTrack> LayoutRoot::parseGridTemplateColumns(const std::wstring& v, int containingWidth) {
+    std::wstring expanded;
+    size_t i = 0;
+    while (i < v.size()) {
+        size_t rep = v.find(L"repeat(", i);
+        if (rep == std::wstring::npos) { expanded += v.substr(i); break; }
+        expanded += v.substr(i, rep - i);
+        size_t close = v.find(L')', rep);
+        if (close == std::wstring::npos) break; // unterminated repeat(; stop, keep what we have so far
+
+        std::wstring args = v.substr(rep + 7, close - rep - 7); // between "repeat(" and ")"
+        size_t comma = args.find(L',');
+        int count = 1;
+        std::wstring track = trimmed(args);
+        if (comma != std::wstring::npos) {
+            try { count = std::max(1, std::stoi(trimmed(args.substr(0, comma)))); } catch (...) {}
+            track = trimmed(args.substr(comma + 1));
+        }
+        for (int n = 0; n < count; n++) { expanded += track; expanded += L' '; }
+        i = close + 1;
+    }
+
+    std::vector<GridTrack> tracks;
+    std::wistringstream ss(expanded);
+    std::wstring tok;
+    while (ss >> tok) {
+        if (tok.size() > 2 && tok.compare(tok.size() - 2, 2, L"fr") == 0) {
+            try { tracks.push_back({ true, (float)std::stod(tok.substr(0, tok.size() - 2)) }); }
+            catch (...) { tracks.push_back({ true, 1.0f }); }
+            continue;
+        }
+        int px = resolveLength(tok, containingWidth, -1);
+        // A keyword this doesn't understand (auto, minmax(...), fit-content(...),
+        // ...) becomes 1fr - see the Layout.h comment on why.
+        tracks.push_back(px >= 0 ? GridTrack{ false, (float)px } : GridTrack{ true, 1.0f });
+    }
+    return tracks;
 }
 
 // Places one <input> or <button> as a box of its own. Controls are laid out
@@ -540,74 +596,180 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
                 continue;
             }
 
-            // Block-level: close out any pending inline run first so it
+            // Block-level (or grid - blockified the same way a real grid
+            // item is): close out any pending inline run first so it
             // renders above this block, in document order.
             flushInline();
-
-            // Box model: turn the cascaded style into an outer width (the
-            // painted border/background edge) and a content width (what's
-            // left for children after padding and border). With no explicit
-            // `width` the box just fills what its container offers, as
-            // always; with one set, box-sizing decides which width it names
-            // - see the BoxSizing comment in Layout.h.
-            int outerWidth;
-            if (sv.width >= 0) {
-                outerWidth = sv.boxSizing == BoxSizing::BorderBox
-                    ? sv.width
-                    : sv.width + sv.paddingLeft + sv.paddingRight + 2 * sv.borderWidth;
-            } else {
-                outerWidth = std::max(containingWidth - sv.marginLeft - sv.marginRight, 0);
-            }
-            int contentWidth = std::max(outerWidth - sv.paddingLeft - sv.paddingRight - 2 * sv.borderWidth, 0);
-            int boxX = x + sv.marginLeft;
-
-            y += sv.marginTop;
-            int contentStartY = y;
-
-            // Reserve a background/border box now (before laying out
-            // children) so it paints behind them, but only if this element
-            // actually declared one — plain structural wrappers like
-            // <html>/<body> get no box at all, they just position their
-            // children.
-            size_t bgIndex = static_cast<size_t>(-1);
-            if (!sv.background.empty() || sv.borderWidth > 0) {
-                LayoutBox box;
-                box.x = boxX;
-                box.y = contentStartY;
-                box.width = outerWidth;
-                box.height = 0; // filled in below once children are laid out
-                box.background = sv.background;
-                box.borderWidth = sv.borderWidth;
-                box.borderColor = sv.borderColor;
-                box.el = e;
-                bgIndex = boxes.size();
-                boxes.push_back(box);
-            }
-
-            y += sv.borderWidth + sv.paddingTop;
-
-            // Recurse into nested elements/text
-            std::wstring savedHref = currentHref;
-            if (e->tag == L"a") {
-                auto href = e->attrs.find(L"href");
-                if (href != e->attrs.end()) currentHref = href->second;
-            }
-            Element* savedForm = currentForm;
-            if (e->tag == L"form") currentForm = e;
-            layoutElement(e, boxX + sv.borderWidth + sv.paddingLeft, y, contentWidth, sv.fontSize);
-            currentHref = savedHref;
-            currentForm = savedForm;
-
-            y += sv.paddingBottom + sv.borderWidth;
-
-            if (bgIndex != static_cast<size_t>(-1)) {
-                boxes[bgIndex].height = y - contentStartY;
-            }
-
-            y += sv.marginBottom;
+            layoutBlockChild(e, x, y, containingWidth, sv);
         }
     }
 
     flushInline();
+    ancestorStack.pop_back();
+}
+
+// See the declaration in Layout.h. This is exactly what layoutElement's own
+// loop used to do inline for a block-level child; factored out so layoutGrid
+// can give a grid item identical box-model treatment without duplicating it.
+void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth, const ComputedStyle& sv) {
+    // Box model: turn the cascaded style into an outer width (the painted
+    // border/background edge) and a content width (what's left for children
+    // after padding and border). With no explicit `width` the box just
+    // fills what its container offers, as always; with one set, box-sizing
+    // decides which width it names - see the BoxSizing comment in Layout.h.
+    int outerWidth;
+    if (sv.width >= 0) {
+        outerWidth = sv.boxSizing == BoxSizing::BorderBox
+            ? sv.width
+            : sv.width + sv.paddingLeft + sv.paddingRight + 2 * sv.borderWidth;
+    } else {
+        outerWidth = std::max(containingWidth - sv.marginLeft - sv.marginRight, 0);
+    }
+    int contentWidth = std::max(outerWidth - sv.paddingLeft - sv.paddingRight - 2 * sv.borderWidth, 0);
+    int boxX = x + sv.marginLeft;
+
+    y += sv.marginTop;
+    int contentStartY = y;
+
+    // Reserve a background/border box now (before laying out children) so
+    // it paints behind them, but only if this element actually declared
+    // one — plain structural wrappers like <html>/<body> get no box at
+    // all, they just position their children.
+    size_t bgIndex = static_cast<size_t>(-1);
+    if (!sv.background.empty() || sv.borderWidth > 0) {
+        LayoutBox box;
+        box.x = boxX;
+        box.y = contentStartY;
+        box.width = outerWidth;
+        box.height = 0; // filled in below once children are laid out
+        box.background = sv.background;
+        box.borderWidth = sv.borderWidth;
+        box.borderColor = sv.borderColor;
+        box.el = e;
+        bgIndex = boxes.size();
+        boxes.push_back(box);
+    }
+
+    y += sv.borderWidth + sv.paddingTop;
+
+    // Recurse into nested elements/text - or, for a grid container, into
+    // layoutGrid instead of the usual vertical flow.
+    std::wstring savedHref = currentHref;
+    if (e->tag == L"a") {
+        auto href = e->attrs.find(L"href");
+        if (href != e->attrs.end()) currentHref = href->second;
+    }
+    Element* savedForm = currentForm;
+    if (e->tag == L"form") currentForm = e;
+
+    int childX = boxX + sv.borderWidth + sv.paddingLeft;
+    if (sv.display == Display::Grid) layoutGrid(e, childX, y, contentWidth, sv);
+    else layoutElement(e, childX, y, contentWidth, sv.fontSize);
+
+    currentHref = savedHref;
+    currentForm = savedForm;
+
+    y += sv.paddingBottom + sv.borderWidth;
+
+    if (bgIndex != static_cast<size_t>(-1)) {
+        boxes[bgIndex].height = y - contentStartY;
+    }
+
+    y += sv.marginBottom;
+}
+
+// Places `el`'s grid items (its direct element children, minus the usual
+// non-visual tags) into a grid: resolves grid-template-columns into pixel
+// column widths, then processes one row at a time - laying out every item
+// in that row first (each into its own scratch box list, at local (0,0), to
+// discover its natural height the same way layoutBlockChild/layoutControl/
+// layoutImage always compute one: by actually laying it out), taking the
+// row's height as the tallest of them, and only then translating each
+// item's boxes into their real position and appending them to `boxes`.
+// This is the only part of grid that couldn't just reuse layoutElement's
+// existing top-to-bottom sweep: a row's height depends on every item placed
+// in it, not just a single running `y`.
+void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style) {
+    ancestorStack.push_back(el); // items' descendant-selector matching includes the grid container
+
+    std::vector<Element*> items;
+    for (auto& child : el->children) {
+        if (child->type != Node::ELEMENT) continue;
+        auto* ce = static_cast<Element*>(child.get());
+        if (ce->tag == L"head" || ce->tag == L"script" || ce->tag == L"style" ||
+            ce->tag == L"title" || ce->tag == L"meta" || ce->tag == L"link" || ce->tag == L"base")
+            continue;
+        // computeStyle is called again per item below, once column widths
+        // are known (it needs containingWidth for %-based item styles) -
+        // this first pass only needs it to filter out display:none items,
+        // the same way layoutElement's own loop does.
+        if (computeStyle(ce, style.fontSize, containingWidth).display == Display::None) continue;
+        items.push_back(ce);
+    }
+    if (items.empty()) { ancestorStack.pop_back(); return; }
+
+    std::vector<GridTrack> cols = style.gridTemplateColumns;
+    if (cols.empty()) cols.push_back({ false, (float)containingWidth }); // no template -> one full-width column
+    int numCols = (int)cols.size();
+
+    int colGap = style.columnGap;
+    int fixedTotal = 0;
+    float frTotal = 0;
+    for (auto& t : cols) { if (t.isFr) frTotal += t.value; else fixedTotal += (int)std::lround(t.value); }
+    int remaining = std::max(containingWidth - colGap * std::max(numCols - 1, 0) - fixedTotal, 0);
+
+    std::vector<int> colWidths(numCols), colX(numCols);
+    int cx = x;
+    for (int i = 0; i < numCols; i++) {
+        int w = cols[i].isFr
+            ? (frTotal > 0 ? (int)std::lround(remaining * (cols[i].value / frTotal)) : 0)
+            : (int)std::lround(cols[i].value);
+        colWidths[i] = std::max(w, 0);
+        colX[i] = cx;
+        cx += colWidths[i] + colGap;
+    }
+
+    int rowY = y;
+    for (size_t i = 0; i < items.size(); i += (size_t)numCols) {
+        if (i > 0) rowY += style.rowGap;
+
+        struct PlacedItem { std::vector<LayoutBox> boxes; int col; };
+        std::vector<PlacedItem> row;
+        int rowHeight = 0;
+        for (size_t j = i; j < std::min(i + (size_t)numCols, items.size()); j++) {
+            int col = (int)(j - i);
+            Element* item = items[j];
+
+            std::vector<LayoutBox> scratch;
+            std::swap(boxes, scratch); // redirect every push_back below into `scratch`
+            int localY = 0;
+            ComputedStyle itemStyle = computeStyle(item, style.fontSize, colWidths[col]);
+            if (item->tag == L"input" || item->tag == L"button" || item->tag == L"select") {
+                layoutControl(item, 0, localY, colWidths[col], itemStyle);
+            } else if (item->tag == L"img") {
+                layoutImage(item, 0, localY, colWidths[col], itemStyle);
+            } else {
+                // A grid item is always block-level, regardless of its own
+                // tag's default (real CSS "blockifies" it the same way).
+                if (itemStyle.display == Display::Inline) itemStyle.display = Display::Block;
+                layoutBlockChild(item, 0, localY, colWidths[col], itemStyle);
+            }
+            std::swap(boxes, scratch);
+
+            rowHeight = std::max(rowHeight, localY);
+            row.push_back({ std::move(scratch), col });
+        }
+
+        for (auto& placed : row) {
+            for (LayoutBox b : placed.boxes) { // copy: translate before appending to the real list
+                b.x += colX[placed.col];
+                b.y += rowY;
+                boxes.push_back(std::move(b));
+            }
+        }
+        rowY += rowHeight;
+    }
+
+    y = rowY;
     ancestorStack.pop_back();
 }
