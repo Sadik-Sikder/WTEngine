@@ -36,34 +36,86 @@ int LayoutRoot::parseFontSize(const std::wstring& s, int def) {
     catch (...) { return def; }
 }
 
-// font-size specifically also supports units relative to `baseFontSize` (the
-// inherited size): em/rem multiply it, % scales it - e.g. real pages commonly
-// write `h1 { font-size: 1.5em }`. Anything else unsupported (pt, vw, ...)
-// falls back to `def`.
-int LayoutRoot::resolveFontSize(const std::wstring& s, int baseFontSize, int def) {
+static std::wstring trimmed(const std::wstring& s) {
     size_t a = 0, b = s.size();
     while (a < b && iswspace(s[a])) a++;
     while (b > a && iswspace(s[b - 1])) b--;
-    std::wstring v = s.substr(a, b - a);
-    if (v.empty()) return def;
+    return s.substr(a, b - a);
+}
 
+// Parses a leading numeric value and trailing unit out of an already-trimmed
+// CSS length like "1.5em" or "50%" (value=1.5, unit=L"em"). False if it
+// doesn't start with a digit (or '.') at all. Shared by resolveFontSize and
+// resolveLength, which each map `unit` to a pixel value against their own base.
+static bool parseNumberAndUnit(const std::wstring& v, double& value, std::wstring& unit) {
     size_t i = 0;
     bool sawDigit = false;
     while (i < v.size() && ((v[i] >= L'0' && v[i] <= L'9') || v[i] == L'.')) {
         if (v[i] != L'.') sawDigit = true;
         i++;
     }
-    if (!sawDigit) return def;
-
-    double value;
+    if (!sawDigit) return false;
     try { value = std::stod(v.substr(0, i)); }
-    catch (...) { return def; }
+    catch (...) { return false; }
+    unit = v.substr(i);
+    return true;
+}
 
-    std::wstring unit = v.substr(i);
+// font-size specifically also supports units relative to `baseFontSize` (the
+// inherited size): em/rem multiply it, % scales it - e.g. real pages commonly
+// write `h1 { font-size: 1.5em }`. Anything else unsupported (pt, vw, ...)
+// falls back to `def`.
+int LayoutRoot::resolveFontSize(const std::wstring& s, int baseFontSize, int def) {
+    std::wstring v = trimmed(s);
+    if (v.empty()) return def;
+
+    double value; std::wstring unit;
+    if (!parseNumberAndUnit(v, value, unit)) return def;
+
     if (unit.empty() || unit == L"px") return (int)std::lround(value);
     if (unit == L"em" || unit == L"rem") return (int)std::lround(value * baseFontSize);
     if (unit == L"%") return (int)std::lround(value * baseFontSize / 100.0);
     return def;
+}
+
+// See the declaration in Layout.h for what `base` means here.
+int LayoutRoot::resolveLength(const std::wstring& s, int base, int def) {
+    std::wstring v = trimmed(s);
+    if (v.empty()) return def;
+
+    double value; std::wstring unit;
+    if (!parseNumberAndUnit(v, value, unit)) return def;
+
+    if (unit.empty() || unit == L"px") return (int)std::lround(value);
+    if (unit == L"%") return (int)std::lround(value * base / 100.0);
+    return def;
+}
+
+// See the declaration in Layout.h for the 1/2/3/4-value expansion rule.
+void LayoutRoot::parseBoxShorthand(const std::wstring& v, int containingWidth, int def,
+                                    int& top, int& right, int& bottom, int& left) {
+    std::vector<std::wstring> tokens;
+    std::wistringstream ss(v);
+    std::wstring tok;
+    while (ss >> tok) tokens.push_back(tok);
+
+    top = right = bottom = left = def;
+    auto len = [&](const std::wstring& t) { return resolveLength(t, containingWidth, def); };
+    if (tokens.size() == 1) {
+        top = right = bottom = left = len(tokens[0]);
+    } else if (tokens.size() == 2) {
+        top = bottom = len(tokens[0]);
+        right = left = len(tokens[1]);
+    } else if (tokens.size() == 3) {
+        top = len(tokens[0]);
+        right = left = len(tokens[1]);
+        bottom = len(tokens[2]);
+    } else if (tokens.size() >= 4) {
+        top = len(tokens[0]);
+        right = len(tokens[1]);
+        bottom = len(tokens[2]);
+        left = len(tokens[3]);
+    }
 }
 
 float LayoutRoot::textWidth(const std::wstring& text, int fontSize) {
@@ -106,7 +158,7 @@ void LayoutRoot::appendWords(const std::wstring& text, int fontSize, const std::
 // break; a block-level element found here (invalid-ish nesting, e.g.
 // <a><div>) is flattened into the run rather than specially promoted, since
 // that combination is rare and not worth the extra complexity.
-void LayoutRoot::collectInline(Element* el, int inheritedFontSize, std::vector<InlineItem>& out) {
+void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containingWidth, std::vector<InlineItem>& out) {
     ancestorStack.push_back(el);
 
     for (auto& child : el->children) {
@@ -127,7 +179,7 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, std::vector<I
             continue;
         }
 
-        ComputedStyle sv = computeStyle(e, inheritedFontSize);
+        ComputedStyle sv = computeStyle(e, inheritedFontSize, containingWidth);
         if (sv.display == Display::None) continue;
 
         std::wstring savedHref = currentHref;
@@ -135,7 +187,7 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, std::vector<I
             auto href = e->attrs.find(L"href");
             if (href != e->attrs.end()) currentHref = href->second;
         }
-        collectInline(e, sv.fontSize, out);
+        collectInline(e, sv.fontSize, containingWidth, out);
         currentHref = savedHref;
     }
 
@@ -232,16 +284,49 @@ static std::wstring firstText(Element* el) {
 // elements and form controls: stylesheet rules first (least to most
 // specific, source order breaking ties), then inline style="" - which, per
 // CSS, always wins regardless of specificity.
-LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFontSize) {
+LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFontSize, int containingWidth) {
     ComputedStyle sv;
     sv.fontSize = inheritedFontSize; // inherited unless a rule below overrides it
     sv.display = isInlineTag(e->tag) ? Display::Inline : Display::Block;
 
     auto applyDecl = [&](const std::wstring& k, const std::wstring& v) {
         if (k == L"background" || k == L"background-color") sv.background = v;
-        else if (k == L"margin-top") sv.marginTop = parseFontSize(v, 6);
-        else if (k == L"margin-bottom") sv.marginBottom = parseFontSize(v, 6);
-        else if (k == L"padding") sv.padding = parseFontSize(v, 6);
+        else if (k == L"margin") {
+            parseBoxShorthand(v, containingWidth, 6, sv.marginTop, sv.marginRight, sv.marginBottom, sv.marginLeft);
+        }
+        else if (k == L"margin-top") sv.marginTop = resolveLength(v, containingWidth, 6);
+        else if (k == L"margin-right") sv.marginRight = resolveLength(v, containingWidth, 0);
+        else if (k == L"margin-bottom") sv.marginBottom = resolveLength(v, containingWidth, 6);
+        else if (k == L"margin-left") sv.marginLeft = resolveLength(v, containingWidth, 0);
+        else if (k == L"padding") {
+            parseBoxShorthand(v, containingWidth, 6, sv.paddingTop, sv.paddingRight, sv.paddingBottom, sv.paddingLeft);
+        }
+        else if (k == L"padding-top") sv.paddingTop = resolveLength(v, containingWidth, 6);
+        else if (k == L"padding-right") sv.paddingRight = resolveLength(v, containingWidth, 6);
+        else if (k == L"padding-bottom") sv.paddingBottom = resolveLength(v, containingWidth, 6);
+        else if (k == L"padding-left") sv.paddingLeft = resolveLength(v, containingWidth, 6);
+        else if (k == L"width") sv.width = resolveLength(v, containingWidth, -1);
+        else if (k == L"box-sizing") {
+            if (v == L"border-box") sv.boxSizing = BoxSizing::BorderBox;
+            else if (v == L"content-box") sv.boxSizing = BoxSizing::ContentBox;
+        }
+        else if (k == L"border-color") sv.borderColor = v;
+        else if (k == L"border-width") sv.borderWidth = resolveLength(v, containingWidth, 0);
+        else if (k == L"border") {
+            // Shorthand, e.g. "1px solid #333": scan whitespace-separated
+            // tokens for a length and a "#rrggbb" color. The style keyword
+            // (solid/dashed/...) is accepted but has nothing to key off of -
+            // every border is drawn the same way, a solid-colored frame.
+            std::wistringstream ss(v);
+            std::wstring tok;
+            while (ss >> tok) {
+                if (!tok.empty() && tok[0] == L'#') sv.borderColor = tok;
+                else {
+                    int len = resolveLength(tok, containingWidth, -1);
+                    if (len >= 0) sv.borderWidth = len;
+                }
+            }
+        }
         else if (k == L"font-size") sv.fontSize = resolveFontSize(v, inheritedFontSize, sv.fontSize);
         else if (k == L"display") {
             if (v == L"none") sv.display = Display::None;
@@ -426,7 +511,7 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
                 continue;
             }
 
-            ComputedStyle sv = computeStyle(e, inheritedFontSize);
+            ComputedStyle sv = computeStyle(e, inheritedFontSize, containingWidth);
             if (sv.display == Display::None) continue; // this element and its subtree take no space
 
             if (e->tag == L"input" || e->tag == L"button" || e->tag == L"select") {
@@ -450,7 +535,7 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
                     auto href = e->attrs.find(L"href");
                     if (href != e->attrs.end()) currentHref = href->second;
                 }
-                collectInline(e, sv.fontSize, pendingInline);
+                collectInline(e, sv.fontSize, containingWidth, pendingInline);
                 currentHref = savedHref;
                 continue;
             }
@@ -459,27 +544,47 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
             // renders above this block, in document order.
             flushInline();
 
+            // Box model: turn the cascaded style into an outer width (the
+            // painted border/background edge) and a content width (what's
+            // left for children after padding and border). With no explicit
+            // `width` the box just fills what its container offers, as
+            // always; with one set, box-sizing decides which width it names
+            // - see the BoxSizing comment in Layout.h.
+            int outerWidth;
+            if (sv.width >= 0) {
+                outerWidth = sv.boxSizing == BoxSizing::BorderBox
+                    ? sv.width
+                    : sv.width + sv.paddingLeft + sv.paddingRight + 2 * sv.borderWidth;
+            } else {
+                outerWidth = std::max(containingWidth - sv.marginLeft - sv.marginRight, 0);
+            }
+            int contentWidth = std::max(outerWidth - sv.paddingLeft - sv.paddingRight - 2 * sv.borderWidth, 0);
+            int boxX = x + sv.marginLeft;
+
             y += sv.marginTop;
             int contentStartY = y;
 
-            // Reserve a background box now (before laying out children) so it
-            // paints behind them, but only if this element actually declared
-            // one — plain structural wrappers like <html>/<body> get no box
-            // at all, they just position their children.
+            // Reserve a background/border box now (before laying out
+            // children) so it paints behind them, but only if this element
+            // actually declared one — plain structural wrappers like
+            // <html>/<body> get no box at all, they just position their
+            // children.
             size_t bgIndex = static_cast<size_t>(-1);
-            if (!sv.background.empty()) {
+            if (!sv.background.empty() || sv.borderWidth > 0) {
                 LayoutBox box;
-                box.x = x;
+                box.x = boxX;
                 box.y = contentStartY;
-                box.width = containingWidth;
+                box.width = outerWidth;
                 box.height = 0; // filled in below once children are laid out
                 box.background = sv.background;
+                box.borderWidth = sv.borderWidth;
+                box.borderColor = sv.borderColor;
                 box.el = e;
                 bgIndex = boxes.size();
                 boxes.push_back(box);
             }
 
-            y += sv.padding;
+            y += sv.borderWidth + sv.paddingTop;
 
             // Recurse into nested elements/text
             std::wstring savedHref = currentHref;
@@ -489,11 +594,11 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
             }
             Element* savedForm = currentForm;
             if (e->tag == L"form") currentForm = e;
-            layoutElement(e, x + sv.padding, y, containingWidth - 2 * sv.padding, sv.fontSize);
+            layoutElement(e, boxX + sv.borderWidth + sv.paddingLeft, y, contentWidth, sv.fontSize);
             currentHref = savedHref;
             currentForm = savedForm;
 
-            y += sv.padding;
+            y += sv.paddingBottom + sv.borderWidth;
 
             if (bgIndex != static_cast<size_t>(-1)) {
                 boxes[bgIndex].height = y - contentStartY;
