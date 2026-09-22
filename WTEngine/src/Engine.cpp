@@ -2,6 +2,7 @@
 #define NOMINMAX
 #include "Engine.h"
 #include "HTMLParser.h"
+#include "CSS.h"
 #include "Renderer.h"
 #include "Fetcher.h"
 #include "JSEngine.h"
@@ -144,6 +145,68 @@ void Engine::runScripts() {
     }
 }
 
+// Finds every <link rel="stylesheet" href="..."> under `el` (and `el`
+// itself), in document order - the same recursive-descent shape
+// HTMLParser's own collectStyleText uses for <style> blocks. <link> is a
+// void tag (see HTMLParser::isVoidTag), so it never has children to
+// recurse into.
+static void collectStylesheetLinks(Element* el, std::vector<Element*>& out) {
+    if (!el) return;
+    if (el->tag == L"link") {
+        auto relIt = el->attrs.find(L"rel");
+        auto hrefIt = el->attrs.find(L"href");
+        if (relIt == el->attrs.end() || hrefIt == el->attrs.end()) return;
+        std::wstring rel = relIt->second;
+        for (auto& c : rel) c = (wchar_t)towlower(c);
+        // Exact match only - a real UA token-matches a space-separated rel
+        // list (rel="preload stylesheet" and the like), which is rare
+        // enough for a <link> that this doesn't bother.
+        if (rel == L"stylesheet") out.push_back(el);
+        return;
+    }
+    for (auto& child : el->children) {
+        if (child->type == Node::ELEMENT) collectStylesheetLinks(static_cast<Element*>(child.get()), out);
+    }
+}
+
+// Fetches and appends the rules of every <link rel="stylesheet"> on the
+// page (in document order) to `doc->styles`, after whatever inline <style>
+// rules HTMLParser already parsed there. Each fetched stylesheet's own
+// `order` values start at 0 (CSS::parseStylesheet has no idea it's one of
+// several sources) - offsetting them by doc->styles.size() before
+// appending keeps them all after everything already collected, so
+// specificity ties still resolve in a sensible document-ish order.
+//
+// Simplification: every linked stylesheet's rules end up ordered after
+// every inline <style> block's rules, regardless of their true relative
+// position in the markup - correct for the overwhelmingly common case (a
+// stylesheet link in <head>, any inline overrides after it) and only wrong
+// if a page deliberately puts an overriding <style> block *before* its
+// <link rel=stylesheet> and relies on that ordering to win a specificity
+// tie. Like a script fetch, this blocks the UI thread.
+static void loadLinkedStylesheets(Document* doc, const std::wstring& baseUrl) {
+    if (!doc) return;
+    Element* searchRoot = doc->root ? doc->root.get() : doc->body.get();
+
+    std::vector<Element*> links;
+    collectStylesheetLinks(searchRoot, links);
+
+    for (Element* link : links) {
+        std::wstring resolved = resolveUrl(baseUrl, link->attrs[L"href"]);
+        if (resolved.empty()) continue; // e.g. a relative href on a local-file page
+
+        FetchResult res = fetchPage(resolved);
+        if (!res.ok) continue;
+
+        std::vector<CSS::Rule> extra = CSS::parseStylesheet(res.html);
+        int offset = (int)doc->styles.size();
+        for (auto& r : extra) r.order += offset;
+        doc->styles.insert(doc->styles.end(),
+                            std::make_move_iterator(extra.begin()),
+                            std::make_move_iterator(extra.end()));
+    }
+}
+
 void Engine::parseAndBuild(const std::wstring& html) {
     // The old DOM (and the elements form state points into) is about to go.
     focusedEl = nullptr;
@@ -153,6 +216,7 @@ void Engine::parseAndBuild(const std::wstring& html) {
 
     HTMLParser parser;
     document = parser.parse(html);
+    if (document) loadLinkedStylesheets(document.get(), pageBaseUrl);
 
     if (document && document->body) {
         layoutRoot.rootNode = document->body.get();
