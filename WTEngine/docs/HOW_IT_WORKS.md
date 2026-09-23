@@ -2,7 +2,7 @@
 
 A working reference for the current codebase. It describes what the code does today, not what is planned. File and function names are given so you can jump straight to the source.
 
-_Snapshot: latest commit `cbaf536` ("Document ResourceLoader's bounded worker pool"), plus this commit's HTTP connection pooling/keep-alive in `Fetcher.cpp`._
+_Snapshot: latest commit `6599b1d` ("Document HTTP connection pooling in Fetcher.cpp"), plus this commit's `display: flex` support (`layoutFlex`)._
 
 ---
 
@@ -232,11 +232,15 @@ A hand-written, forgiving, single-pass recursive-descent parser. All text is `st
 | `border`, `border-width`, `border-color` | `border: 1px solid #rrggbb`-style shorthand, or the longhands. The style keyword (`solid`/`dashed`/…) is accepted but ignored - every border draws the same way |
 | `box-sizing` | `content-box` (default) or `border-box`; see §9 |
 | `grid-template-columns` | Space-separated px/`%`/`fr` tracks, and `repeat(N, <track>)`; see §9's Grid subsection |
-| `gap`, `row-gap`, `column-gap` | `gap: <row>` or `gap: <row> <column>`, px or `%` |
+| `gap`, `row-gap`, `column-gap` | `gap: <row>` or `gap: <row> <column>`, px or `%` - shared by grid and flex, same properties either way |
+| `flex-direction` | `row` (default) or `column`; see §9's Flex subsection |
+| `justify-content` | `flex-start` (default), `center`, `flex-end`, `space-between`, `space-around` |
+| `align-items` | `stretch` (default), `flex-start`, `center`, `flex-end` |
+| `flex-grow`, `flex` | A bare number, on a flex item. `flex: N` is simplified to set `flex-grow` only (real CSS's shorthand also sets `flex-shrink`/`flex-basis`, neither modeled) |
 | `font-size` | px, `em`, `rem`, `%` (relative to the inherited size); inherited by children |
-| `display` | `none`, `block`, `inline`, `inline-block` (treated as inline), `grid` |
+| `display` | `none`, `block`, `inline`, `inline-block` (treated as inline), `grid`, `flex` |
 
-Everything else (`color`, `height`, `float`, `position`, flex, `font-weight`, …) is parsed and ignored. Text is always black; links are always blue. `em`/`rem` aren't supported for `width`/`margin`/`padding`/`border-width`/grid tracks/`gap` (only `font-size` resolves those) - use px or `%`.
+Everything else (`color`, `height`, `float`, `position`, `font-weight`, …) is parsed and ignored. Text is always black; links are always blue. `em`/`rem` aren't supported for `width`/`margin`/`padding`/`border-width`/grid tracks/`gap` (only `font-size` resolves those) - use px or `%`.
 
 `CSS::parseSelector` and `CSS::matches` are also reused by JS `querySelector`.
 
@@ -253,9 +257,9 @@ Everything else (`color`, `height`, `float`, `position`, flex, `font-weight`, �
 - **`outerWidth`** - what actually gets painted (the border/background edge). With `width` unset, it's `containingWidth - marginLeft - marginRight`, same as always. With `width` set: under `content-box` (the default), `width` names the *content* box, so outer = `width + padding + 2×border`; under `border-box`, `width` already *is* the outer size.
 - **`contentWidth`** - `outerWidth` minus padding and border, and what children are actually laid out into.
 
-This box-model computation - and reserving the background/border box, sized to `outerWidth`, height patched in once the content's natural height is known - is factored into `layoutBlockChild(e, x, y, containingWidth, style)`, called once per block-level child from `layoutElement`'s loop and, for each grid item, from `layoutGrid` (below). Once the box model is resolved, `layoutBlockChild` recurses into `layoutElement(e, ...)` as always - unless `style.display == Grid`, in which case it calls `layoutGrid(e, ...)` instead.
+This box-model computation - and reserving the background/border box, sized to `outerWidth`, height patched in once the content's natural height is known - is factored into `layoutBlockChild(e, x, y, containingWidth, style)`, called once per block-level child from `layoutElement`'s loop and, for each grid/flex item, from `layoutGrid`/`layoutFlex` (below). Once the box model is resolved, `layoutBlockChild` recurses into `layoutElement(e, ...)` as always - unless `style.display` is `Grid` or `Flex`, in which case it calls `layoutGrid(e, ...)` or `layoutFlex(e, ...)` instead.
 
-This still means **explicit CSS `height` isn't supported** - a box is always exactly as tall as its content, `overflow: visible`-style clipping/`height` isn't modeled. `width`/`border`/`box-sizing` currently apply to plain block and grid-item elements only, not to `<input>`/`<button>`/`<select>` (`layoutControl`, unchanged) or `<img>` (`layoutImage`, unchanged) - those keep their own fixed/intrinsic sizing.
+This still means **explicit CSS `height` isn't supported** - a box is always exactly as tall as its content, `overflow: visible`-style clipping/`height` isn't modeled. `width`/`border`/`box-sizing` currently apply to plain block and grid/flex-item elements only, not to `<input>`/`<button>`/`<select>` (`layoutControl`, unchanged) or `<img>` (`layoutImage`, unchanged) - those keep their own fixed/intrinsic sizing.
 
 `Engine::render` paints a border as four thin rects forming a hollow frame (not one filled rect), so a border with no background still lets whatever's behind the box show through the middle, then paints the background inset by the border width.
 
@@ -267,6 +271,23 @@ This still means **explicit CSS `height` isn't supported** - a box is always exa
 3. **Row height**: a row's height depends on every item in it, which `layoutElement`'s single top-to-bottom `y` sweep can't express - so each row is laid out fully before any of it is placed. Every item in the row is laid out once, into a scratch `boxes` vector at local `(0, 0)` (`std::swap(boxes, scratch)` redirects every `boxes.push_back` anywhere in that call - `layoutControl`, `layoutImage`, or `layoutBlockChild` for a plain item, chosen the same way `layoutElement`'s loop would) to discover its natural height; once every item in the row has been measured, the row's height is the tallest of them, and each item's saved boxes are translated by `(columnX, rowY)` and appended to the real `boxes`. A grid item that would otherwise be `display: inline` (e.g. a bare `<span>`) is "blockified" first, matching real CSS - there's no flowing paragraph for it to join inside a cell.
 4. `ancestorStack` gets `el` (the grid container) pushed for the whole function, so a descendant selector matching a grid item still sees the container as an ancestor, exactly as it would for a plain block's children.
 
+### Flex (`layoutFlex`)
+`display: flex` runs `layoutFlex` instead of the usual vertical flow, the same way `display: grid` runs `layoutGrid` - only for the container's own children, box model unchanged. Row and column direction are different enough (which axis is "main" swaps entirely) that they're really two algorithms sharing one function.
+
+**Row direction** (`flex-direction: row`, the default) - the genuinely hard part, and the reason this isn't spec-accurate:
+- An item's width is its explicit CSS `width` if set. Otherwise it gets a *share* of whatever width is left after every explicit-width item and every gap is subtracted - 1 share by default, or its own `flex-grow` if explicitly set and positive.
+- Real CSS flexbox sizes an unflexed item by its *content* instead (min/max-content sizing) - this engine has no equivalent of that anywhere (text wrapping already needs a width handed to it, it doesn't derive one), so an item with neither `width` nor `flex-grow` would otherwise collapse to zero. The equal-share fallback is the same tradeoff `layoutGrid` already makes for an untemplated grid ("no template → one full-width column" there; here, "no width/flex-grow → an equal share"), and gives common patterns (nav bars, equal-width card rows, button groups) a reasonable result instead of disappearing.
+- `justify-content` only has a visible effect when every item has an explicit width and their sum is still less than the container - any item using a share consumes 100% of the leftover space by construction, leaving none for `justify-content` to distribute. This matches real flexbox's own behavior in that case, not a shortcut.
+- A row's height, like a grid row's, isn't known until every item in it has been laid out - so each item is laid out once into a scratch `boxes` vector at local `(0, 0)` (same `std::swap(boxes, scratch)` technique `layoutGrid` uses) to discover its natural height, then translated into place once the row's height (the tallest item) is known.
+- `align-items: stretch` (the default) is approximated by extending each item's own background/border box (if it made one - see `layoutBlockChild`) to the row's height, rather than by re-flowing its content into the extra space; an item with no background/border has nothing visible to stretch anyway.
+
+**Column direction** (`flex-direction: column`) - no equivalent sizing problem, since the main axis is height, and height is exactly what ordinary block layout already produces from content:
+- Items are normal block children stacked vertically, honoring `row-gap`/`gap`.
+- `justify-content` has no effect: distributing leftover space along a container's height needs a *definite* height to distribute within, and this engine's pages are always "auto" height (they grow to fit content) - the same behavior real CSS flexbox shows for an auto-height flex column, not a shortcut unique to this engine.
+- `align-items` does work, on the cross axis (horizontal, here): an item with an explicit `width` can be positioned via `flex-start`/`center`/`flex-end` within the container's width; one without always fills it (`stretch`, the default, and the only sensible behavior for something with no natural width to fall back to - same reasoning as row direction's fallback).
+
+**Not supported (either direction):** `flex-wrap` (always single-line/single-column), `flex-shrink`, `flex-basis` as a value distinct from `width`, `align-content`, `align-self`, and `order`.
+
 ### Algorithm (`layoutElement`)
 For each child:
 - **Text node** → split into words and buffered in `pendingInline`.
@@ -275,7 +296,7 @@ For each child:
 - **`<input>`, `<button>`, `<select>`** → flush inline, then `layoutControl`.
 - **`<img>`** → flush inline, then `layoutImage`.
 - **Inline element** (`a span b strong i em u small code sub sup mark label abbr cite q`, or `display:inline`) → `collectInline` flattens its text and nested inline children into the same run. `<a href>` sets `currentHref` for its words.
-- **Block element** (or `display: grid`) → flush inline, then `layoutBlockChild`: resolve the box model above, add `margin-top`, reserve a background/border box if it has either (height patched afterwards), add `border` + `padding-top`, recurse into `layoutElement` (or `layoutGrid`, above, if `display: grid`), add `padding-bottom` + `border` and `margin-bottom`. `<form>` sets `currentForm` for the subtree either way.
+- **Block element** (or `display: grid`/`flex`) → flush inline, then `layoutBlockChild`: resolve the box model above, add `margin-top`, reserve a background/border box if it has either (height patched afterwards), add `border` + `padding-top`, recurse into `layoutElement` (or `layoutGrid`/`layoutFlex`, above, for `display: grid`/`flex`), add `padding-bottom` + `border` and `margin-bottom`. `<form>` sets `currentForm` for the subtree either way.
 
 ### Inline runs (`layoutInlineRun`)
 Greedy word wrapping. Each word gets its own `LayoutBox` (so words on one line can differ in size, link, or owner). Line height = tallest font on the line + 8. A word wider than a line is split by characters. A 6 px gap follows each run.
@@ -479,8 +500,9 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 - `<title>` is discarded, so the window title is the URL.
 - Colours: only `#rrggbb`. Named colours (`red`), `#rgb`, `rgb(...)` and malformed values (e.g. `#gggggg`) all fall back to light gray. (`parseColor` validates the hex digits, so bad input can't crash the engine.)
 - External stylesheets (`<link rel=stylesheet>`) are fetched and applied, but always cascade after every inline `<style>` block regardless of true document order (§10). No `@media`, no pseudo-classes, attribute selectors or child/sibling combinators.
-- Only the properties in §8 are honoured. `width`/`border`/`box-sizing` work for plain block and grid-item elements (not for form controls or `<img>`); `height` is not supported at all (boxes are always exactly as tall as their content). No floats, positioning, flexbox, or text colour/weight. Border is always solid-colored; `border-radius`/`border-style` aren't read.
+- Only the properties in §8 are honoured. `width`/`border`/`box-sizing` work for plain block and grid/flex-item elements (not for form controls or `<img>`); `height` is not supported at all (boxes are always exactly as tall as their content). No floats, positioning, or text colour/weight. Border is always solid-colored; `border-radius`/`border-style` aren't read.
 - Grid supports column tracks (px/%/fr, `repeat()`), `gap`, and row-major auto-placement only. Not supported: explicit item placement (`grid-column`/`grid-row`), `grid-template-rows`, `grid-template-areas`, `justify-*`/`align-*`, and subgrid. A bare text node directly inside a grid container is dropped rather than becoming an anonymous item.
+- Flex supports `flex-direction` (row/column), `justify-content`, `align-items`, `flex-grow`, and `gap` - see §9's Flex subsection for exactly what each does and doesn't do on each axis. Not spec-accurate for row-direction sizing: an item with neither an explicit `width` nor `flex-grow` gets an equal share of leftover space rather than being sized by its content, since this engine has no min/max-content sizing anywhere to size it by. Not supported at all: `flex-wrap`, `flex-shrink`, `flex-basis`, `align-content`, `align-self`, `order`.
 - Radio buttons, file inputs, `<textarea>` (content dropped), and multi-line inputs are not supported. A `<select>` shows only direct `<option>` children (no `<optgroup>`).
 
 **JavaScript**
