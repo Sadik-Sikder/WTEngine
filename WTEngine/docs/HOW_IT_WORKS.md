@@ -2,7 +2,7 @@
 
 A working reference for the current codebase. It describes what the code does today, not what is planned. File and function names are given so you can jump straight to the source.
 
-_Snapshot: latest commit `83e145f` ("Add inline layout, JS timers, window global, and `<select>` dropdowns")._
+_Snapshot: latest commit `dcb95c0` ("Document the background page loader"), plus this commit's WinINet → Boost.Beast/Asio networking migration._
 
 ---
 
@@ -10,7 +10,7 @@ _Snapshot: latest commit `83e145f` ("Add inline layout, JS timers, window global
 
 WTEngine is a small, from-scratch web browser engine for Windows. It:
 
-1. Loads a page from an `http(s)://` URL or a local file (WinINet).
+1. Loads a page from an `http(s)://` URL or a local file (Boost.Beast/Asio + OpenSSL).
 2. Parses the HTML into a DOM tree and the `<style>` blocks into CSS rules.
 3. Runs the page's `<script>`s in an embedded JavaScript engine (quickjs-ng) with a minimal DOM API.
 4. Lays the DOM out into a flat list of rectangles (`LayoutBox`).
@@ -26,7 +26,7 @@ Everything is one process, one UI thread, plus a small pool of image-loader thre
 | Drawing | Fixed-function OpenGL (`glBegin/glEnd`, `glOrtho`) |
 | Text rasterizing | GDI (Segoe UI) → alpha texture |
 | Image decoding | WIC (Windows Imaging Component) |
-| Networking | WinINet (`InternetOpenUrl`, `HttpSendRequest`) |
+| Networking | Boost.Beast/Asio (sync HTTP/HTTPS client) + OpenSSL (via vcpkg) |
 | JavaScript | quickjs-ng, vendored in `third_party/quickjs-ng` |
 | Platform | Windows, x64 only |
 
@@ -34,9 +34,17 @@ Everything is one process, one UI thread, plus a small pool of image-loader thre
 
 There are two equivalent ways to build. Both produce the same program (x64 only, C++20).
 
-**A. Visual Studio (`WTEngine.sln` → `WTEngine.vcxproj`).** Open the solution, pick **x64** (Debug or Release), build. The vendored quickjs-ng is compiled directly into the project from four C files (`dtoa.c`, `libregexp.c`, `libunicode.c`, `quickjs.c`) as C11 with `/experimental:c11atomics`. **Any new `.cpp` file must be added to the project** (VS: right-click → Add → Existing Item; it lands in the `ClCompile` list in `WTEngine.vcxproj`).
+**Prerequisite: vcpkg.** `Fetcher.cpp`'s HTTP(S) client needs `boost-beast` and `openssl`, built for the `x64-windows-static-md` triplet (static libs, dynamic CRT — matching how `qjs`/`glfw3` are already linked). These come from [vcpkg](https://github.com/microsoft/vcpkg), not `third_party/` (see §13). One-time setup:
+```
+git clone https://github.com/microsoft/vcpkg C:\dev\vcpkg
+C:\dev\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+C:\dev\vcpkg\vcpkg install boost-beast:x64-windows-static-md openssl:x64-windows-static-md
+```
+Then set `VCPKG_ROOT` (e.g. `C:\dev\vcpkg`) as an environment variable — both build paths below read it.
 
-**B. CMake.** `CMakeLists.txt` builds quickjs-ng as the static library `qjs` (its own `CMakeLists.txt`, unmodified) and links `glfw3`, `opengl32`, `wininet` and `qjs`. **Any new `.cpp` file must be added to the `add_executable(WTEngine …)` list.**
+**A. Visual Studio (`WTEngine.sln` → `WTEngine.vcxproj`).** Open the solution, pick **x64** (Debug or Release), build. The vendored quickjs-ng is compiled directly into the project from four C files (`dtoa.c`, `libregexp.c`, `libunicode.c`, `quickjs.c`) as C11 with `/experimental:c11atomics`. Boost/OpenSSL include and library paths are wired via `$(VCPKG_ROOT)\installed\x64-windows-static-md\...` in the `Debug|x64`/`Release|x64` `ItemDefinitionGroup`s. **Any new `.cpp` file must be added to the project** (VS: right-click → Add → Existing Item; it lands in the `ClCompile` list in `WTEngine.vcxproj`).
+
+**B. CMake.** `CMakeLists.txt` builds quickjs-ng as the static library `qjs` (its own `CMakeLists.txt`, unmodified), points `CMAKE_TOOLCHAIN_FILE` at vcpkg's toolchain (from `VCPKG_ROOT`, before the first `project()` call — required, since CMake only honors it that early), and links `glfw3`, `opengl32`, `wininet` (URL-parsing utilities only — see §13), `qjs`, `Boost::beast`, `OpenSSL::SSL`/`OpenSSL::Crypto`, and the Windows socket/crypto libs. **Any new `.cpp` file must be added to the `add_executable(WTEngine …)` list.**
 
 ```
 cmake -S . -B build -A x64
@@ -93,7 +101,7 @@ libs/glfw/                 prebuilt glfw3.lib
    scroll)          └───────┬────────────────────────────────────┬──────────────┘
                             │ navigate(url)                      │ every frame
                             ▼                                    ▼
-                     Fetcher (WinINet)                    Engine::render()
+                  Fetcher (Boost.Beast/Asio)               Engine::render()
                             │ html                               │
                             ▼                                    ▼
                    Engine::loadHTML(html, baseUrl)         Renderer (OpenGL)
@@ -131,10 +139,11 @@ Each iteration (capped at ~60 fps with `Sleep`):
 ### Navigation (`PageLoader`)
 Page fetching is **backgrounded**: `navigate(url, postBody?)` doesn't call `fetchPage()` itself, it calls `app.pageLoader.start(url, postBody, replace)`, which launches a detached `std::thread` to do the actual `fetchPage()` call and returns immediately - so the frame loop, and the window's message pump with it, keeps running while a fetch is in flight, however long it takes. `applyFinishedNavigation` polls `pageLoader.poll(...)` once per frame; the moment a result is ready, it shows the page (`visitPage`) or a generated red error page, exactly as if the fetch had been synchronous.
 
-- **Why:** a single blocking `fetchPage()` call used to freeze the *entire application* - unresponsive, un-closeable except by killing the process - for as long as the underlying WinINet call took. Observed cause: a real site whose IPv6 route is black-holed makes WinINet wait through the OS's full TCP connect timeout (~20-30s) before falling back to the working IPv4 address, and nothing bounded that wait.
-- **Superseding:** starting a new fetch (or `goHistory`'s Back/Forward, which calls `pageLoader.cancel()`) abandons whatever was previously in flight. Its thread keeps running fetchPage() to completion regardless - cheaper than trying to interrupt a blocking WinINet call - but its result is just never read once nothing points at it anymore. See `PageLoader.h`'s comments for how this is made thread-safe (the tricky part: not destroying the result slot's mutex while a `lock_guard` still holds it - a real bug caught during development via a Debug-CRT "unlock of unowned mutex" assertion).
-- **Timeout:** `poll()` also gives up on a fetch that's been running longer than 8 seconds, reporting it as failed ("Timed out") from the application's side - independent of whatever WinINet or the OS is still doing with the underlying connection. This turned out to be necessary, not just a nicety: shortening WinINet's own timeout options (`INTERNET_OPTION_CONNECT_TIMEOUT` etc.) didn't reliably shorten how long a stuck connection attempt actually took.
-- **Scope:** only the top-level page fetch goes through `PageLoader`. A page's own `<script src>` and `<link rel=stylesheet>` fetches (`Engine::runScripts`/`Engine::parseAndBuild`) still run synchronously once that page's HTML is already in hand - a smaller, separate blocking window not addressed here (same host as the page that just loaded, so usually already known reachable).
+- **Why:** a single blocking `fetchPage()` call used to freeze the *entire application* - unresponsive, un-closeable except by killing the process - for as long as the underlying fetch took. The original theory (still true, just not the dominant cause - see below) was WinINet's dual-stack connect behavior: on a host whose IPv6 route is black-holed, WinINet waits through the OS's full TCP connect timeout (~20-30s) before falling back to the working IPv4 address.
+- **Superseding:** starting a new fetch (or `goHistory`'s Back/Forward, which calls `pageLoader.cancel()`) abandons whatever was previously in flight. Its thread keeps running `fetchPage()` to completion regardless - cheaper than trying to interrupt a blocking network call - but its result is just never read once nothing points at it anymore. See `PageLoader.h`'s comments for how this is made thread-safe (the tricky part: not destroying the result slot's mutex while a `lock_guard` still holds it - a real bug caught during development via a Debug-CRT "unlock of unowned mutex" assertion).
+- **Timeout:** `poll()` also gives up on a fetch that's been running longer than 8 seconds, reporting it as failed ("Timed out") from the application's side - independent of whatever the OS is still doing with the underlying connection.
+- **The networking layer was later replaced** (WinINet → Boost.Beast/Asio + OpenSSL, §13) specifically to fix the above: `beast::tcp_stream::connect()` applies a short *per-address* deadline (`expires_after`, a few seconds) instead of waiting out the OS's own connect timeout, so a black-holed address is abandoned quickly.
+- **This did not fix the freeze.** Diagnostic timing (wall-clock around `resolve()`/`connect()`) showed the top-level fetch itself completing in ~1 second even against the site that used to hang for 20-30s - yet the application still went unresponsive for ~35 more seconds afterward. The actual dominant cause is the item below: **`Engine::runScripts()` and `Engine::loadHTML`'s `loadLinkedStylesheets()` each call `fetchPage()` synchronously on the main UI thread, once per `<script src>`/`<link rel=stylesheet>` tag** - entirely bypassing `PageLoader`. A real page (e.g. a Wikipedia article) can reference dozens of external scripts/stylesheets across several hosts; each one blocks the render loop serially until it finishes, and that sum - not any single connection's setup time - is what actually freezes the app. **Not yet fixed** - see the Engine limitation below.
 - `visitPage` saves the scroll offset of the page being left, pushes a new `HistoryEntry`, then `showEntry`.
 - `showEntry` calls `engine.loadHTML(html, url)`, restores the scroll position, and updates the window title and address bar. (The window title is the URL — `<title>` content is discarded by the parser.)
 - `goHistory(±1)` re-displays a stored entry **from its saved HTML** — no network request, and a POSTed result is not re-sent.
@@ -391,15 +400,21 @@ Part of `Engine`, split out for size.
 
 ## 13. Fetching (`Fetcher.cpp`)
 
+HTTP(S) I/O goes through **Boost.Beast/Asio + OpenSSL** (from vcpkg, `x64-windows-static-md` triplet - see §2), not WinINet. URL parsing/combining (`InternetCrackUrlW`/`InternetCombineUrlW`) is pure string manipulation with no networking involved, so it's kept as-is from the original WinINet-based implementation rather than writing a new URL parser - `wininet.lib` is still linked for exactly that, and for nothing else.
+
+- **Connecting:** `beast::tcp_stream::connect()` is given a short per-address deadline (`expires_after`, a few seconds) before trying each of DNS's resolved addresses - the practical effect of RFC 8305 Happy Eyeballs (fast abandonment of an unreachable address) without actually racing connections in parallel. `tcp::resolver::resolve()` itself (the DNS lookup) has no such deadline - Boost.Asio's synchronous resolver API doesn't expose one.
+- **TLS:** one shared, thread-safe `ssl::context` (a function-local `static`, the standard safe-to-share-across-threads OpenSSL pattern) per process. It loads the live Windows "ROOT" certificate store (`CertOpenSystemStoreW` → `d2i_X509` → `X509_STORE_add_cert`) into OpenSSL's trust store, since OpenSSL has no native notion of Windows' store. Hostname verification (`ssl::host_name_verification`) is required in addition to chain-of-trust verification - the latter alone would accept any validly-CA-signed certificate for any host. SNI is set via `SSL_set_tlsext_host_name`.
+- **`WIN32_LEAN_AND_MEAN`** must be defined before `<windows.h>` in this file - otherwise `windows.h` pulls in the legacy `winsock.h`, which conflicts with Asio's `winsock2.h` (`error C1189: WinSock.h has already been included`).
+
 | Function | Purpose |
 |---|---|
-| `fetchPage(url, postBody?)` | HTML text. http(s) via WinINet (`GET` with `Accept: text/html`, or `POST`); anything else is treated as a local file path. Status ≥ 400 → error. Decodes UTF-8 (BOM stripped). Reports the final URL after redirects |
+| `fetchPage(url, postBody?)` | HTML text. http(s) via Beast/Asio (`GET` with `Accept: text/html`, or `POST`); anything else is treated as a local file path. Status ≥ 400 → error. Follows up to 10 redirects (always as GET after the first hop). Decodes UTF-8 (BOM stripped). Reports the final URL after redirects |
 | `fetchBytes(url, out)` | Raw bytes for images: http(s), local file, or `data:…;base64,…` URI |
 | `resolveUrl(base, href)` | Makes an absolute URL via `InternetCombineUrl`. Returns `""` for fragments (`#…`), non-http schemes (`javascript:`, `mailto:`, …), and relative links from a local file |
 | `urlEncodeForm(text)` | UTF-8 percent-encoding, space → `+` |
 | `withQuery(url, query)` | Replaces the query string and fragment |
 
-The user agent is `WTEngine/0.1`. **All page and script fetches are synchronous on the UI thread**; only images are asynchronous.
+The user agent is `WTEngine/0.1`. **The top-level page fetch is backgrounded** (`PageLoader`, §5); **script and stylesheet fetches are still synchronous on the UI thread** (see §5's Navigation note - this, not the HTTP client backend, is the confirmed dominant cause of the remaining page-load freeze on real-world pages). Images are asynchronous via their own loader threads.
 
 ## 14. Rendering (`Renderer.h`, `OpenGLRenderer.cpp`)
 
@@ -458,8 +473,8 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 - No `submit` event on forms (§12).
 
 **Engine**
-- Page navigation itself no longer blocks the UI thread (`PageLoader`, §5) and gives up after 8s if a fetch is stuck. External script/stylesheet fetches (`<script src>`, `<link rel=stylesheet>`) still do block, once a page's own HTML is already in hand - a smaller remaining window, not yet backgrounded.
-- In one specific environment (a sandboxed dev/test session), a stuck low-level connection attempt (a black-holed IPv6 route) still appeared to freeze the whole process for a while even with `PageLoader` in place, despite the 8s timeout demonstrably firing correctly when the same code path was tested with no networking involved (a plain background sleep). That points at something *outside* the application - most likely network-connection monitoring in that sandbox - rather than a flaw in `PageLoader` itself, but it means the fix's real-world effectiveness against a truly stuck connection hasn't been confirmed outside that one environment. Worth re-testing on a normal machine.
+- Page navigation itself no longer blocks the UI thread (`PageLoader`, §5) and gives up after 8s if a fetch is stuck. The networking backend was also replaced (WinINet → Boost.Beast/Asio + OpenSSL, §13) to give connection attempts a short per-address timeout instead of waiting out the OS's own.
+- **Confirmed remaining freeze cause:** external script/stylesheet fetches (`<script src>`, `<link rel=stylesheet>` - `Engine::runScripts`/`loadLinkedStylesheets`) still run synchronously on the UI thread, once a page's own HTML is already in hand, entirely bypassing `PageLoader`. This turned out to be the *dominant* contributor to the original "unresponsive for 15-30s" report, not a minor one: diagnostic timing showed a top-level fetch completing in ~1s while the app still froze for ~35s afterward, processing a real page's (e.g. Wikipedia) many external script/stylesheet requests one at a time. Fixing this needs fetching those resources off the UI thread too, ideally concurrently rather than serially (extending `PageLoader`'s background-thread pattern to cover them) - not yet done.
 - Layout is a full re-layout on every change; no incremental layout.
 - The text-texture cache grows without bound.
 - Dropdown lists are not clipped to the window and don't scroll.
