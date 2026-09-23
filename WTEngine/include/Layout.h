@@ -131,7 +131,24 @@ private:
         // grid-template-columns was set - layoutGrid then falls back to one
         // full-width column, so items still stack rather than disappear.
         std::vector<GridTrack> gridTemplateColumns;
+        // Only meaningful with display:grid. Empty means every row is
+        // auto-sized (tallest item in it) - unlike columns, there's no
+        // "one row" fallback needed, since rows already grow as items are
+        // placed into them. A track's `isFr` is ignored for rows (treated
+        // as auto/unset) - fr needs a definite container height to
+        // distribute against, and this engine's pages are always
+        // auto-height (see layoutFlex's column-direction comment for the
+        // same limitation).
+        std::vector<GridTrack> gridTemplateRows;
         int rowGap = 0, columnGap = 0; // from `gap`/`row-gap`/`column-gap` - shared by grid and flex, same properties either way
+        // Only meaningful on a grid item (read from the item's own style by
+        // its container's layoutGrid). 1-based CSS grid line numbers, as
+        // authored; 0 means unset. An item needs *both* its column and row
+        // set to be explicitly placed - one set without the other is
+        // treated as fully automatic instead of partially placed (see
+        // layoutGrid's comment on why).
+        int gridColumnStart = 0, gridColumnEnd = 0;
+        int gridRowStart = 0, gridRowEnd = 0;
         // Only meaningful with display:flex, on the container.
         FlexDirection flexDirection = FlexDirection::Row;
         JustifyContent justifyContent = JustifyContent::FlexStart;
@@ -149,11 +166,19 @@ private:
     // to parse, fall back to `def`.
     void parseBoxShorthand(const std::wstring& v, int containingWidth, int def,
                             int& top, int& right, int& bottom, int& left);
-    // Parses a grid-template-columns value (see the .cpp for exactly what's
-    // supported: px/%/fr tracks and repeat(N, <track>); an unsupported
-    // keyword like auto or minmax() becomes 1fr, so the track *count* an
-    // author wrote is always honored even where the sizing isn't).
-    std::vector<GridTrack> parseGridTemplateColumns(const std::wstring& v, int containingWidth);
+    // Parses a grid-template-columns/grid-template-rows value (the track
+    // grammar is identical for both axes, so one parser serves both - see
+    // the .cpp for exactly what's supported: px/%/fr tracks and
+    // repeat(N, <track>); an unsupported keyword like auto or minmax()
+    // becomes 1fr, so the track *count* an author wrote is always honored
+    // even where the sizing isn't).
+    std::vector<GridTrack> parseGridTemplateTracks(const std::wstring& v, int containingWidth);
+    // Parses a grid-column/grid-row shorthand value - "2" (start, span 1),
+    // "2 / 4" (start/end line numbers), or "2 / span 3" (start + span) -
+    // into 1-based start/end line numbers. Returns false (leaving start/
+    // end untouched) for anything else: named lines, negative/from-the-end
+    // indices, and a bare "span N" with no start aren't supported.
+    bool parseGridLinePlacement(const std::wstring& v, int& start, int& end);
     void layoutControl(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
     void layoutImage(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
     // The box-model + content treatment layoutElement gives any block-level
@@ -162,11 +187,26 @@ private:
     // out so layoutGrid can give each grid item the exact same treatment,
     // for one specific element, without duplicating the box-model math.
     void layoutBlockChild(Element* e, int x, int& y, int containingWidth, const ComputedStyle& style);
-    // Places `el`'s children into a grid instead of flowing them vertically:
-    // resolves grid-template-columns into pixel column widths, then places
-    // items in row-major order (grid-auto-flow: row, the default; explicit
-    // grid-column/grid-row placement isn't supported), one full row at a
-    // time so each row's height can be the tallest item placed in it.
+    // Places `el`'s children into a grid instead of flowing them vertically.
+    // See the .cpp for the full algorithm; in short:
+    // 1. Resolves grid-template-columns into pixel column widths, same as
+    //    before.
+    // 2. Items with *both* grid-column and grid-row set are placed into
+    //    those exact cells (clamped to the template's column count - a
+    //    line beyond it doesn't create an implicit column). One axis set
+    //    without the other is treated as fully automatic, not partially
+    //    placed - a deliberate simplification, not an oversight.
+    // 3. Every other item auto-places row-major (grid-auto-flow: row, the
+    //    CSS default), walking past any cell an explicit item already
+    //    claimed. This is simpler than real CSS's own auto-placement
+    //    (which packs more tightly around explicit items) and can leave a
+    //    gap a "dense" packing algorithm would have filled instead.
+    // 4. Row heights: an explicit grid-template-rows track wins if set
+    //    (fr tracks excepted - see its ComputedStyle comment); otherwise a
+    //    row is as tall as the tallest single-row item placed in it. An
+    //    item spanning multiple rows bumps the *last* row it spans if the
+    //    rows it's already in aren't tall enough for it, rather than
+    //    distributing the difference across all of them.
     void layoutGrid(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
     // Places `el`'s children along style.flexDirection's main axis. See the
     // .cpp for the full explanation of what's supported and why (row vs.

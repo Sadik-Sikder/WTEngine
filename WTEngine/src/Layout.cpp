@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
+#include <set>
+#include <utility>
 
 std::wstring LayoutRoot::getAttr(Element* el, const std::wstring& key, const std::wstring& def) {
     if (!el) return def;
@@ -327,7 +329,20 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
                 }
             }
         }
-        else if (k == L"grid-template-columns") sv.gridTemplateColumns = parseGridTemplateColumns(v, containingWidth);
+        else if (k == L"grid-template-columns") sv.gridTemplateColumns = parseGridTemplateTracks(v, containingWidth);
+        else if (k == L"grid-template-rows") sv.gridTemplateRows = parseGridTemplateTracks(v, containingWidth);
+        else if (k == L"grid-column") {
+            int s, e;
+            if (parseGridLinePlacement(v, s, e)) { sv.gridColumnStart = s; sv.gridColumnEnd = e; }
+        }
+        else if (k == L"grid-column-start") { try { sv.gridColumnStart = std::stoi(v); } catch (...) {} }
+        else if (k == L"grid-column-end") { try { sv.gridColumnEnd = std::stoi(v); } catch (...) {} }
+        else if (k == L"grid-row") {
+            int s, e;
+            if (parseGridLinePlacement(v, s, e)) { sv.gridRowStart = s; sv.gridRowEnd = e; }
+        }
+        else if (k == L"grid-row-start") { try { sv.gridRowStart = std::stoi(v); } catch (...) {} }
+        else if (k == L"grid-row-end") { try { sv.gridRowEnd = std::stoi(v); } catch (...) {} }
         else if (k == L"row-gap") sv.rowGap = resolveLength(v, containingWidth, 0);
         else if (k == L"column-gap") sv.columnGap = resolveLength(v, containingWidth, 0);
         else if (k == L"gap" || k == L"grid-gap") {
@@ -400,7 +415,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
 // See the declaration in Layout.h for what's supported. repeat(N, <track>)
 // is expanded textually first (e.g. "repeat(3, 1fr)" -> "1fr 1fr 1fr"),
 // then the result is just a space-separated list of px/%/fr tokens.
-std::vector<LayoutRoot::GridTrack> LayoutRoot::parseGridTemplateColumns(const std::wstring& v, int containingWidth) {
+std::vector<LayoutRoot::GridTrack> LayoutRoot::parseGridTemplateTracks(const std::wstring& v, int containingWidth) {
     std::wstring expanded;
     size_t i = 0;
     while (i < v.size()) {
@@ -437,6 +452,36 @@ std::vector<LayoutRoot::GridTrack> LayoutRoot::parseGridTemplateColumns(const st
         tracks.push_back(px >= 0 ? GridTrack{ false, (float)px } : GridTrack{ true, 1.0f });
     }
     return tracks;
+}
+
+// See the declaration in Layout.h for the grammar/scope. `start`/`end` are
+// 1-based CSS grid line numbers, matching how they're authored.
+bool LayoutRoot::parseGridLinePlacement(const std::wstring& v, int& start, int& end) {
+    std::wistringstream ss(v);
+    std::wstring a, slash, b;
+    if (!(ss >> a)) return false;
+    int startVal;
+    try { startVal = std::stoi(a); } catch (...) { return false; }
+    if (startVal <= 0) return false; // line numbers are 1-based; 0/negative isn't supported
+
+    if (!(ss >> slash)) { start = startVal; end = startVal + 1; return true; } // bare "N": span 1
+    if (slash != L"/") return false;
+    if (!(ss >> b)) return false;
+
+    if (b == L"span") {
+        std::wstring n;
+        if (!(ss >> n)) return false;
+        int spanVal;
+        try { spanVal = std::stoi(n); } catch (...) { return false; }
+        if (spanVal <= 0) return false;
+        start = startVal; end = startVal + spanVal;
+        return true;
+    }
+    int endVal;
+    try { endVal = std::stoi(b); } catch (...) { return false; }
+    if (endVal <= startVal) return false; // an empty/reversed range isn't supported
+    start = startVal; end = endVal;
+    return true;
 }
 
 // Places one <input> or <button> as a box of its own. Controls are laid out
@@ -709,34 +754,52 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
 }
 
 // Places `el`'s grid items (its direct element children, minus the usual
-// non-visual tags) into a grid: resolves grid-template-columns into pixel
-// column widths, then processes one row at a time - laying out every item
-// in that row first (each into its own scratch box list, at local (0,0), to
-// discover its natural height the same way layoutBlockChild/layoutControl/
-// layoutImage always compute one: by actually laying it out), taking the
-// row's height as the tallest of them, and only then translating each
-// item's boxes into their real position and appending them to `boxes`.
-// This is the only part of grid that couldn't just reuse layoutElement's
-// existing top-to-bottom sweep: a row's height depends on every item placed
-// in it, not just a single running `y`.
+// non-visual tags) into a grid - see the declaration in Layout.h for the
+// numbered summary of the algorithm. Like layoutFlex, every item is laid
+// out into its own scratch box list at local (0,0) first (the same
+// std::swap(boxes, scratch) technique used throughout this file) to
+// discover its natural height, since a row's height - especially one a
+// multi-row item spans into - depends on items this single top-to-bottom
+// pass hasn't reached yet.
 void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style) {
     ancestorStack.push_back(el); // items' descendant-selector matching includes the grid container
 
-    std::vector<Element*> items;
+    // One grid item: its element, its computed style (against containingWidth
+    // - re-resolved against its real span width once that's known, below,
+    // the same reason layoutFlex re-resolves per item), and its placement -
+    // set here if the item is explicitly positioned (both axes), left as -1
+    // (auto) otherwise for the placement pass further down to fill in.
+    struct ItemPlacement {
+        Element* el;
+        ComputedStyle style;
+        int colStart = -1, colEnd = -1; // 0-based cell range [start, end)
+        int rowStart = -1, rowEnd = -1;
+    };
+    std::vector<ItemPlacement> placements;
     for (auto& child : el->children) {
         if (child->type != Node::ELEMENT) continue;
         auto* ce = static_cast<Element*>(child.get());
         if (ce->tag == L"head" || ce->tag == L"script" || ce->tag == L"style" ||
             ce->tag == L"title" || ce->tag == L"meta" || ce->tag == L"link" || ce->tag == L"base")
             continue;
-        // computeStyle is called again per item below, once column widths
-        // are known (it needs containingWidth for %-based item styles) -
-        // this first pass only needs it to filter out display:none items,
-        // the same way layoutElement's own loop does.
-        if (computeStyle(ce, style.fontSize, containingWidth).display == Display::None) continue;
-        items.push_back(ce);
+        ComputedStyle cs = computeStyle(ce, style.fontSize, containingWidth);
+        if (cs.display == Display::None) continue;
+
+        ItemPlacement p;
+        p.el = ce;
+        p.style = cs;
+        // Both axes must be explicit for this item to be explicitly placed
+        // - see the ComputedStyle/layoutGrid comments in Layout.h on why
+        // one alone isn't treated as a partial placement.
+        if (cs.gridColumnStart > 0 && cs.gridRowStart > 0) {
+            p.colStart = cs.gridColumnStart - 1; // 1-based line -> 0-based cell index
+            p.colEnd = (cs.gridColumnEnd > 0 ? cs.gridColumnEnd - 1 : p.colStart + 1);
+            p.rowStart = cs.gridRowStart - 1;
+            p.rowEnd = (cs.gridRowEnd > 0 ? cs.gridRowEnd - 1 : p.rowStart + 1);
+        }
+        placements.push_back(std::move(p));
     }
-    if (items.empty()) { ancestorStack.pop_back(); return; }
+    if (placements.empty()) { ancestorStack.pop_back(); return; }
 
     std::vector<GridTrack> cols = style.gridTemplateColumns;
     if (cols.empty()) cols.push_back({ false, (float)containingWidth }); // no template -> one full-width column
@@ -759,48 +822,120 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
         cx += colWidths[i] + colGap;
     }
 
-    int rowY = y;
-    for (size_t i = 0; i < items.size(); i += (size_t)numCols) {
-        if (i > 0) rowY += style.rowGap;
-
-        struct PlacedItem { std::vector<LayoutBox> boxes; int col; };
-        std::vector<PlacedItem> row;
-        int rowHeight = 0;
-        for (size_t j = i; j < std::min(i + (size_t)numCols, items.size()); j++) {
-            int col = (int)(j - i);
-            Element* item = items[j];
-
-            std::vector<LayoutBox> scratch;
-            std::swap(boxes, scratch); // redirect every push_back below into `scratch`
-            int localY = 0;
-            ComputedStyle itemStyle = computeStyle(item, style.fontSize, colWidths[col]);
-            if (item->tag == L"input" || item->tag == L"button" || item->tag == L"select") {
-                layoutControl(item, 0, localY, colWidths[col], itemStyle);
-            } else if (item->tag == L"img") {
-                layoutImage(item, 0, localY, colWidths[col], itemStyle);
-            } else {
-                // A grid item is always block-level, regardless of its own
-                // tag's default (real CSS "blockifies" it the same way).
-                if (itemStyle.display == Display::Inline) itemStyle.display = Display::Block;
-                layoutBlockChild(item, 0, localY, colWidths[col], itemStyle);
-            }
-            std::swap(boxes, scratch);
-
-            rowHeight = std::max(rowHeight, localY);
-            row.push_back({ std::move(scratch), col });
+    // Explicitly-placed items: clamp to the template's column count (a
+    // line beyond it doesn't create an implicit column - see Layout.h),
+    // then claim their cells. Auto-placed items (colStart still -1) fill
+    // in around them next, row-major, skipping any cell already claimed.
+    std::set<std::pair<int, int>> occupied; // (row, col)
+    int maxRowUsed = -1;
+    for (auto& p : placements) {
+        if (p.colStart < 0) continue;
+        p.colStart = std::clamp(p.colStart, 0, numCols - 1);
+        p.colEnd = std::clamp(p.colEnd, p.colStart + 1, numCols);
+        for (int r = p.rowStart; r < p.rowEnd; r++)
+            for (int c = p.colStart; c < p.colEnd; c++)
+                occupied.insert({ r, c });
+        maxRowUsed = std::max(maxRowUsed, p.rowEnd - 1);
+    }
+    int cursorRow = 0, cursorCol = 0;
+    for (auto& p : placements) {
+        if (p.colStart >= 0) continue; // already explicitly placed
+        while (occupied.count({ cursorRow, cursorCol })) {
+            cursorCol++;
+            if (cursorCol >= numCols) { cursorCol = 0; cursorRow++; }
         }
+        p.colStart = cursorCol; p.colEnd = cursorCol + 1;
+        p.rowStart = cursorRow; p.rowEnd = cursorRow + 1;
+        occupied.insert({ cursorRow, cursorCol });
+        maxRowUsed = std::max(maxRowUsed, cursorRow);
+        cursorCol++;
+        if (cursorCol >= numCols) { cursorCol = 0; cursorRow++; }
+    }
+    int numRows = maxRowUsed + 1;
 
-        for (auto& placed : row) {
-            for (LayoutBox b : placed.boxes) { // copy: translate before appending to the real list
-                b.x += colX[placed.col];
-                b.y += rowY;
-                boxes.push_back(std::move(b));
-            }
+    // Lay out every item at its resolved span width to discover its
+    // natural height, exactly as layoutFlex does per item.
+    std::vector<std::vector<LayoutBox>> itemBoxes(placements.size());
+    std::vector<int> itemHeights(placements.size());
+    for (size_t idx = 0; idx < placements.size(); idx++) {
+        ItemPlacement& p = placements[idx];
+        int spanWidth = colGap * (p.colEnd - p.colStart - 1);
+        for (int c = p.colStart; c < p.colEnd; c++) spanWidth += colWidths[c];
+
+        // Re-resolve against the item's real span width, not the
+        // container's - matters for any %-based property on the item
+        // itself (its own padding/margin/width), same reason layoutFlex does.
+        ComputedStyle real = computeStyle(p.el, style.fontSize, spanWidth);
+
+        std::vector<LayoutBox> scratch;
+        std::swap(boxes, scratch); // redirect every push_back below into `scratch`
+        int localY = 0;
+        if (p.el->tag == L"input" || p.el->tag == L"button" || p.el->tag == L"select") {
+            layoutControl(p.el, 0, localY, spanWidth, real);
+        } else if (p.el->tag == L"img") {
+            layoutImage(p.el, 0, localY, spanWidth, real);
+        } else {
+            // A grid item is always block-level, regardless of its own
+            // tag's default (real CSS "blockifies" it the same way).
+            if (real.display == Display::Inline) real.display = Display::Block;
+            layoutBlockChild(p.el, 0, localY, spanWidth, real);
         }
-        rowY += rowHeight;
+        std::swap(boxes, scratch);
+
+        itemBoxes[idx] = std::move(scratch);
+        itemHeights[idx] = localY;
     }
 
-    y = rowY;
+    // Row heights: an explicit grid-template-rows track wins if set (fr
+    // tracks excepted, per its ComputedStyle comment); otherwise a row is
+    // as tall as the tallest single-row item placed in it.
+    std::vector<GridTrack> rowTracks = style.gridTemplateRows;
+    std::vector<int> rowHeights(numRows, 0);
+    std::vector<bool> rowExplicit(numRows, false);
+    for (int r = 0; r < numRows; r++) {
+        if (r < (int)rowTracks.size() && !rowTracks[r].isFr) {
+            rowHeights[r] = (int)std::lround(rowTracks[r].value);
+            rowExplicit[r] = true;
+        }
+    }
+    for (size_t idx = 0; idx < placements.size(); idx++) {
+        ItemPlacement& p = placements[idx];
+        if (p.rowEnd - p.rowStart == 1 && !rowExplicit[p.rowStart])
+            rowHeights[p.rowStart] = std::max(rowHeights[p.rowStart], itemHeights[idx]);
+    }
+    // A multi-row item bumps the *last* row it spans if the rows it's
+    // already in (plus the row-gaps between them) aren't tall enough for
+    // it, rather than distributing the shortfall across all of them -
+    // simpler, and rare enough in practice (spanning items are less
+    // common than spanning columns) not to be worth more than that.
+    for (size_t idx = 0; idx < placements.size(); idx++) {
+        ItemPlacement& p = placements[idx];
+        int span = p.rowEnd - p.rowStart;
+        if (span <= 1) continue;
+        int sum = style.rowGap * (span - 1);
+        for (int r = p.rowStart; r < p.rowEnd; r++) sum += rowHeights[r];
+        if (itemHeights[idx] > sum && !rowExplicit[p.rowEnd - 1])
+            rowHeights[p.rowEnd - 1] += itemHeights[idx] - sum;
+    }
+
+    std::vector<int> rowY(numRows);
+    int cy = y;
+    for (int r = 0; r < numRows; r++) {
+        if (r > 0) cy += style.rowGap;
+        rowY[r] = cy;
+        cy += rowHeights[r];
+    }
+
+    for (size_t idx = 0; idx < placements.size(); idx++) {
+        ItemPlacement& p = placements[idx];
+        for (LayoutBox b : itemBoxes[idx]) { // copy: translate before appending to the real list
+            b.x += colX[p.colStart];
+            b.y += rowY[p.rowStart];
+            boxes.push_back(std::move(b));
+        }
+    }
+
+    y = cy;
     ancestorStack.pop_back();
 }
 
