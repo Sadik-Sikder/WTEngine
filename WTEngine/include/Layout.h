@@ -157,4 +157,11 @@ private:
     // Ancestors of the element layoutElement is currently iterating the
     // children of (root first); used to match descendant selectors ("a b").
     std::vector<Element*> ancestorStack;
+
+    // Every element's parsed class list, computed at most once per layout()
+    // call and reused across every rule that tests it - see CSS::ClassCache
+    // and computeStyle. Cleared at the start of layout(): safe to reuse
+    // within one pass (the DOM doesn't mutate mid-layout) but not across
+    // passes, since a page's own class="" attributes can change between them.
+    CSS::ClassCache classCache;
 };

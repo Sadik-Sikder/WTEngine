@@ -352,7 +352,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
     if (rules) {
         std::vector<const CSS::Rule*> matched;
         for (const auto& rule : *rules) {
-            if (CSS::matches(rule, ancestorStack, e)) matched.push_back(&rule);
+            if (CSS::matches(rule, ancestorStack, e, &classCache)) matched.push_back(&rule);
         }
         std::stable_sort(matched.begin(), matched.end(),
             [](const CSS::Rule* a, const CSS::Rule* b) {
@@ -517,6 +517,7 @@ void LayoutRoot::layoutImage(Element* e, int x, int& y, int containingWidth, con
 void LayoutRoot::layout() {
     boxes.clear();
     ancestorStack.clear();
+    classCache.clear(); // safe to reuse within this pass only - see its declaration in Layout.h
     if (!rootNode) return;
 
     int y = 10;
