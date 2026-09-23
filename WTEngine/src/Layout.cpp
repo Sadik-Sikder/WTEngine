@@ -331,6 +331,16 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         }
         else if (k == L"grid-template-columns") sv.gridTemplateColumns = parseGridTemplateTracks(v, containingWidth);
         else if (k == L"grid-template-rows") sv.gridTemplateRows = parseGridTemplateTracks(v, containingWidth);
+        else if (k == L"grid-template-areas") sv.gridTemplateAreas = parseGridTemplateAreas(v);
+        else if (k == L"grid-template") {
+            std::vector<std::vector<std::wstring>> areas;
+            std::vector<GridTrack> rowTracks, colTracks;
+            parseGridTemplateShorthand(v, containingWidth, areas, rowTracks, colTracks);
+            if (!areas.empty()) sv.gridTemplateAreas = std::move(areas);
+            if (!rowTracks.empty()) sv.gridTemplateRows = std::move(rowTracks);
+            if (!colTracks.empty()) sv.gridTemplateColumns = std::move(colTracks);
+        }
+        else if (k == L"grid-area") sv.gridArea = trimmed(v); // on an item: the area name to place into - see its ComputedStyle comment
         else if (k == L"grid-column") {
             int s, e;
             if (parseGridLinePlacement(v, s, e)) { sv.gridColumnStart = s; sv.gridColumnEnd = e; }
@@ -482,6 +492,72 @@ bool LayoutRoot::parseGridLinePlacement(const std::wstring& v, int& start, int& 
     if (endVal <= startVal) return false; // an empty/reversed range isn't supported
     start = startVal; end = endVal;
     return true;
+}
+
+// See the declaration in Layout.h for the grammar/scope.
+std::vector<std::vector<std::wstring>> LayoutRoot::parseGridTemplateAreas(const std::wstring& v) {
+    std::vector<std::vector<std::wstring>> rows;
+    size_t i = 0;
+    while (i < v.size()) {
+        size_t open = v.find(L'"', i);
+        if (open == std::wstring::npos) break;
+        size_t close = v.find(L'"', open + 1);
+        if (close == std::wstring::npos) return {}; // unterminated string - malformed, bail on the whole value
+
+        std::wistringstream ss(v.substr(open + 1, close - open - 1));
+        std::vector<std::wstring> row;
+        std::wstring tok;
+        while (ss >> tok) row.push_back(tok);
+        if (!rows.empty() && row.size() != rows[0].size()) return {}; // every row must name the same number of columns
+        rows.push_back(std::move(row));
+        i = close + 1;
+    }
+    return rows;
+}
+
+// See the declaration in Layout.h for the grammar/scope. Splits at the
+// top-level '/' first (an area string never contains one); everything
+// before it is scanned for alternating quoted area-rows and an optional
+// track-size token right after each one's closing quote.
+void LayoutRoot::parseGridTemplateShorthand(const std::wstring& v, int containingWidth,
+                                             std::vector<std::vector<std::wstring>>& areas,
+                                             std::vector<GridTrack>& rowTracks, std::vector<GridTrack>& colTracks) {
+    size_t slash = v.find(L'/');
+    std::wstring rowsPart = slash == std::wstring::npos ? v : v.substr(0, slash);
+
+    size_t i = 0;
+    while (i < rowsPart.size()) {
+        size_t open = rowsPart.find(L'"', i);
+        if (open == std::wstring::npos) break;
+        size_t close = rowsPart.find(L'"', open + 1);
+        if (close == std::wstring::npos) { areas.clear(); rowTracks.clear(); return; } // unterminated - bail
+
+        std::wistringstream ss(rowsPart.substr(open + 1, close - open - 1));
+        std::vector<std::wstring> row;
+        std::wstring tok;
+        while (ss >> tok) row.push_back(tok);
+        if (!areas.empty() && row.size() != areas[0].size()) { areas.clear(); rowTracks.clear(); return; }
+        areas.push_back(std::move(row));
+
+        // An optional track size sits between this row's closing quote and
+        // the next row's opening one (or the end) - e.g. the 40px in
+        // `"header header" 40px "sidebar main" 1fr`. isFr:true,value:0 - a
+        // share of nothing - marks "no size given", distinct from an
+        // actually-parsed 0px: layoutGrid already treats any isFr track as
+        // unset/auto for rows (see gridTemplateRows's own comment), so
+        // this rides that same rule for free instead of needing a new one.
+        size_t nextOpen = rowsPart.find(L'"', close + 1);
+        std::wstring between = trimmed(rowsPart.substr(close + 1, (nextOpen == std::wstring::npos ? rowsPart.size() : nextOpen) - close - 1));
+        if (!between.empty()) {
+            auto parsed = parseGridTemplateTracks(between, containingWidth);
+            rowTracks.push_back(!parsed.empty() ? parsed[0] : GridTrack{ true, 0.0f });
+        } else {
+            rowTracks.push_back({ true, 0.0f });
+        }
+        i = close + 1;
+    }
+
+    if (slash != std::wstring::npos) colTracks = parseGridTemplateTracks(trimmed(v.substr(slash + 1)), containingWidth);
 }
 
 // Places one <input> or <button> as a box of its own. Controls are laid out
@@ -788,10 +864,30 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
         ItemPlacement p;
         p.el = ce;
         p.style = cs;
+        // grid-area wins if it names a cell that actually exists in the
+        // template; otherwise (no grid-template-areas, or a name that
+        // doesn't appear in it) fall through to line-based placement.
+        bool placedByArea = false;
+        if (!cs.gridArea.empty()) {
+            int minRow = -1, maxRow = -1, minCol = -1, maxCol = -1;
+            for (int r = 0; r < (int)style.gridTemplateAreas.size(); r++) {
+                auto& row = style.gridTemplateAreas[r];
+                for (int c = 0; c < (int)row.size(); c++) {
+                    if (row[c] != cs.gridArea) continue;
+                    if (minRow < 0) { minRow = maxRow = r; minCol = maxCol = c; }
+                    else { minRow = std::min(minRow, r); maxRow = std::max(maxRow, r); minCol = std::min(minCol, c); maxCol = std::max(maxCol, c); }
+                }
+            }
+            if (minRow >= 0) { // the name was found - real CSS requires its cells to form a rectangle; this just takes their bounding box regardless
+                p.colStart = minCol; p.colEnd = maxCol + 1;
+                p.rowStart = minRow; p.rowEnd = maxRow + 1;
+                placedByArea = true;
+            }
+        }
         // Both axes must be explicit for this item to be explicitly placed
         // - see the ComputedStyle/layoutGrid comments in Layout.h on why
         // one alone isn't treated as a partial placement.
-        if (cs.gridColumnStart > 0 && cs.gridRowStart > 0) {
+        if (!placedByArea && cs.gridColumnStart > 0 && cs.gridRowStart > 0) {
             p.colStart = cs.gridColumnStart - 1; // 1-based line -> 0-based cell index
             p.colEnd = (cs.gridColumnEnd > 0 ? cs.gridColumnEnd - 1 : p.colStart + 1);
             p.rowStart = cs.gridRowStart - 1;
@@ -802,7 +898,12 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
     if (placements.empty()) { ancestorStack.pop_back(); return; }
 
     std::vector<GridTrack> cols = style.gridTemplateColumns;
-    if (cols.empty()) cols.push_back({ false, (float)containingWidth }); // no template -> one full-width column
+    // grid-template-areas defines the column *count* even if
+    // grid-template-columns doesn't have enough tracks for it - pad the
+    // missing ones with 1fr, the same fallback "no template" already uses.
+    int areaCols = style.gridTemplateAreas.empty() ? 0 : (int)style.gridTemplateAreas[0].size();
+    while ((int)cols.size() < areaCols) cols.push_back({ true, 1.0f });
+    if (cols.empty()) cols.push_back({ false, (float)containingWidth }); // no template at all -> one full-width column
     int numCols = (int)cols.size();
 
     int colGap = style.columnGap;
@@ -827,7 +928,9 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
     // then claim their cells. Auto-placed items (colStart still -1) fill
     // in around them next, row-major, skipping any cell already claimed.
     std::set<std::pair<int, int>> occupied; // (row, col)
-    int maxRowUsed = -1;
+    // grid-template-areas defines the row count too, even for a trailing
+    // row nothing ends up placed in (e.g. one made entirely of "." cells).
+    int maxRowUsed = style.gridTemplateAreas.empty() ? -1 : (int)style.gridTemplateAreas.size() - 1;
     for (auto& p : placements) {
         if (p.colStart < 0) continue;
         p.colStart = std::clamp(p.colStart, 0, numCols - 1);
