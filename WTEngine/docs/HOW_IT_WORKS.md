@@ -2,7 +2,7 @@
 
 A working reference for the current codebase. It describes what the code does today, not what is planned. File and function names are given so you can jump straight to the source.
 
-_Snapshot: latest commit `edab22f` ("Document the Beast/Asio migration and the real page-load freeze cause"), plus this commit's progressive script/stylesheet loading (`ResourceLoader`)._
+_Snapshot: latest commit `8f0e3c3` ("Document progressive script/stylesheet loading and the layout bottleneck"), plus this commit's CSS class-list caching fix for `LayoutRoot::layout()`'s performance._
 
 ---
 
@@ -215,7 +215,7 @@ A hand-written, forgiving, single-pass recursive-descent parser. All text is `st
 
 **Selectors supported:** `tag`, `.class`, `#id`, `*`, compounds like `div.card#x`, and the **descendant** combinator (`a b`, any depth). **Not supported** (the whole selector is skipped): `>`, `+`, `~`, `[attr]`, `:pseudo`.
 
-**Matching** (`CSS::matches`): the last compound must match the element; earlier compounds must match *some* ancestor in order, right to left.
+**Matching** (`CSS::matches`): the last compound must match the element; earlier compounds must match *some* ancestor in order, right to left. No selector index - every rule is checked against every element (`LayoutRoot::computeStyle`, §10), so cost is roughly elements × rules; the optional `ClassCache*` parameter only avoids re-parsing the same element's `class=""` repeatedly across those checks (§10's Engine limitations), it doesn't reduce how many checks happen.
 
 **Cascade** (in `LayoutRoot::computeStyle`): matched rules are stable-sorted by specificity `(ids, classes, tags)` then source order and applied in that order; then the inline `style=""` attribute is applied last (always wins). `!important` is stripped but gives no extra priority.
 
@@ -485,7 +485,7 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 
 **Engine**
 - Page navigation itself no longer blocks the UI thread (`PageLoader`, §5) and gives up after 8s if a fetch is stuck. The networking backend was also replaced (WinINet → Boost.Beast/Asio + OpenSSL, §13) to give connection attempts a short per-address timeout instead of waiting out the OS's own. External script/stylesheet fetches are backgrounded too, and concurrently rather than serially (`ResourceLoader`, §5) - fetching is no longer on the UI thread's critical path anywhere in the engine (confirmed by grepping every `fetchPage`/`fetchBytes` call site).
-- **Confirmed *current* dominant freeze cause, not yet fixed: `LayoutRoot::layout()` itself.** With fetching no longer a factor, diagnostic timing against a real page (Wikipedia's Tiger article, ~1.3MB of HTML, ~20,000 laid-out boxes) showed `doLayout()` alone taking 5.2s with only 135 CSS rules (inline `<style>` only), then 14.4s on the very next call with 623 rules applied (fewer boxes that time, appreciably *more* time) - both entirely on the UI thread, since layout has to finish before there's anything to paint. Rule count going up ~4.6x while layout time roughly tripled points at CSS selector matching being checked per-element against every rule with no indexing (by tag/class/id), i.e. cost scaling with elements × rules or worse. This is a distinct, algorithmic problem in `Layout.cpp`/`CSS.cpp`'s matching, unrelated to networking or threading - not yet investigated further.
+- **`LayoutRoot::layout()` was the next dominant freeze cause after fetching was fixed - largely fixed itself now.** Diagnostic timing against a real page (Wikipedia's Tiger article, ~1.3MB of HTML, ~20,000 laid-out boxes) showed `doLayout()` taking 5.2s with 135 CSS rules, then 14.4s on the next call with 623 rules applied - both entirely on the UI thread, since layout has to finish before there's anything to paint. Root cause: `CSS::matches` is checked per element against every rule with no selector index (by tag/class/id) - expected to cost roughly elements × rules - but the actual dominant cost turned out to be `classesOf()` (in `CSS.cpp`, used by any class selector) re-splitting the same element's `class=""` attribute string into a fresh `std::vector` from scratch on *every single call*, rather than once per element. Fixed by caching each element's parsed class list for the duration of one layout pass (`CSS::ClassCache`, threaded through `matches`/`compoundMatches` as an optional parameter so `querySelector`'s one-off matching - JSBinding.cpp - is unaffected; `LayoutRoot::classCache`, cleared at the top of every `layout()` since it's only valid within one pass - the DOM doesn't mutate mid-layout). Measured result on the same page: 5.2s → 1.1s and 14.4s → 2.2s, roughly a 5-6x speedup, with no change in visual output (verified against a page exercising every selector form: multi-class AND, tag+class compounds, id, and descendant combinators). The remaining ~1-3s is the *expected* cost of brute-force O(elements × rules) matching with no rule index at all - not yet addressed, and the next thing to look at if page-load time on large real pages still matters.
 - Layout is a full re-layout on every change; no incremental layout.
 - The text-texture cache grows without bound.
 - Dropdown lists are not clipped to the window and don't scroll.
