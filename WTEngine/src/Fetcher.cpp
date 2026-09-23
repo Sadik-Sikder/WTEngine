@@ -26,9 +26,15 @@
 #include <windows.h>
 #include <wininet.h>   // InternetCrackUrlW/InternetCombineUrlW only - see above
 #include <wincrypt.h>  // CryptStringToBinaryA (data: URIs) and the ROOT cert store (CertOpenSystemStoreW etc.)
+#include <cctype>
 #include <cwctype>
 #include <fstream>
 #include <iterator>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <unordered_map>
 #include <vector>
 #include <chrono>
 
@@ -149,7 +155,9 @@ static ssl::context& sharedSslContext() {
 }
 
 // ---------------------------------------------------------------------
-// The actual network I/O.
+// The raw result of one HTTP round-trip - defined here (ahead of where
+// the rest of this file's comments put "the actual network I/O") because
+// the connection-pooling code just below needs it as a parameter type.
 
 struct RawResponse {
     bool ok = false;
@@ -159,6 +167,179 @@ struct RawResponse {
     std::wstring finalUrl;
     std::wstring error;
 };
+
+// ---------------------------------------------------------------------
+// Connection pooling: reusing an already-open, already-TLS-handshaked
+// connection for a second request to the same host skips resolve/connect/
+// handshake entirely - measured (see HOW_IT_WORKS.md) at roughly 200ms of
+// pure overhead per connection, dominated by the TLS handshake alone, and
+// a page very commonly sends several requests to the same host (its own
+// origin, or a shared CDN for stylesheets/scripts/images).
+//
+// Each pooled connection owns its net::io_context: an Asio/Beast stream
+// is permanently bound to the io_context it was constructed with (an
+// executor can't be rebound afterward), so reusing a stream across
+// separate sendOneRequest() calls - potentially from different background
+// threads, since PageLoader/ResourceLoader/the image loader all call into
+// this file concurrently - means keeping its io_context alive alongside
+// it, not just the stream itself.
+
+struct PooledPlainConnection {
+    net::io_context ioc;
+    beast::tcp_stream stream;
+    std::chrono::steady_clock::time_point idleSince;
+    std::chrono::seconds serverTimeout;
+    explicit PooledPlainConnection(std::chrono::seconds timeout) : stream(ioc), serverTimeout(timeout) {}
+};
+
+struct PooledSslConnection {
+    net::io_context ioc;
+    beast::ssl_stream<beast::tcp_stream> stream;
+    std::chrono::steady_clock::time_point idleSince;
+    std::chrono::seconds serverTimeout;
+    PooledSslConnection(ssl::context& sslCtx, std::chrono::seconds timeout)
+        : stream(ioc, sslCtx), serverTimeout(timeout) {}
+};
+
+// How long to keep an idle connection when the response didn't say (no
+// Keep-Alive: timeout=N) - conservative, safely under most servers' actual
+// defaults (commonly 5-15s), so guessing wrong in the "kept it too long"
+// direction stays rare. The write/read failure path in sendOneRequest
+// covers it when a guess is wrong anyway, so this only needs to be a
+// reasonable default, not a guarantee.
+static constexpr std::chrono::seconds kDefaultPoolTimeout{ 4 };
+// Bounds memory/socket use if connections are returned faster than
+// they're reused - a low ceiling is fine since the goal is avoiding
+// *repeat* handshakes to a host being fetched from concurrently right
+// now, not maintaining a large persistent cache of every host ever visited.
+static constexpr size_t kMaxPooledPerHost = 4;
+
+// Parses a "Keep-Alive: timeout=N, max=N" response header. `max` (the
+// number of requests the server will still allow on this connection)
+// isn't tracked here - running into it is just another way a pooled
+// connection turns out to be unusable, already handled reactively by the
+// write/read failure fallback in sendOneRequest, so there's nothing extra
+// to do with knowing it in advance.
+static std::optional<int> parseKeepAliveTimeout(const std::string& value) {
+    std::istringstream ss(value);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        size_t eq = token.find('=');
+        if (eq == std::string::npos) continue;
+        size_t start = token.find_first_not_of(" \t");
+        if (start == std::string::npos || start >= eq) continue;
+        if (token.compare(start, eq - start, "timeout") != 0) continue;
+        try { return std::stoi(token.substr(eq + 1)); }
+        catch (...) { return std::nullopt; }
+    }
+    return std::nullopt;
+}
+
+// HTTP/1.1 (the only version this file ever sends - see sendOneRequest)
+// defaults to keeping the connection open; only an explicit "close" token
+// says otherwise.
+static bool responseWantsClose(const http::response<http::string_body>& res) {
+    auto it = res.find(http::field::connection);
+    if (it == res.end()) return false;
+    std::string val(it->value());
+    for (auto& c : val) c = (char)std::tolower((unsigned char)c);
+    return val.find("close") != std::string::npos;
+}
+
+// One shared pool for the process, keyed by "host:port" - separate maps
+// for plain and TLS connections since they're different C++ types, not
+// because the concept differs. Thread-safe: every method locks the same
+// mutex, matching PageLoader/ResourceLoader's established pattern of one
+// mutex per shared structure rather than anything more elaborate.
+class ConnectionPool {
+public:
+    std::unique_ptr<PooledPlainConnection> takePlain(const std::string& key) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return take(plain_, key);
+    }
+    void givePlain(const std::string& key, std::unique_ptr<PooledPlainConnection> conn) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        give(plain_, key, std::move(conn));
+    }
+    std::unique_ptr<PooledSslConnection> takeSsl(const std::string& key) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return take(ssl_, key);
+    }
+    void giveSsl(const std::string& key, std::unique_ptr<PooledSslConnection> conn) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        give(ssl_, key, std::move(conn));
+    }
+
+private:
+    template <class Conn>
+    static std::unique_ptr<Conn> take(std::unordered_map<std::string, std::vector<std::unique_ptr<Conn>>>& map,
+                                       const std::string& key) {
+        auto it = map.find(key);
+        if (it == map.end()) return nullptr;
+        auto& bucket = it->second;
+        auto now = std::chrono::steady_clock::now();
+        while (!bucket.empty()) {
+            auto conn = std::move(bucket.back());
+            bucket.pop_back();
+            if (now - conn->idleSince <= conn->serverTimeout) return conn;
+            // else: past its advertised lifetime, likely already closed by
+            // the server - discard without even trying it, and check the
+            // next one (there's rarely more than one, but a burst of
+            // concurrent requests can leave a few queued up).
+        }
+        return nullptr;
+    }
+    template <class Conn>
+    static void give(std::unordered_map<std::string, std::vector<std::unique_ptr<Conn>>>& map,
+                      const std::string& key, std::unique_ptr<Conn> conn) {
+        auto& bucket = map[key];
+        if (bucket.size() >= kMaxPooledPerHost) return; // conn (and its connection) is closed by falling out of scope here
+        conn->idleSince = std::chrono::steady_clock::now();
+        bucket.push_back(std::move(conn));
+    }
+
+    std::mutex mutex_;
+    std::unordered_map<std::string, std::vector<std::unique_ptr<PooledPlainConnection>>> plain_;
+    std::unordered_map<std::string, std::vector<std::unique_ptr<PooledSslConnection>>> ssl_;
+};
+
+static ConnectionPool& sharedConnectionPool() {
+    static ConnectionPool pool;
+    return pool;
+}
+
+// Sends `req` on an already-connected `stream` (freshly opened, or reused
+// from the pool) and fills `out` from the response - shared between the
+// plain-TCP and TLS paths in sendOneRequest below via the template
+// parameter, since both stream types support the same write/read API;
+// only connecting and tearing down differ between them, which stays with
+// their respective callers. Throws on failure (a stale pooled connection,
+// most commonly), same as the write/read calls it wraps - the caller
+// decides what that means.
+template <class Stream>
+static void writeAndRead(Stream& stream, const http::request<http::string_body>& req, RawResponse& out,
+                          bool& keepAlive, std::chrono::seconds& keepAliveTimeout) {
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::write(stream, req);
+    http::read(stream, buffer, res);
+
+    out.status = res.result_int();
+    out.body = std::move(res.body());
+    auto loc = res.find(http::field::location);
+    if (loc != res.end()) out.location.assign(loc->value());
+    out.ok = true;
+
+    keepAlive = !responseWantsClose(res);
+    keepAliveTimeout = kDefaultPoolTimeout;
+    auto ka = res.find(http::field::keep_alive);
+    if (ka != res.end()) {
+        if (auto t = parseKeepAliveTimeout(std::string(ka->value()))) keepAliveTimeout = std::chrono::seconds(*t);
+    }
+}
+
+// ---------------------------------------------------------------------
+// The actual network I/O.
 
 // Connects to the resolved address(es) for host:port, trying each in turn
 // with a short per-attempt deadline - see the file header comment for why
@@ -171,80 +352,134 @@ static void connectStream(beast::tcp_stream& stream, const std::string& host, co
     stream.connect(results);
 }
 
+// Opens a fresh HTTPS connection (SNI + hostname verification + connect +
+// handshake), sends `req` on it, and either returns it to the pool or
+// shuts it down, depending on what the response said. Split out of
+// sendOneRequest below only because it's used from two places there (the
+// normal path, and the fallback after a pooled connection turns out to be
+// stale) - not a general-purpose helper otherwise.
+static void sendFreshHttps(const std::string& host, const std::string& port, const std::string& poolKey,
+                            const http::request<http::string_body>& req, RawResponse& out) {
+    auto fresh = std::make_unique<PooledSslConnection>(sharedSslContext(), kDefaultPoolTimeout);
+
+    // SNI: without this, many hosts (anything relying on virtual hosting
+    // by hostname, i.e. most of the web) return the wrong certificate or
+    // reject the handshake outright.
+    if (!SSL_set_tlsext_host_name(fresh->stream.native_handle(), host.c_str())) {
+        beast::error_code ec{static_cast<int>(::ERR_get_error()), net::error::get_ssl_category()};
+        throw beast::system_error(ec);
+    }
+    // verify_peer (set on the shared context) alone only checks the
+    // certificate chains to a trusted CA - not that it's actually FOR
+    // this host. Without this, any validly-CA-signed certificate for any
+    // site would be accepted, defeating the point.
+    fresh->stream.set_verify_callback(ssl::host_name_verification(host));
+
+    connectStream(beast::get_lowest_layer(fresh->stream), host, port);
+    beast::get_lowest_layer(fresh->stream).expires_after(std::chrono::seconds(10));
+    fresh->stream.handshake(ssl::stream_base::client);
+
+    bool keepAlive; std::chrono::seconds timeout;
+    writeAndRead(fresh->stream, req, out, keepAlive, timeout);
+
+    if (keepAlive) {
+        fresh->serverTimeout = timeout;
+        sharedConnectionPool().giveSsl(poolKey, std::move(fresh));
+    } else {
+        beast::error_code ec;
+        beast::get_lowest_layer(fresh->stream).expires_after(std::chrono::seconds(3));
+        fresh->stream.shutdown(ec); // the peer closing first is routine, not an error - ignore ec
+    }
+}
+
+// Same shape as sendFreshHttps, for plain (non-TLS) HTTP.
+static void sendFreshPlain(const std::string& host, const std::string& port, const std::string& poolKey,
+                            const http::request<http::string_body>& req, RawResponse& out) {
+    auto fresh = std::make_unique<PooledPlainConnection>(kDefaultPoolTimeout);
+    connectStream(fresh->stream, host, port);
+    fresh->stream.expires_after(std::chrono::seconds(10));
+
+    bool keepAlive; std::chrono::seconds timeout;
+    writeAndRead(fresh->stream, req, out, keepAlive, timeout);
+
+    if (keepAlive) {
+        fresh->serverTimeout = timeout;
+        sharedConnectionPool().givePlain(poolKey, std::move(fresh));
+    } else {
+        beast::error_code ec;
+        fresh->stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+    }
+}
+
 // Sends one request (no redirect following - fetchRaw below loops) and
-// returns the raw response. Exceptions from anywhere in the Beast/Asio
-// call chain (resolve/connect/handshake/write/read failures, including a
-// connect that exhausted every resolved address) are caught and reported
-// via RawResponse::error, matching how the rest of this file signals
-// failure (a bool/empty-error pattern, not exceptions, at the API
-// boundary fetchPage/fetchBytes expose).
+// returns the raw response. Tries a pooled connection for this host
+// first, if one's available - just write+read, skipping resolve/connect/
+// (for HTTPS) handshake entirely. If that throws (the connection had
+// already been silently closed by the server while it sat idle - the one
+// failure mode pooling can't avoid, only recover from), the exception is
+// swallowed here and a fresh connection is opened instead, transparently;
+// only a fresh connection's own failure is reported to the caller.
+// Exceptions from anywhere in the Beast/Asio call chain (resolve/connect/
+// handshake/write/read failures, including a connect that exhausted every
+// resolved address) are caught and reported via RawResponse::error,
+// matching how the rest of this file signals failure (a bool/empty-error
+// pattern, not exceptions, at the API boundary fetchPage/fetchBytes expose).
 static RawResponse sendOneRequest(const UrlParts& parts, http::verb method, const std::string& body,
                                    const char* accept) {
     RawResponse out;
     std::string host = wideToUtf8(parts.host);
     std::string port = std::to_string(parts.port);
     std::string target = wideToUtf8(parts.pathAndQuery);
+    std::string poolKey = host + ":" + port;
+
+    http::request<http::string_body> req{method, target, 11};
+    req.set(http::field::host, host);
+    req.set(http::field::user_agent, "WTEngine/0.1");
+    if (accept) req.set(http::field::accept, accept); // "text/html" for a page, unset for an image
+    req.set(http::field::connection, "keep-alive"); // was "close" - see ConnectionPool above
+    if (!body.empty()) {
+        req.set(http::field::content_type, "application/x-www-form-urlencoded");
+        req.body() = body;
+        req.prepare_payload();
+    }
 
     try {
-        net::io_context ioc;
-
-        http::request<http::string_body> req{method, target, 11};
-        req.set(http::field::host, host);
-        req.set(http::field::user_agent, "WTEngine/0.1");
-        if (accept) req.set(http::field::accept, accept); // "text/html" for a page, unset for an image
-        req.set(http::field::connection, "close"); // one request per connection, matching this engine's existing behavior
-        if (!body.empty()) {
-            req.set(http::field::content_type, "application/x-www-form-urlencoded");
-            req.body() = body;
-            req.prepare_payload();
-        }
-
-        beast::flat_buffer buffer;
-        http::response<http::string_body> res;
-
         if (parts.https) {
-            beast::ssl_stream<beast::tcp_stream> stream(ioc, sharedSslContext());
-
-            // SNI: without this, many hosts (anything relying on virtual
-            // hosting by hostname, i.e. most of the web) return the wrong
-            // certificate or reject the handshake outright.
-            if (!SSL_set_tlsext_host_name(stream.native_handle(), host.c_str())) {
-                beast::error_code ec{static_cast<int>(::ERR_get_error()), net::error::get_ssl_category()};
-                throw beast::system_error(ec);
+            if (auto pooled = sharedConnectionPool().takeSsl(poolKey)) {
+                try {
+                    bool keepAlive; std::chrono::seconds timeout;
+                    beast::get_lowest_layer(pooled->stream).expires_after(std::chrono::seconds(10));
+                    writeAndRead(pooled->stream, req, out, keepAlive, timeout);
+                    if (keepAlive) {
+                        pooled->serverTimeout = timeout;
+                        sharedConnectionPool().giveSsl(poolKey, std::move(pooled));
+                    }
+                    return out; // succeeded via the pooled connection - done
+                }
+                catch (std::exception const&) {
+                    // Stale - `pooled` is destroyed here (closing whatever's
+                    // left of it), and a fresh connection is tried below.
+                }
             }
-            // verify_peer (set on the shared context) alone only checks the
-            // certificate chains to a trusted CA - not that it's actually
-            // FOR this host. Without this, any validly-CA-signed certificate
-            // for any site would be accepted, defeating the point.
-            stream.set_verify_callback(ssl::host_name_verification(host));
-
-            connectStream(beast::get_lowest_layer(stream), host, port);
-            beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(10));
-            stream.handshake(ssl::stream_base::client);
-
-            http::write(stream, req);
-            http::read(stream, buffer, res);
-
-            beast::error_code ec;
-            beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(3));
-            stream.shutdown(ec); // the peer closing first is routine, not an error - ignore ec
+            sendFreshHttps(host, port, poolKey, req, out);
         } else {
-            beast::tcp_stream stream(ioc);
-            connectStream(stream, host, port);
-            stream.expires_after(std::chrono::seconds(10));
-
-            http::write(stream, req);
-            http::read(stream, buffer, res);
-
-            beast::error_code ec;
-            stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+            if (auto pooled = sharedConnectionPool().takePlain(poolKey)) {
+                try {
+                    bool keepAlive; std::chrono::seconds timeout;
+                    pooled->stream.expires_after(std::chrono::seconds(10));
+                    writeAndRead(pooled->stream, req, out, keepAlive, timeout);
+                    if (keepAlive) {
+                        pooled->serverTimeout = timeout;
+                        sharedConnectionPool().givePlain(poolKey, std::move(pooled));
+                    }
+                    return out;
+                }
+                catch (std::exception const&) {
+                    // fall through to a fresh connection, same as above
+                }
+            }
+            sendFreshPlain(host, port, poolKey, req, out);
         }
-
-        out.status = res.result_int();
-        out.body = std::move(res.body());
-        auto loc = res.find(http::field::location);
-        if (loc != res.end()) out.location.assign(loc->value());
-        out.ok = true;
     }
     catch (std::exception const& e) {
         out.error = utf8ToWide(e.what());
