@@ -119,7 +119,7 @@ size_t skipAtRule(const std::wstring& css, size_t i) {
     return j;
 }
 
-std::vector<std::wstring> classesOf(const Element* el) {
+std::vector<std::wstring> classesOfUncached(const Element* el) {
     std::vector<std::wstring> out;
     auto it = el->attrs.find(L"class");
     if (it == el->attrs.end()) return out;
@@ -136,7 +136,25 @@ std::vector<std::wstring> classesOf(const Element* el) {
     return out;
 }
 
-bool compoundMatches(const CompoundSelector& cs, Element* el) {
+// Cache-aware wrapper: on a hit, returns the already-split class list
+// without touching the "class" attribute string again at all. On a miss
+// (or no cache given), splits it - the same work classesOfUncached always
+// did - storing the result for next time if there's a cache to store it in.
+// Returning a reference (not a copy) matters here: this is called once per
+// rule with a class selector for every element under consideration, so
+// even the copy alone would have undone most of the savings.
+const std::vector<std::wstring>& classesOf(const Element* el, CSS::ClassCache* cache) {
+    if (!cache) {
+        thread_local std::vector<std::wstring> scratch;
+        scratch = classesOfUncached(el);
+        return scratch;
+    }
+    auto [it, inserted] = cache->try_emplace(el);
+    if (inserted) it->second = classesOfUncached(el);
+    return it->second;
+}
+
+bool compoundMatches(const CompoundSelector& cs, Element* el, CSS::ClassCache* cache) {
     if (!el) return false;
     if (!cs.tag.empty() && el->tag != cs.tag) return false;
 
@@ -146,7 +164,7 @@ bool compoundMatches(const CompoundSelector& cs, Element* el) {
     }
 
     if (!cs.classes.empty()) {
-        std::vector<std::wstring> have = classesOf(el);
+        const std::vector<std::wstring>& have = classesOf(el, cache);
         for (const auto& want : cs.classes) {
             bool found = false;
             for (const auto& h : have) if (h == want) { found = true; break; }
@@ -236,8 +254,8 @@ std::vector<Rule> parseStylesheet(const std::wstring& cssIn) {
     return rules;
 }
 
-bool matches(const Rule& rule, const std::vector<Element*>& ancestors, Element* el) {
-    if (rule.chain.empty() || !compoundMatches(rule.chain.back(), el)) return false;
+bool matches(const Rule& rule, const std::vector<Element*>& ancestors, Element* el, ClassCache* cache) {
+    if (rule.chain.empty() || !compoundMatches(rule.chain.back(), el, cache)) return false;
 
     // Walk the remaining compounds right-to-left; each must match *some*
     // ancestor above the previous match (a descendant combinator, not
@@ -249,7 +267,7 @@ bool matches(const Rule& rule, const std::vector<Element*>& ancestors, Element* 
         bool found = false;
         while (ancestorIdx > 0) {
             ancestorIdx--;
-            if (compoundMatches(rule.chain[compoundIdx], ancestors[ancestorIdx])) { found = true; break; }
+            if (compoundMatches(rule.chain[compoundIdx], ancestors[ancestorIdx], cache)) { found = true; break; }
         }
         if (!found) return false;
     }

@@ -1,6 +1,7 @@
 // CSS.h
 #pragma once
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -55,8 +56,23 @@ std::vector<Rule> parseStylesheet(const std::wstring& css);
 // of a stylesheet rule and for an inline style="" attribute.
 std::vector<std::pair<std::wstring, std::wstring>> parseDeclarations(const std::wstring& block);
 
+// Caches each element's parsed class list (see matches()'s `cache` param) -
+// classesOf would otherwise re-split the same class="" string from scratch
+// on every single match attempt. Keyed by raw pointer, so an instance is
+// only valid as long as none of its elements are freed and none of their
+// `class` attributes change - true for exactly one layout pass (the DOM
+// never mutates mid-layout), which is the only place this is worth using.
+using ClassCache = std::unordered_map<const Element*, std::vector<std::wstring>>;
+
 // True if `rule` matches `el`, given the chain of `el`'s ancestors from the
 // root down (root first; does not include `el` itself).
-bool matches(const Rule& rule, const std::vector<Element*>& ancestors, Element* el);
+//
+// `cache`, if given, speeds up repeated matching against the same elements
+// - e.g. layout calling this once per rule for every element on the page,
+// where the same element's class list would otherwise be recomputed for
+// every rule that has a class in its selector. Leave it null for a one-off
+// match (e.g. querySelector), where there's nothing to amortize.
+bool matches(const Rule& rule, const std::vector<Element*>& ancestors, Element* el,
+             ClassCache* cache = nullptr);
 
 } // namespace CSS
