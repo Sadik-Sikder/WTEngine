@@ -2,7 +2,7 @@
 
 A working reference for the current codebase. It describes what the code does today, not what is planned. File and function names are given so you can jump straight to the source.
 
-_Snapshot: latest commit `dcb95c0` ("Document the background page loader"), plus this commit's WinINet → Boost.Beast/Asio networking migration._
+_Snapshot: latest commit `edab22f` ("Document the Beast/Asio migration and the real page-load freeze cause"), plus this commit's progressive script/stylesheet loading (`ResourceLoader`)._
 
 ---
 
@@ -87,6 +87,7 @@ src/                       include/
   AddressBar.cpp             AddressBar.h
   TextEditor.cpp             TextEditor.h    — caret + selection for one line
   PageLoader.cpp             PageLoader.h    — background page fetch, §5
+  ResourceLoader.cpp         ResourceLoader.h — background script/stylesheet fetch, §5
                              PageHistory.h   — back/forward stacks (header only)
 third_party/quickjs-ng/    vendored JS engine, built unmodified
 libs/glfw/                 prebuilt glfw3.lib
@@ -108,7 +109,7 @@ libs/glfw/                 prebuilt glfw3.lib
                             │                              drawRect / drawText /
         ┌───────────────────┼───────────────────┐          drawImage
         ▼                   ▼                   ▼
-   HTMLParser          runScripts()         doLayout()
+   HTMLParser          beginScripts()       doLayout()
    → Document          quickjs + DOM        LayoutRoot::layout()
    (DOM + CSS rules)   bindings             → vector<LayoutBox>
 ```
@@ -143,10 +144,20 @@ Page fetching is **backgrounded**: `navigate(url, postBody?)` doesn't call `fetc
 - **Superseding:** starting a new fetch (or `goHistory`'s Back/Forward, which calls `pageLoader.cancel()`) abandons whatever was previously in flight. Its thread keeps running `fetchPage()` to completion regardless - cheaper than trying to interrupt a blocking network call - but its result is just never read once nothing points at it anymore. See `PageLoader.h`'s comments for how this is made thread-safe (the tricky part: not destroying the result slot's mutex while a `lock_guard` still holds it - a real bug caught during development via a Debug-CRT "unlock of unowned mutex" assertion).
 - **Timeout:** `poll()` also gives up on a fetch that's been running longer than 8 seconds, reporting it as failed ("Timed out") from the application's side - independent of whatever the OS is still doing with the underlying connection.
 - **The networking layer was later replaced** (WinINet → Boost.Beast/Asio + OpenSSL, §13) specifically to fix the above: `beast::tcp_stream::connect()` applies a short *per-address* deadline (`expires_after`, a few seconds) instead of waiting out the OS's own connect timeout, so a black-holed address is abandoned quickly.
-- **This did not fix the freeze.** Diagnostic timing (wall-clock around `resolve()`/`connect()`) showed the top-level fetch itself completing in ~1 second even against the site that used to hang for 20-30s - yet the application still went unresponsive for ~35 more seconds afterward. The actual dominant cause is the item below: **`Engine::runScripts()` and `Engine::loadHTML`'s `loadLinkedStylesheets()` each call `fetchPage()` synchronously on the main UI thread, once per `<script src>`/`<link rel=stylesheet>` tag** - entirely bypassing `PageLoader`. A real page (e.g. a Wikipedia article) can reference dozens of external scripts/stylesheets across several hosts; each one blocks the render loop serially until it finishes, and that sum - not any single connection's setup time - is what actually freezes the app. **Not yet fixed** - see the Engine limitation below.
+- **This did not fully fix the freeze.** Diagnostic timing (wall-clock around `resolve()`/`connect()`) showed the top-level fetch itself completing in ~1 second even against the site that used to hang for 20-30s - yet the application still went unresponsive for tens of seconds afterward. The actual dominant cause at that point was `Engine::runScripts()` and `loadLinkedStylesheets()` each calling `fetchPage()` synchronously on the main UI thread, once per `<script src>`/`<link rel=stylesheet>` tag - entirely bypassing `PageLoader`. That's now fixed too - see `ResourceLoader` below - but fixing it surfaced a third, larger bottleneck that's still open; see §13's `ResourceLoader` note and the Engine limitation at the end of this doc.
 - `visitPage` saves the scroll offset of the page being left, pushes a new `HistoryEntry`, then `showEntry`.
 - `showEntry` calls `engine.loadHTML(html, url)`, restores the scroll position, and updates the window title and address bar. (The window title is the URL — `<title>` content is discarded by the parser.)
 - `goHistory(±1)` re-displays a stored entry **from its saved HTML** — no network request, and a POSTed result is not re-sent.
+
+### Progressive resource loading (`ResourceLoader`)
+A page's own `<script src>` and `<link rel="stylesheet">` fetches are **also backgrounded**, and concurrently rather than serially - fixing the bypass `PageLoader` couldn't cover (above). `Engine::parseAndBuild` and `beginScripts` don't fetch anything themselves: they collect every external stylesheet/script URL in document order, hand the list to a `ResourceLoader` (one per resource kind: `styleLoader_`, `scriptLoader_`), which spawns one background thread per URL - the same abandon-in-place thread-safety pattern as `PageLoader`, generalized from one in-flight result to a batch of them (a `shared_ptr<Slot>` per URL instead of per navigation).
+
+The page paints once immediately after `parseAndBuild`/`beginScripts` return - with only inline `<style>` rules and whatever prefix of inline `<script>`s could run synchronously (see below) - then fills in progressively:
+
+- **Stylesheets** apply independently, in *whatever order their fetches complete* - safe because each one's CSS rules get a precomputed "order band" (`kStyleOrderBand * (its 1-based position among `<link>`s)`) added to their specificity tie-break `order` field at *collection* time, not at *append* time. The old synchronous code relied on append order matching document order, which relied on fetching happening serially; that assumption no longer holds, so tie-breaking had to move from "wherever this landed in `doc->styles`" to "this stylesheet's true position in the document," computed up front.
+- **Scripts** must still run in strict document order (side effects, shared globals) despite fetching concurrently and completing in arbitrary order. `Engine::advanceScripts()` walks `scriptTasks_` from a cursor, running each task the instant it's ready (inline is always ready; external once its `ResourceLoader` slot is `done`) and **stopping at the first one that isn't** - even if a later task already finished fetching. It's called once synchronously right after starting the fetches (so a page with no external scripts behaves exactly as it did when this all ran synchronously - no added delay), then again every frame from `pollResources()`.
+- `Engine::pollResources()` (called from `render()`, once per frame) is the only place newly-arrived resources get applied. It reuses `domState.domDirty` - the same per-frame "did something change, so re-layout" flag already used for JS timers/DOM mutations (§4's frame loop) - rather than inventing a second signal; applying a stylesheet or running a script just sets it.
+- Cancellation follows `PageLoader`'s pattern: a new `loadHTML()` call replaces `styleTasks_`/`scriptTasks_`/both loaders' slots outright. Old background threads from an abandoned navigation keep running to completion, writing into `Slot` objects nothing references anymore - never touching the new page's state.
 
 ### Input handling
 
@@ -287,16 +298,16 @@ Text is measured through a `std::function` set by `Engine` that calls `Renderer:
 **State:** `document`, `layoutRoot`, `scrollY`, `topInset`, `documentHeight`, the per-page JS realm (`jsEngine` + `domState`), and the form/focus state.
 
 ### `loadHTML(html, baseUrl)`
-1. `parseAndBuild` — clears focus/submission/dropdown state, parses, fetches linked stylesheets (below), points `layoutRoot` at the new body and rules.
-2. `runScripts` — see §11.
-3. `doLayout`.
+1. `parseAndBuild` — clears focus/submission/dropdown state, parses, collects linked stylesheets and starts fetching them in the background (below), points `layoutRoot` at the new body and rules.
+2. `beginScripts` — see §11. Also starts external script fetches, and runs whatever prefix of them is already ready (inline scripts, synchronously - see below).
+3. `doLayout` — first paint, before any external resource is necessarily ready. `Engine::pollResources` (called every frame from `render`) fills the rest in progressively; see §5's "Progressive resource loading".
 
-### Linked stylesheets (`loadLinkedStylesheets`, in `parseAndBuild`)
-`<style>` blocks are the only CSS source `HTMLParser` itself understands (§7). Right after parsing, `parseAndBuild` walks the parsed tree (`document->root` if set, else `document->body`) for every `<link rel="stylesheet" href="...">`, in document order, and for each: resolves the href with `resolveUrl` (so a relative href only works against an `http(s)` page - same rule `<img src>` and `<script src>` already follow), fetches it with `fetchPage` (blocking, like a script fetch), and parses the response text with `CSS::parseStylesheet` - straight text parsing, so `fetchPage` never needing to know or care that this particular response happens to be CSS rather than HTML. The resulting rules are appended to `document->styles`, after whatever `<style>` blocks already produced.
+### Linked stylesheets (`parseAndBuild`)
+`<style>` blocks are the only CSS source `HTMLParser` itself understands (§7). Right after parsing, `parseAndBuild` walks the parsed tree (`document->root` if set, else `document->body`) for every `<link rel="stylesheet" href="...">`, in document order, resolves each href with `resolveUrl` (so a relative href only works against an `http(s)` page - same rule `<img src>` and `<script src>` already follow), and hands the resolved URLs to `styleLoader_` (a `ResourceLoader`, §5), which fetches them all concurrently in the background. `pollResources` parses each one's response text with `CSS::parseStylesheet` - straight text parsing, so nothing needs to know or care that this particular response happens to be CSS rather than HTML - and appends the resulting rules to `document->styles`, after whatever `<style>` blocks already produced, as each fetch completes.
 
-Each stylesheet's own rules come back from `parseStylesheet` numbered from 0 (it has no idea it's one of several sources), so before appending, `loadLinkedStylesheets` shifts every rule's `order` up by `document->styles.size()` - the count of rules already collected - keeping specificity ties resolved in a sensible combined order across sources.
+Each stylesheet's own rules come back from `parseStylesheet` numbered from 0 (it has no idea it's one of several sources), so before appending, every rule's `order` is shifted up by a precomputed *band* - `kStyleOrderBand * (this stylesheet's 1-based position among the page's `<link>`s)` - computed from the link's position in the *document*, not from `document->styles.size()` at append time. That distinction matters now that stylesheets apply in whatever order their background fetches happen to complete, rather than always in document order: a size-based offset would only have been correct if appending still happened serially in document order.
 
-**Simplification:** every linked stylesheet's rules end up ordered after every inline `<style>` block's rules, regardless of their true relative position in the markup. Correct for the overwhelmingly common case (stylesheet links in `<head>`, any inline overrides after them); wrong only if a page deliberately puts an overriding `<style>` block *before* its `<link rel=stylesheet>` and relies on that ordering to win a specificity tie.
+**Simplification (unchanged from before backgrounding):** every linked stylesheet's rules end up ordered after every inline `<style>` block's rules, regardless of their true relative position in the markup. Correct for the overwhelmingly common case (stylesheet links in `<head>`, any inline overrides after them); wrong only if a page deliberately puts an overriding `<style>` block *before* its `<link rel=stylesheet>` and relies on that ordering to win a specificity tie.
 
 ### `doLayout()`
 Clears any open dropdown, runs `layoutRoot.layout()`, recomputes `documentHeight` (max box bottom), and clamps `scrollY`.
@@ -326,14 +337,14 @@ All hit-tests scan `boxes` in **reverse** (last painted = topmost):
 ### Per-page realm
 Every `loadHTML` creates a **fresh** `JSEngine` (quickjs runtime + context) and resets `DOMBindingState`. Nothing survives navigation. `JSEngine::eval` runs a global script and returns the result string, or `"Error: message\nstack"` on exception. `console.log/warn/error` all print `[console] …` to stdout and the debugger output.
 
-**Teardown order matters.** `Engine::runScripts` resets `domState` first, then destroys the old `JSEngine`, then creates the new one. `domState` owns `JSValue`s (listeners, timers) that must be freed against a runtime that still exists; quickjs asserts (Debug) or corrupts memory (Release) if a runtime is destroyed while any value is alive. Keep that order if you touch it. The same rule is why `domState` is declared after `jsEngine` in `Engine.h` (members destruct in reverse).
+**Teardown order matters.** `Engine::beginScripts` resets `domState` first, then destroys the old `JSEngine`, then creates the new one. `domState` owns `JSValue`s (listeners, timers) that must be freed against a runtime that still exists; quickjs asserts (Debug) or corrupts memory (Release) if a runtime is destroyed while any value is alive. Keep that order if you touch it. The same rule is why `domState` is declared after `jsEngine` in `Engine.h` (members destruct in reverse).
 
 ### Promises and microtasks
 quickjs never runs promise jobs on its own; the host must pump them. `runPendingJobs(ctx)` (`JSEngine.cpp`) drains the job queue, like a browser's microtask checkpoint. It runs after every script's `eval`, after each click listener, and after each timer callback, so `Promise.then` and `async`/`await` continuations behave in the expected order (`sync code → promise callbacks → timers`). A job that throws is printed as `[promise] Error: …` and the rest still run. **Any new place that calls into JS (`JS_Call`, `JS_Eval`) should call `runPendingJobs` afterwards.** Unhandled promise rejections are not reported (no rejection tracker is installed).
 
-### Script execution (`Engine::runScripts`)
+### Script execution (`Engine::beginScripts` / `advanceScripts`)
 - Runs **after the entire DOM is built**, in document order. So no `document.write`, and scripts can see the whole page.
-- Handles inline scripts and `src=` scripts. External scripts are fetched **synchronously** through `fetchPage`, blocking the UI.
+- `beginScripts` handles inline scripts and `src=` scripts, but doesn't fetch or run anything itself beyond building `scriptTasks_` (one per `<script>`, either the inline code or an index into `scriptLoader_`) and starting every external script's fetch concurrently (`ResourceLoader`, §5). `advanceScripts` does the actual running: it walks `scriptTasks_` from a cursor, executing each task the moment it's ready (inline: immediately; external: once its fetch completes) and **stopping at the first one that isn't ready yet**, even if a later task's fetch already finished - preserving document order despite concurrent, out-of-order fetch completion. `beginScripts` calls it once synchronously right after starting the fetches (so a page with only inline scripts runs them all immediately, same as before backgrounding existed), and `pollResources` calls it again every frame to pick up whatever's newly ready.
 - Only "classic" scripts run: no `type`, or `text/javascript`, `application/javascript`, `application/ecmascript`. `type="module"`, JSON-LD, templates etc. are skipped.
 - An exception is printed as `[script] Error: …` and execution continues with the next script.
 
@@ -414,7 +425,7 @@ HTTP(S) I/O goes through **Boost.Beast/Asio + OpenSSL** (from vcpkg, `x64-window
 | `urlEncodeForm(text)` | UTF-8 percent-encoding, space → `+` |
 | `withQuery(url, query)` | Replaces the query string and fragment |
 
-The user agent is `WTEngine/0.1`. **The top-level page fetch is backgrounded** (`PageLoader`, §5); **script and stylesheet fetches are still synchronous on the UI thread** (see §5's Navigation note - this, not the HTTP client backend, is the confirmed dominant cause of the remaining page-load freeze on real-world pages). Images are asynchronous via their own loader threads.
+The user agent is `WTEngine/0.1`. Every caller of `fetchPage`/`fetchBytes` now runs it off the main thread: the top-level page fetch via `PageLoader` (§5), external scripts/stylesheets via `ResourceLoader` (§5's "Progressive resource loading"), and images via their own loader thread pool (§14). Nothing in the engine calls `fetchPage`/`fetchBytes` directly from the UI thread anymore - confirmed by grepping every call site.
 
 ## 14. Rendering (`Renderer.h`, `OpenGLRenderer.cpp`)
 
@@ -473,8 +484,8 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 - No `submit` event on forms (§12).
 
 **Engine**
-- Page navigation itself no longer blocks the UI thread (`PageLoader`, §5) and gives up after 8s if a fetch is stuck. The networking backend was also replaced (WinINet → Boost.Beast/Asio + OpenSSL, §13) to give connection attempts a short per-address timeout instead of waiting out the OS's own.
-- **Confirmed remaining freeze cause:** external script/stylesheet fetches (`<script src>`, `<link rel=stylesheet>` - `Engine::runScripts`/`loadLinkedStylesheets`) still run synchronously on the UI thread, once a page's own HTML is already in hand, entirely bypassing `PageLoader`. This turned out to be the *dominant* contributor to the original "unresponsive for 15-30s" report, not a minor one: diagnostic timing showed a top-level fetch completing in ~1s while the app still froze for ~35s afterward, processing a real page's (e.g. Wikipedia) many external script/stylesheet requests one at a time. Fixing this needs fetching those resources off the UI thread too, ideally concurrently rather than serially (extending `PageLoader`'s background-thread pattern to cover them) - not yet done.
+- Page navigation itself no longer blocks the UI thread (`PageLoader`, §5) and gives up after 8s if a fetch is stuck. The networking backend was also replaced (WinINet → Boost.Beast/Asio + OpenSSL, §13) to give connection attempts a short per-address timeout instead of waiting out the OS's own. External script/stylesheet fetches are backgrounded too, and concurrently rather than serially (`ResourceLoader`, §5) - fetching is no longer on the UI thread's critical path anywhere in the engine (confirmed by grepping every `fetchPage`/`fetchBytes` call site).
+- **Confirmed *current* dominant freeze cause, not yet fixed: `LayoutRoot::layout()` itself.** With fetching no longer a factor, diagnostic timing against a real page (Wikipedia's Tiger article, ~1.3MB of HTML, ~20,000 laid-out boxes) showed `doLayout()` alone taking 5.2s with only 135 CSS rules (inline `<style>` only), then 14.4s on the very next call with 623 rules applied (fewer boxes that time, appreciably *more* time) - both entirely on the UI thread, since layout has to finish before there's anything to paint. Rule count going up ~4.6x while layout time roughly tripled points at CSS selector matching being checked per-element against every rule with no indexing (by tag/class/id), i.e. cost scaling with elements × rules or worse. This is a distinct, algorithmic problem in `Layout.cpp`/`CSS.cpp`'s matching, unrelated to networking or threading - not yet investigated further.
 - Layout is a full re-layout on every change; no incremental layout.
 - The text-texture cache grows without bound.
 - Dropdown lists are not clipped to the window and don't scroll.
