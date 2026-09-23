@@ -96,7 +96,13 @@ private:
     // The subset of an element's cascaded style that layout cares about -
     // computed once per element and shared by both plain elements and form
     // controls, so both respond to the same CSS/inline styling.
-    enum class Display { Block, Inline, None, Grid };
+    enum class Display { Block, Inline, None, Grid, Flex };
+    enum class FlexDirection { Row, Column };
+    enum class JustifyContent { FlexStart, Center, FlexEnd, SpaceBetween, SpaceAround };
+    // Only Stretch (the default) and FlexStart/Center/FlexEnd's cross-axis
+    // *positioning* are supported - see layoutFlex's comment for exactly
+    // what each does (and doesn't) on each axis.
+    enum class AlignItems { Stretch, FlexStart, Center, FlexEnd };
     // Only meaningful with an explicit `width` set; ContentBox (the CSS
     // default) means `width` names the content box, so padding/border add
     // to it - BorderBox means `width` already includes them. See
@@ -125,7 +131,16 @@ private:
         // grid-template-columns was set - layoutGrid then falls back to one
         // full-width column, so items still stack rather than disappear.
         std::vector<GridTrack> gridTemplateColumns;
-        int rowGap = 0, columnGap = 0; // from `gap`/`row-gap`/`column-gap`
+        int rowGap = 0, columnGap = 0; // from `gap`/`row-gap`/`column-gap` - shared by grid and flex, same properties either way
+        // Only meaningful with display:flex, on the container.
+        FlexDirection flexDirection = FlexDirection::Row;
+        JustifyContent justifyContent = JustifyContent::FlexStart;
+        AlignItems alignItems = AlignItems::Stretch;
+        // Only meaningful on a flex item (read from the item's own style by
+        // its container's layoutFlex, not used by the item's own layout).
+        // 0 (unset) is the real CSS default too - an item only grows if
+        // this is explicitly positive.
+        float flexGrow = 0;
     };
     ComputedStyle computeStyle(Element* e, int inheritedFontSize, int containingWidth);
     // Splits a shorthand value like "4px 8px" on whitespace and expands it
@@ -153,6 +168,20 @@ private:
     // grid-column/grid-row placement isn't supported), one full row at a
     // time so each row's height can be the tallest item placed in it.
     void layoutGrid(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
+    // Places `el`'s children along style.flexDirection's main axis. See the
+    // .cpp for the full explanation of what's supported and why (row vs.
+    // column are different enough to be effectively two algorithms):
+    // row-direction items without an explicit width share leftover space
+    // by an implicit flex-grow:1 (or their real flex-grow, if set) - not
+    // spec-accurate (real flexbox sizes them by content) but avoids
+    // collapsing to zero, the same tradeoff layoutGrid already makes for
+    // an untemplated grid. Column-direction items are normal block
+    // children stacked vertically; justify-content has no effect there,
+    // since a flex container with no definite height (this engine's pages
+    // are always "auto" height) has no leftover space to distribute along
+    // that axis - the same behavior real CSS shows for an auto-height
+    // flex column, not a shortcut unique to this engine.
+    void layoutFlex(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
 
     // Ancestors of the element layoutElement is currently iterating the
     // children of (root first); used to match descendant selectors ("a b").
