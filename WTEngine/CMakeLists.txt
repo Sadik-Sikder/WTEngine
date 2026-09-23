@@ -1,3 +1,17 @@
+# Boost.Beast/Asio + OpenSSL (Fetcher.cpp's HTTP client - see its header
+# comment for why it isn't WinINet) come from vcpkg, not third_party/ - big
+# enough that vendoring the vcpkg-built output wholesale is left as a
+# follow-up rather than done here. Point CMAKE_TOOLCHAIN_FILE at vcpkg's
+# toolchain before the first project() call (required - CMake only honors
+# it that early), unless the caller already set one. Set VCPKG_ROOT to
+# wherever vcpkg lives (this project doesn't ship or install vcpkg itself).
+if(NOT CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
+endif()
+if(NOT VCPKG_TARGET_TRIPLET)
+    set(VCPKG_TARGET_TRIPLET "x64-windows-static-md" CACHE STRING "") # static libs, matching qjs/glfw3; dynamic CRT, matching this project's MSVC default
+endif()
+
 cmake_minimum_required(VERSION 3.15)
 project(WTEngine CXX)
 
@@ -36,4 +50,8 @@ target_include_directories(WTEngine PRIVATE include)
 
 find_library(GLFW3_LIB glfw3 PATHS "${CMAKE_CURRENT_SOURCE_DIR}/libs/glfw" NO_DEFAULT_PATH)
 
-target_link_libraries(WTEngine PRIVATE "${GLFW3_LIB}" opengl32 wininet qjs)
+find_package(boost_beast CONFIG REQUIRED)
+find_package(OpenSSL REQUIRED)
+
+target_link_libraries(WTEngine PRIVATE "${GLFW3_LIB}" opengl32 wininet qjs
+    Boost::beast OpenSSL::SSL OpenSSL::Crypto ws2_32 mswsock crypt32)

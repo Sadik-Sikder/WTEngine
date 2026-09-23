@@ -1,6 +1,9 @@
 // PageLoader.cpp
+#define NOMINMAX
 #include "PageLoader.h"
 #include <thread>
+#include <windows.h>
+#include <cstdio>
 
 void PageLoader::start(const std::wstring& url, const std::string* postBody, bool replace) {
     auto pending = std::make_shared<Pending>();
@@ -18,10 +21,25 @@ void PageLoader::start(const std::wstring& url, const std::string* postBody, boo
     // write into even if `current_` has since moved on to a newer
     // navigation, or this PageLoader no longer exists at all.
     std::thread([pending, url, hasBody, body = std::move(body)]() {
+        // COM must be initialized per-thread, not just once process-wide -
+        // OpenGLRenderer's image-loader threads already do exactly this
+        // (see its imageLoaderThreadMain) for the same reason: the main
+        // thread is an STA (OpenGLRenderer's constructor calls
+        // CoInitializeEx(..., COINIT_APARTMENTTHREADED)), and a thread
+        // with no COM apartment of its own that ends up needing one -
+        // which WinINet's PRECONFIG mode can, transitively, for
+        // COM-based network services - gets cross-apartment-marshaled
+        // through the main thread, which can stall it. Matching the main
+        // thread's apartment type here avoids that marshaling entirely.
+        bool comInit = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+
         FetchResult res = fetchPage(url, hasBody ? &body : nullptr);
-        std::lock_guard<std::mutex> lock(pending->mutex);
-        pending->result = std::move(res);
-        pending->done = true;
+        {
+            std::lock_guard<std::mutex> lock(pending->mutex);
+            pending->result = std::move(res);
+            pending->done = true;
+        } // lock released before CoUninitialize() - nothing below needs it held
+        if (comInit) CoUninitialize();
     }).detach();
 }
 
