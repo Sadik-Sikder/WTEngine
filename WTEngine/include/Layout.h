@@ -140,6 +140,12 @@ private:
         // auto-height (see layoutFlex's column-direction comment for the
         // same limitation).
         std::vector<GridTrack> gridTemplateRows;
+        // Only meaningful with display:grid. One entry per row, each a list
+        // of column cell names for that row ("." means no area, same as
+        // real CSS) - e.g. `"header header" "sidebar main"` parses to
+        // {{"header","header"}, {"sidebar","main"}}. Empty means no named
+        // areas are in use.
+        std::vector<std::vector<std::wstring>> gridTemplateAreas;
         int rowGap = 0, columnGap = 0; // from `gap`/`row-gap`/`column-gap` - shared by grid and flex, same properties either way
         // Only meaningful on a grid item (read from the item's own style by
         // its container's layoutGrid). 1-based CSS grid line numbers, as
@@ -149,6 +155,12 @@ private:
         // layoutGrid's comment on why).
         int gridColumnStart = 0, gridColumnEnd = 0;
         int gridRowStart = 0, gridRowEnd = 0;
+        // Only meaningful on a grid item. The area name from `grid-area:
+        // <name>` - empty means unset. Only the named-area form is
+        // supported, not grid-area's alternate 4-value line-based syntax
+        // (`grid-area: <row-start> / <col-start> / <row-end> / <col-end>`) -
+        // use grid-column/grid-row for that instead.
+        std::wstring gridArea;
         // Only meaningful with display:flex, on the container.
         FlexDirection flexDirection = FlexDirection::Row;
         JustifyContent justifyContent = JustifyContent::FlexStart;
@@ -179,6 +191,26 @@ private:
     // end untouched) for anything else: named lines, negative/from-the-end
     // indices, and a bare "span N" with no start aren't supported.
     bool parseGridLinePlacement(const std::wstring& v, int& start, int& end);
+    // Parses a grid-template-areas value - one or more quoted strings, each
+    // one grid row, each whitespace-separated token in it one column's area
+    // name ("." means no area). Returns an empty grid (not a partial one)
+    // for anything malformed: an unterminated quoted string, or rows with
+    // different column counts - real CSS requires every row to name the
+    // same number of columns, and this engine does too, just by rejecting
+    // the whole thing rather than trying to reconcile mismatched rows.
+    std::vector<std::vector<std::wstring>> parseGridTemplateAreas(const std::wstring& v);
+    // Parses the grid-template shorthand's area-string form - e.g.
+    // `"header header" 40px "sidebar main" 1fr / 100px 1fr` - into areas
+    // (via parseGridTemplateAreas), row tracks (one per area-row, an
+    // optional track size token right after its closing quote - see the
+    // .cpp for how "no size given" is distinguished from "explicit 0"),
+    // and column tracks (the part after the top-level '/', via
+    // parseGridTemplateTracks). Only this form is supported, not the
+    // plainer "<rows> / <columns>" form with no area strings at all - use
+    // the grid-template-rows/columns longhands for that instead.
+    void parseGridTemplateShorthand(const std::wstring& v, int containingWidth,
+                                     std::vector<std::vector<std::wstring>>& areas,
+                                     std::vector<GridTrack>& rowTracks, std::vector<GridTrack>& colTracks);
     void layoutControl(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
     void layoutImage(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
     // The box-model + content treatment layoutElement gives any block-level
@@ -190,12 +222,19 @@ private:
     // Places `el`'s children into a grid instead of flowing them vertically.
     // See the .cpp for the full algorithm; in short:
     // 1. Resolves grid-template-columns into pixel column widths, same as
-    //    before.
-    // 2. Items with *both* grid-column and grid-row set are placed into
-    //    those exact cells (clamped to the template's column count - a
-    //    line beyond it doesn't create an implicit column). One axis set
-    //    without the other is treated as fully automatic, not partially
-    //    placed - a deliberate simplification, not an oversight.
+    //    before - padded with implicit 1fr tracks first if
+    //    grid-template-areas names more columns than it has tracks for.
+    // 2. An item with grid-area set, naming an area that appears in
+    //    grid-template-areas, is placed at that name's bounding box (every
+    //    cell the name appears in - real CSS requires those cells to form
+    //    a rectangle; this doesn't specially validate that, it just takes
+    //    the bounding box regardless). Otherwise, an item with *both*
+    //    grid-column and grid-row set is placed into those exact cells
+    //    (clamped to the template's column count - a line beyond it
+    //    doesn't create an implicit column). One axis set without the
+    //    other, or a grid-area naming nothing in the template, is treated
+    //    as fully automatic, not partially placed - a deliberate
+    //    simplification, not an oversight.
     // 3. Every other item auto-places row-major (grid-auto-flow: row, the
     //    CSS default), walking past any cell an explicit item already
     //    claimed. This is simpler than real CSS's own auto-placement
