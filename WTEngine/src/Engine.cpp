@@ -68,8 +68,8 @@ void Engine::setRenderer(Renderer* r) {
 void Engine::loadHTML(const std::wstring& html, const std::wstring& baseUrl) {
     pageBaseUrl = baseUrl;
     parseAndBuild(html);
-    runScripts();
-    doLayout();
+    beginScripts();
+    doLayout(); // first paint: DOM + inline <style> rules + whatever beginScripts ran synchronously (see its comment) - external resources fill in over the next few frames via pollResources
 }
 
 // Collects <script> elements under `el` (and `el` itself) in document
@@ -97,12 +97,20 @@ static bool isClassicScript(Element* scriptEl) {
     return t == L"text/javascript" || t == L"application/javascript" || t == L"application/ecmascript";
 }
 
-// Runs every <script> on the page once, in document order, after the whole
-// DOM is built (see Layout.h's LayoutRoot::loadImage comment for the same
-// "batch, not streaming" simplification applied to images - here it means
-// a script can't document.write() more markup mid-parse, since parsing has
-// already finished by the time any script runs).
-void Engine::runScripts() {
+// Sets up every <script> on the page to run once, in document order, after
+// the whole DOM is built (see Layout.h's LayoutRoot::loadImage comment for
+// the same "batch, not streaming" simplification applied to images - here
+// it means a script can't document.write() more markup mid-parse, since
+// parsing has already finished by the time any script runs). An inline
+// script's code is available immediately; an external one (<script src>)
+// is fetched concurrently with every other external script/stylesheet on
+// the page (ResourceLoader) instead of blocking here - advanceScripts()
+// (called once synchronously below, then again each frame from
+// pollResources) runs each task the moment it's ready, in order, so a page
+// with no external scripts behaves exactly as it did when this all ran
+// synchronously, and a page with some just fills them in over a few frames
+// instead of freezing the UI thread on each one in turn.
+void Engine::beginScripts() {
     // Drop the previous page's state FIRST, while its JS runtime still exists:
     // domState holds JSValues (click listeners, pending timers) that must be
     // freed against their own runtime, and quickjs asserts if a runtime is
@@ -111,29 +119,60 @@ void Engine::runScripts() {
     domState.pageUrl = pageBaseUrl; // so location.href/.replace()/.assign() have a base
     jsEngine.reset();
     jsEngine = std::make_unique<JSEngine>(); // fresh realm per page
-    if (!document || !document->body) return;
+    scriptTasks_.clear();
+    scriptCursor_ = 0;
+    if (!document || !document->body) { scriptLoader_.start({}); return; }
 
     installDOMBindings(jsEngine->context(), document->body.get(), &domState);
 
     std::vector<Element*> scripts;
     collectScripts(document->body.get(), scripts);
 
+    std::vector<std::wstring> urls;
     for (Element* scriptEl : scripts) {
         if (!isClassicScript(scriptEl)) continue;
 
-        std::wstring code;
         auto srcAttr = scriptEl->attrs.find(L"src");
         if (srcAttr != scriptEl->attrs.end() && !srcAttr->second.empty()) {
             std::wstring resolved = resolveUrl(pageBaseUrl, srcAttr->second);
             if (resolved.empty()) continue;
-            FetchResult res = fetchPage(resolved);
+            ScriptTask task;
+            task.external = true;
+            task.fetchIndex = urls.size();
+            scriptTasks_.push_back(task);
+            urls.push_back(resolved);
+        }
+        else {
+            ScriptTask task;
+            task.external = false;
+            for (auto& child : scriptEl->children) {
+                if (child->type == Node::TEXT) task.inlineCode += static_cast<TextNode*>(child.get())->text;
+            }
+            scriptTasks_.push_back(std::move(task));
+        }
+    }
+    scriptLoader_.start(std::move(urls));
+    advanceScripts();
+}
+
+// Runs scriptTasks_[scriptCursor_..] for as long as each one is ready
+// (inline is always ready; external is ready once its ResourceLoader fetch
+// completes), stopping at the first that isn't - preserving document
+// order even though external scripts can finish fetching in any order.
+void Engine::advanceScripts() {
+    while (scriptCursor_ < scriptTasks_.size()) {
+        ScriptTask& task = scriptTasks_[scriptCursor_];
+        std::wstring code;
+        if (task.external) {
+            if (!scriptLoader_.ready(task.fetchIndex)) break; // wait here even if a later task is already ready
+            const FetchResult& res = scriptLoader_.result(task.fetchIndex);
+            scriptCursor_++;
             if (!res.ok) continue;
             code = res.html;
         }
         else {
-            for (auto& child : scriptEl->children) {
-                if (child->type == Node::TEXT) code += static_cast<TextNode*>(child.get())->text;
-            }
+            code = task.inlineCode;
+            scriptCursor_++;
         }
         if (code.empty()) continue;
 
@@ -143,7 +182,42 @@ void Engine::runScripts() {
             wprintf(L"%ls", line.c_str());
             OutputDebugStringW(line.c_str());
         }
+        domState.domDirty = true; // conservatively assume the script may have mutated the DOM
     }
+}
+
+// Precomputed per-<link> band, wide enough that no single stylesheet will
+// ever produce this many rules - see parseAndBuild's comment on why this
+// (not simple append-order) is what keeps specificity ties resolving in
+// true document order despite stylesheets applying in arbitrary fetch-
+// completion order.
+static constexpr int kStyleOrderBand = 1'000'000;
+
+// Applies every styleTask_/scriptTask_ that has become ready since the last
+// call, in whatever order their fetches happened to complete (stylesheets)
+// or strictly in document order (scripts, via advanceScripts) - called
+// once per frame from render(). This is what makes resource loading
+// "progressive": the page already painted once (Engine::loadHTML's first
+// doLayout) before any external resource was necessarily ready, and each
+// one that lands here nudges domState.domDirty so render()'s existing
+// domDirty check re-lays-out to reflect it - the same mechanism already
+// used for JS timers/DOM mutations, not a new one.
+void Engine::pollResources() {
+    for (auto& task : styleTasks_) {
+        if (task.applied) continue;
+        if (!styleLoader_.ready(task.fetchIndex)) continue;
+        task.applied = true;
+        const FetchResult& res = styleLoader_.result(task.fetchIndex);
+        if (!res.ok) continue;
+
+        std::vector<CSS::Rule> extra = CSS::parseStylesheet(res.html);
+        for (auto& r : extra) r.order += task.orderBase;
+        document->styles.insert(document->styles.end(),
+                                 std::make_move_iterator(extra.begin()),
+                                 std::make_move_iterator(extra.end()));
+        domState.domDirty = true;
+    }
+    advanceScripts();
 }
 
 // Finds every <link rel="stylesheet" href="..."> under `el` (and `el`
@@ -170,44 +244,6 @@ static void collectStylesheetLinks(Element* el, std::vector<Element*>& out) {
     }
 }
 
-// Fetches and appends the rules of every <link rel="stylesheet"> on the
-// page (in document order) to `doc->styles`, after whatever inline <style>
-// rules HTMLParser already parsed there. Each fetched stylesheet's own
-// `order` values start at 0 (CSS::parseStylesheet has no idea it's one of
-// several sources) - offsetting them by doc->styles.size() before
-// appending keeps them all after everything already collected, so
-// specificity ties still resolve in a sensible document-ish order.
-//
-// Simplification: every linked stylesheet's rules end up ordered after
-// every inline <style> block's rules, regardless of their true relative
-// position in the markup - correct for the overwhelmingly common case (a
-// stylesheet link in <head>, any inline overrides after it) and only wrong
-// if a page deliberately puts an overriding <style> block *before* its
-// <link rel=stylesheet> and relies on that ordering to win a specificity
-// tie. Like a script fetch, this blocks the UI thread.
-static void loadLinkedStylesheets(Document* doc, const std::wstring& baseUrl) {
-    if (!doc) return;
-    Element* searchRoot = doc->root ? doc->root.get() : doc->body.get();
-
-    std::vector<Element*> links;
-    collectStylesheetLinks(searchRoot, links);
-
-    for (Element* link : links) {
-        std::wstring resolved = resolveUrl(baseUrl, link->attrs[L"href"]);
-        if (resolved.empty()) continue; // e.g. a relative href on a local-file page
-
-        FetchResult res = fetchPage(resolved);
-        if (!res.ok) continue;
-
-        std::vector<CSS::Rule> extra = CSS::parseStylesheet(res.html);
-        int offset = (int)doc->styles.size();
-        for (auto& r : extra) r.order += offset;
-        doc->styles.insert(doc->styles.end(),
-                            std::make_move_iterator(extra.begin()),
-                            std::make_move_iterator(extra.end()));
-    }
-}
-
 bool Engine::takeNavigation(std::wstring& outUrl, bool& outReplace) {
     if (!domState.navigationPending) return false;
     outUrl = std::move(domState.navigationUrl);
@@ -218,6 +254,31 @@ bool Engine::takeNavigation(std::wstring& outUrl, bool& outReplace) {
     return true;
 }
 
+// Collects every <link rel="stylesheet"> on the page (in document order,
+// after whatever inline <style> rules HTMLParser already parsed into
+// doc->styles) and starts fetching them all concurrently (ResourceLoader) -
+// pollResources applies each one's rules the moment it's ready, rather
+// than this blocking on them one at a time.
+//
+// Each stylesheet gets a precomputed order *band* (its 1-based position
+// among links, times kStyleOrderBand) added to every rule it produces,
+// instead of the old approach of offsetting by doc->styles.size() at
+// append time. That old approach relied on appending happening in
+// document order, which relied on fetching happening serially - no longer
+// true now that stylesheets apply in whatever order their fetches happen
+// to complete. Precomputing each one's band from its position in the
+// *document* rather than its position in doc->styles keeps specificity
+// ties resolving in true document order regardless of fetch order (band 0
+// is implicitly reserved for inline <style> rules, whose order values
+// HTMLParser already assigns starting at 0).
+//
+// Simplification carried over unchanged from before: every linked
+// stylesheet's rules end up ordered after every inline <style> block's
+// rules, regardless of their true relative position in the markup -
+// correct for the overwhelmingly common case (a stylesheet link in <head>,
+// any inline overrides after it) and only wrong if a page deliberately
+// puts an overriding <style> block *before* its <link rel=stylesheet> and
+// relies on that ordering to win a specificity tie.
 void Engine::parseAndBuild(const std::wstring& html) {
     // The old DOM (and the elements form state points into) is about to go.
     focusedEl = nullptr;
@@ -227,7 +288,29 @@ void Engine::parseAndBuild(const std::wstring& html) {
 
     HTMLParser parser;
     document = parser.parse(html);
-    if (document) loadLinkedStylesheets(document.get(), pageBaseUrl);
+
+    styleTasks_.clear();
+    if (document) {
+        Element* searchRoot = document->root ? document->root.get() : document->body.get();
+        std::vector<Element*> links;
+        collectStylesheetLinks(searchRoot, links);
+
+        std::vector<std::wstring> urls;
+        for (Element* link : links) {
+            std::wstring resolved = resolveUrl(pageBaseUrl, link->attrs[L"href"]);
+            if (resolved.empty()) continue; // e.g. a relative href on a local-file page
+
+            StyleTask task;
+            task.fetchIndex = urls.size();
+            task.orderBase = kStyleOrderBand * (int)(styleTasks_.size() + 1);
+            styleTasks_.push_back(task);
+            urls.push_back(resolved);
+        }
+        styleLoader_.start(std::move(urls));
+    }
+    else {
+        styleLoader_.start({});
+    }
 
     if (document && document->body) {
         layoutRoot.rootNode = document->body.get();
@@ -305,6 +388,11 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     // A setTimeout/setInterval callback may mutate the DOM below (sets
     // domDirty, same as any other script), so this runs before that check.
     if (jsEngine) fireDueTimers(jsEngine->context(), timeSeconds);
+
+    // A stylesheet/script that was still being fetched in the background
+    // may have just landed - apply whatever's newly ready (also sets
+    // domDirty on anything that changes; see pollResources).
+    pollResources();
 
     // A script mutated the DOM (appendChild, textContent=, setAttribute,
     // innerHTML=, ...) since the last layout - re-layout to pick it up.

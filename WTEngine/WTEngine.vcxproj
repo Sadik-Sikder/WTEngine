@@ -147,6 +147,7 @@
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\OpenGLRenderer.cpp" />
     <ClCompile Include="src\PageLoader.cpp" />
+    <ClCompile Include="src\ResourceLoader.cpp" />
   </ItemGroup>
   <!-- The vendored quickjs-ng engine, compiled straight into this project. Mirrors the
        "qjs" target in third_party/quickjs-ng/CMakeLists.txt (only these four files, C11 with
@@ -181,6 +182,7 @@
     <ClInclude Include="include\OpenGLRenderer.h" />
     <ClInclude Include="include\PageLoader.h" />
     <ClInclude Include="include\Renderer.h" />
+    <ClInclude Include="include\ResourceLoader.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

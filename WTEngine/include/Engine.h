@@ -6,6 +6,7 @@
 #include "DOM.h"
 #include "JSBinding.h"
 #include "Layout.h"
+#include "ResourceLoader.h"
 #include "TextEditor.h"
 
 // A form the user submitted. The caller resolves `action` against the current
@@ -90,7 +91,30 @@ private:
     // how navigation already discards and re-parses the whole DOM).
     std::unique_ptr<JSEngine> jsEngine;
     DOMBindingState domState; // reset alongside jsEngine; see JSBinding.h
-    void runScripts();
+    void beginScripts();
+
+    // A page's own <link rel=stylesheet> and <script src> fetches happen
+    // concurrently on background threads (ResourceLoader) instead of
+    // blocking the UI thread on them one at a time - see Engine.cpp's
+    // pollResources for the full explanation. Each task records enough to
+    // either apply immediately (inline) or look up its fetch once ready.
+    struct StyleTask {
+        size_t fetchIndex;
+        int orderBase; // precomputed document-order band - see parseAndBuild
+        bool applied = false;
+    };
+    struct ScriptTask {
+        bool external;
+        size_t fetchIndex;       // valid if external
+        std::wstring inlineCode; // valid if !external
+    };
+    ResourceLoader styleLoader_;
+    ResourceLoader scriptLoader_;
+    std::vector<StyleTask> styleTasks_;
+    std::vector<ScriptTask> scriptTasks_;
+    size_t scriptCursor_ = 0; // next scriptTasks_ index to run, in document order
+    void advanceScripts();    // runs scriptTasks_[scriptCursor_..] while each is ready, stopping at the first that isn't
+    void pollResources();     // called every frame from render(): applies newly-ready stylesheets, advances scripts
 
     // Form state. The focused field's text lives in `editor` while editing
     // and is copied back to the element's "value" attribute after each edit.

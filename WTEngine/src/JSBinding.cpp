@@ -55,7 +55,7 @@ static std::wstring argStr(JSContext* ctx, int argc, JSValueConst* argv, int i) 
 // happens in the destructor, which unique_ptr<ListenerStorage>'s own
 // move-assignment already invokes correctly for both DOMBindingState's
 // full destruction and its per-navigation `= DOMBindingState{}` reset in
-// Engine::runScripts() (replacing the pointer destroys the old target).
+// Engine::beginScripts() (replacing the pointer destroys the old target).
 struct ListenerStorage {
     std::map<Element*, std::vector<JSValue>> click;
     JSContext* ctx = nullptr;

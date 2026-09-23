@@ -44,6 +44,7 @@ add_executable(WTEngine
     src/main.cpp
     src/OpenGLRenderer.cpp
     src/PageLoader.cpp
+    src/ResourceLoader.cpp
 )
 
 target_include_directories(WTEngine PRIVATE include)
