@@ -311,6 +311,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         else if (k == L"padding-bottom") sv.paddingBottom = resolveLength(v, containingWidth, 6);
         else if (k == L"padding-left") sv.paddingLeft = resolveLength(v, containingWidth, 6);
         else if (k == L"width") sv.width = resolveLength(v, containingWidth, -1);
+        else if (k == L"height") sv.height = resolveLength(v, containingWidth, -1);
         else if (k == L"box-sizing") {
             if (v == L"border-box") sv.boxSizing = BoxSizing::BorderBox;
             else if (v == L"content-box") sv.boxSizing = BoxSizing::ContentBox;
@@ -829,6 +830,15 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
 
     currentHref = savedHref;
     currentForm = savedForm;
+
+    // Explicit height:0 collapses this box regardless of its children's
+    // natural size - real CSS clips them via overflow:hidden; this engine
+    // has no clipping model, so it just doesn't let them push layout past
+    // here. Children's own boxes keep whatever (real, un-collapsed)
+    // positions they were laid out at - harmless as long as they're also
+    // invisible (opacity:0/visibility:hidden), which is the only realistic
+    // reason a page pairs height:0 with content still inside it.
+    if (sv.height == 0) y = contentStartY + sv.borderWidth + sv.paddingTop;
 
     y += sv.paddingBottom + sv.borderWidth;
 
