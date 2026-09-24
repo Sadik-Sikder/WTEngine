@@ -2,7 +2,7 @@
 
 A working reference for the current codebase. It describes what the code does today, not what is planned. File and function names are given so you can jump straight to the source.
 
-_Snapshot: latest commit `5cfc6d7` ("Add a watchdog timeout to JS execution"), plus this commit's documentation of it._
+_Snapshot: latest commit `2a601e7` ("Fix CSS parser corruption on native-nested rules"), plus this commit's documentation of it and the preceding `opacity`/`visibility` commit (`2fbc537`)._
 
 ---
 
@@ -213,7 +213,7 @@ A hand-written, forgiving, single-pass recursive-descent parser. All text is `st
 
 ## 8. CSS (`CSS.h`, `CSS.cpp`)
 
-**Parsing** (`parseStylesheet`): strips `/* */` comments, drops every `@`-rule (so `@media`, `@import`, `@font-face` never apply), splits comma groups, and produces one `Rule` per selector with `chain`, `declarations`, `specificity` and source `order`.
+**Parsing** (`parseStylesheet`): strips `/* */` comments, drops every `@`-rule (so `@media`, `@import`, `@font-face` never apply), splits comma groups, and produces one `Rule` per selector with `chain`, `declarations`, `specificity` and source `order`. A rule's declaration body is found via brace-depth counting (`matchBrace`, shared with `skipAtRule`'s own `@media {...}` skipping), not a plain search for the next `}` - real-world minified CSS uses native nesting (a selector block declared directly inside another rule's body, e.g. `.a{ .b{...} .c{...} }`, no `@` involved), and a naive next-`}` search stops at the *inner* rule's close instead of the outer one's, desyncing every rule parsed afterward for the rest of the file.
 
 **Selectors supported:** `tag`, `.class`, `#id`, `*`, compounds like `div.card#x`, and the **descendant** combinator (`a b`, any depth). **Not supported** (the whole selector is skipped): `>`, `+`, `~`, `[attr]`, `:pseudo`.
 
@@ -243,6 +243,7 @@ A hand-written, forgiving, single-pass recursive-descent parser. All text is `st
 | `flex-grow`, `flex` | A bare number, on a flex item. `flex: N` is simplified to set `flex-grow` only (real CSS's shorthand also sets `flex-shrink`/`flex-basis`, neither modeled) |
 | `font-size` | px, `em`, `rem`, `%` (relative to the inherited size); inherited by children |
 | `display` | `none`, `block`, `inline`, `inline-block` (treated as inline), `grid`, `flex` |
+| `opacity`, `visibility` | `opacity <= 0` or `visibility: hidden`/`collapse` (own or inherited from an ancestor) makes an element's boxes skip painting (`LayoutBox::visuallyHidden`, checked in `Engine::render`) - but *not* layout: it still occupies its normal space, matching real CSS, unlike `display:none`. Click hit-testing is unaffected (a simplification - real CSS only blocks it for `visibility:hidden`, not `opacity`) |
 
 Everything else (`color`, `height`, `float`, `position`, `font-weight`, …) is parsed and ignored. Text is always black; links are always blue. `em`/`rem` aren't supported for `width`/`margin`/`padding`/`border-width`/grid tracks/`gap` (only `font-size` resolves those) - use px or `%`.
 
@@ -512,8 +513,8 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 - Sloppy HTML nests wrongly (any end tag closes the current element; no implied end tags).
 - `<title>` is discarded, so the window title is the URL.
 - Colours: only `#rrggbb`. Named colours (`red`), `#rgb`, `rgb(...)` and malformed values (e.g. `#gggggg`) all fall back to light gray. (`parseColor` validates the hex digits, so bad input can't crash the engine.)
-- External stylesheets (`<link rel=stylesheet>`) are fetched and applied, but always cascade after every inline `<style>` block regardless of true document order (§10). No `@media`, no pseudo-classes, attribute selectors or child/sibling combinators.
-- Only the properties in §8 are honoured. `width`/`border`/`box-sizing` work for plain block and grid/flex-item elements (not for form controls or `<img>`); `height` is not supported at all (boxes are always exactly as tall as their content). No floats, positioning, or text colour/weight. Border is always solid-colored; `border-radius`/`border-style` aren't read.
+- External stylesheets (`<link rel=stylesheet>`) are fetched and applied, but always cascade after every inline `<style>` block regardless of true document order (§10). No `@media`, no pseudo-classes, attribute selectors or child/sibling combinators. **Confirmed on a real page:** Wikipedia's collapsible "Main menu" panel is hidden by a plain-class rule (`.vector-dropdown-content{opacity:0;height:0;visibility:hidden;...}`, revealed via a `:checked ~` sibling-combinator rule this engine already correctly skips) - `opacity`/`visibility` are now supported (§8) and were verified to hide it correctly in isolation, but on the real page that whole rule turns out to be nested inside `@media screen{...}` (confirmed by tracing the parser's byte offsets - a real, ~36KB block, not a parsing bug), so it's still skipped, unrelated to whether `opacity`/`visibility` themselves work. Implementing `@media` (even just evaluating simple `screen`/`print`/width conditions instead of always skipping) would be needed to fix this specific case, and hasn't been attempted.
+- Only the properties in §8 are honoured. `width`/`border`/`box-sizing` work for plain block and grid/flex-item elements (not for form controls or `<img>`); `height` is not supported at all (boxes are always exactly as tall as their content). No floats, positioning, or text colour/weight. Border is always solid-colored; `border-radius`/`border-style` aren't read. `opacity`/`visibility` are supported as a "keep the space, skip the paint" hide mechanism (§8) - not a general implementation of either property (no partial-opacity blending, no `visibility:collapse`'s table-specific behavior).
 - Grid supports column and row tracks (px/%/fr for columns; `fr` rows fall back to auto - no definite container height to distribute against), `gap`, row-major auto-placement, named-area placement (`grid-template-areas`/`grid-area`, and the `grid-template` shorthand's area-string form), and explicit line-based placement (`grid-column`/`grid-row`, both axes required together - see §9). Auto-placed items fill gaps left by explicit ones less tightly than real CSS's own algorithm does; a named area's cells aren't checked for forming a proper rectangle (its bounding box is used regardless). Not supported: `justify-*`/`align-*` and subgrid. A bare text node directly inside a grid container is dropped rather than becoming an anonymous item.
 - Flex supports `flex-direction` (row/column), `justify-content`, `align-items`, `flex-grow`, and `gap` - see §9's Flex subsection for exactly what each does and doesn't do on each axis. Not spec-accurate for row-direction sizing: an item with neither an explicit `width` nor `flex-grow` gets an equal share of leftover space rather than being sized by its content, since this engine has no min/max-content sizing anywhere to size it by. Not supported at all: `flex-wrap`, `flex-shrink`, `flex-basis`, `align-content`, `align-self`, `order`.
 - Radio buttons, file inputs, `<textarea>` (content dropped), and multi-line inputs are not supported. A `<select>` shows only direct `<option>` children (no `<optgroup>`).
