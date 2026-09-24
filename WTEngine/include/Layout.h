@@ -34,6 +34,12 @@ struct LayoutBox {
     // which element - and its ancestors, for bubbling - a click landed on.
     Element* el = nullptr;
     Element* form = nullptr; // the enclosing <form>, if any
+
+    // opacity:0 / visibility:hidden (own or inherited from an ancestor):
+    // still occupies its layout position (x/y/width/height above are real),
+    // just skipped by Engine::render's paint loop. Click hit-testing is
+    // deliberately unaffected - see Engine::render's comment.
+    bool visuallyHidden = false;
 };
 
 struct LayoutRoot {
@@ -60,7 +66,8 @@ private:
     // `inheritedFontSize` is the size to use for `el`'s own direct text, and
     // the default for its children's font-size unless they set their own -
     // i.e. plain CSS inheritance, not reset to a hardcoded size each level.
-    void layoutElement(Element* el, int x, int& y, int containingWidth, int inheritedFontSize);
+    void layoutElement(Element* el, int x, int& y, int containingWidth, int inheritedFontSize,
+                        bool inheritedVisuallyHidden);
     std::wstring getAttr(Element* el, const std::wstring& key, const std::wstring& def = L"");
     int parseFontSize(const std::wstring& s, int def = 14);
     int resolveFontSize(const std::wstring& s, int baseFontSize, int def);
@@ -86,11 +93,13 @@ private:
         std::wstring href;
         Element* owner = nullptr;
         bool isBreak = false;
+        bool visuallyHidden = false;
     };
     // Splits `text` on whitespace, appending one InlineItem per word.
     void appendWords(const std::wstring& text, int fontSize, const std::wstring& href,
-                      Element* owner, std::vector<InlineItem>& out);
-    void collectInline(Element* el, int inheritedFontSize, int containingWidth, std::vector<InlineItem>& out);
+                      Element* owner, std::vector<InlineItem>& out, bool visuallyHidden);
+    void collectInline(Element* el, int inheritedFontSize, int containingWidth, std::vector<InlineItem>& out,
+                        bool inheritedVisuallyHidden);
     void layoutInlineRun(const std::vector<InlineItem>& items, int x, int& y, int containingWidth);
 
     // The subset of an element's cascaded style that layout cares about -
@@ -170,8 +179,18 @@ private:
         // 0 (unset) is the real CSS default too - an item only grows if
         // this is explicitly positive.
         float flexGrow = 0;
+        // Raw `opacity`/`visibility` as authored, plus the resolved,
+        // inheritance-aware flag layout code actually checks (own opacity
+        // <= 0, own visibility:hidden, or an ancestor already hidden this
+        // way). Distinct from Display::None: a visually-hidden element
+        // still occupies its normal layout space, just isn't painted - see
+        // layoutElement's/Engine::render's comments.
+        float opacity = 1.0f;
+        bool visibilityHidden = false;
+        bool visuallyHidden = false;
     };
-    ComputedStyle computeStyle(Element* e, int inheritedFontSize, int containingWidth);
+    ComputedStyle computeStyle(Element* e, int inheritedFontSize, int containingWidth,
+                                bool inheritedVisuallyHidden);
     // Splits a shorthand value like "4px 8px" on whitespace and expands it
     // to all four sides per CSS's 1/2/3/4-value shorthand rule (used for
     // both `margin` and `padding`). Missing tokens, or a value that fails

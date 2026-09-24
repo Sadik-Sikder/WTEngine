@@ -409,6 +409,12 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
         if (screenY + b.height < topInset || screenY > height)
             continue;
 
+        // opacity:0 / visibility:hidden (own or inherited): still occupies
+        // its layout position (handled above/below), just not painted.
+        // Click hit-testing (dispatchClick/onClick) is unaffected - a
+        // deliberate simplification, see Layout.h's LayoutBox comment.
+        if (b.visuallyHidden) continue;
+
         if (b.control != LayoutBox::NoControl) {
             drawControl(renderer, b, screenY, timeSeconds);
             continue;
