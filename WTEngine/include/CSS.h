@@ -35,6 +35,14 @@ struct Rule {
     std::vector<std::pair<std::wstring, std::wstring>> declarations;
     Specificity specificity;
     int order = 0; // source order, to break specificity ties
+    // A width this rule's @media condition requires the viewport to be at
+    // least/at most (px), or -1 for no constraint on that side. Set by
+    // parseStylesheet for a rule found inside a "@media ... (min-width:
+    // Npx) ..."/"(max-width:Npx)" block; not checked by matches() itself
+    // (which stays viewport-agnostic) - the caller (LayoutRoot::computeStyle)
+    // checks it against the live viewport alongside matches(), so it's
+    // re-evaluated on every relayout (e.g. a window resize), not just once.
+    int mediaMinWidth = -1, mediaMaxWidth = -1;
 };
 
 // Parses one selector (e.g. "div.card#id", "#target", ".foo bar") into a
@@ -50,11 +58,16 @@ bool parseSelector(const std::wstring& selector, std::vector<CompoundSelector>& 
 // parent); strips comments. A bare-media-type @media block ("@media
 // screen{...}", "@media print{...}", "@media all{...}", or no type at
 // all) is evaluated outright (screen/all/none = always applies, print =
-// never) and its content parsed as if unwrapped; every other @-rule -
-// @supports, @import, @font-face, @keyframes, and any @media with a
-// parenthesized feature query (min-width, prefers-color-scheme, ...) or a
-// comma-separated query list - is still always skipped, never
-// conditionally applied.
+// never) and its content parsed as if unwrapped. A @media condition
+// combining a type with (min-width:Npx)/(max-width:Npx) via "and" (e.g.
+// "screen and (min-width:1120px)") is also handled, but differently -
+// since the viewport isn't known at parse time, every rule found inside
+// is tagged with the width bound (Rule::mediaMinWidth/mediaMaxWidth) and
+// checked against the live viewport wherever rules are matched, not
+// decided once here. Every other @-rule - @supports, @import, @font-face,
+// @keyframes, a comma-separated media query list, or any feature besides
+// min-width/max-width (prefers-color-scheme, hover, orientation, ...) -
+// is still always skipped, never conditionally applied.
 // Not supported: >, +, ~ combinators, attribute selectors, pseudo-classes.
 std::vector<Rule> parseStylesheet(const std::wstring& css);
 

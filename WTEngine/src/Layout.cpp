@@ -411,6 +411,13 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
     if (rules) {
         std::vector<const CSS::Rule*> matched;
         for (const auto& rule : *rules) {
+            // A width-conditioned @media's rule carries the viewport
+            // bound it needs (CSS::Rule's comment); checked here, against
+            // the live viewport, rather than once at parse time - so a
+            // resize (a full relayout, hence a fresh computeStyle pass)
+            // re-evaluates it for free, no separate reactivity needed.
+            if (rule.mediaMinWidth >= 0 && viewportWidth < rule.mediaMinWidth) continue;
+            if (rule.mediaMaxWidth >= 0 && viewportWidth > rule.mediaMaxWidth) continue;
             if (CSS::matches(rule, ancestorStack, e, &classCache)) matched.push_back(&rule);
         }
         std::stable_sort(matched.begin(), matched.end(),
