@@ -138,6 +138,65 @@ bool isSimpleScreenMedia(const std::wstring& conditionRaw) {
     return condition.empty() || condition == L"all" || condition == L"screen";
 }
 
+// A @media condition this engine can evaluate against the viewport at
+// layout time (unlike isSimpleScreenMedia's parse-time-decided case).
+// `supported` false means "fall back to skipAtRule", same meaning as
+// isSimpleScreenMedia returning false.
+struct MediaCondition {
+    bool supported = false;
+    int minWidthPx = -1, maxWidthPx = -1;
+};
+
+// Parses a condition like "screen and (min-width:1120px)" - a media type
+// (screen/all; print or anything else falls back to unsupported, same as
+// isSimpleScreenMedia) ANDed with zero or more (min-width:Npx)/
+// (max-width:Npx) features (any other feature, or a non-px unit, is
+// unsupported). No comma-separated query list (a real query *list* means
+// "match if ANY one applies" - supporting that would need each Rule to
+// carry multiple alternative ranges instead of one, not worth it for how
+// rarely a list is mixed with min-width/max-width in practice).
+MediaCondition parseMediaCondition(const std::wstring& conditionRaw) {
+    MediaCondition mc;
+    std::wstring condition = trim(conditionRaw);
+    if (condition.empty() || condition.find(L',') != std::wstring::npos) return mc;
+
+    std::vector<std::wstring> parts;
+    size_t pos = 0;
+    while (true) {
+        size_t andPos = condition.find(L" and ", pos);
+        size_t end = (andPos == std::wstring::npos) ? condition.size() : andPos;
+        parts.push_back(trim(condition.substr(pos, end - pos)));
+        if (andPos == std::wstring::npos) break;
+        pos = andPos + 5;
+    }
+
+    bool sawType = false;
+    for (auto& part : parts) {
+        if (part.empty()) return MediaCondition{};
+        if (part.front() == L'(') {
+            if (part.back() != L')') return MediaCondition{};
+            std::wstring inner = trim(part.substr(1, part.size() - 2));
+            size_t colon = inner.find(L':');
+            if (colon == std::wstring::npos) return MediaCondition{};
+            std::wstring feature = trim(inner.substr(0, colon));
+            std::wstring value = trim(inner.substr(colon + 1));
+            if (value.size() < 3 || value.compare(value.size() - 2, 2, L"px") != 0) return MediaCondition{};
+            int px;
+            try { px = std::stoi(value.substr(0, value.size() - 2)); }
+            catch (...) { return MediaCondition{}; }
+            if (feature == L"min-width") mc.minWidthPx = px;
+            else if (feature == L"max-width") mc.maxWidthPx = px;
+            else return MediaCondition{};
+        } else {
+            if (sawType) return MediaCondition{};
+            sawType = true;
+            if (part != L"screen" && part != L"all") return MediaCondition{}; // "print" (or anything else) included
+        }
+    }
+    mc.supported = true;
+    return mc;
+}
+
 // Skips a `@media (...) { ... }`-style at-rule (braces may nest) or a
 // `@import "x.css";`-style statement. Either way its content never takes
 // effect - a page's CSS only applies when unconditional.
@@ -250,9 +309,26 @@ std::vector<Rule> parseStylesheet(const std::wstring& cssIn) {
     int order = 0;
     size_t i = 0;
 
+    // Width-conditioned @media blocks currently being descended into -
+    // unlike a bare-type block (decided once, here, at parse time), a
+    // width condition can't be decided until layout knows the viewport,
+    // so every rule found while this is non-empty gets tagged with the
+    // innermost entry's bounds instead (see parseMediaCondition's
+    // comment). `endPos` is where that block's own closing '}' is
+    // (from matchBrace, already computed to know where to descend to);
+    // popped once the parse cursor reaches it, right before that brace is
+    // consumed by the ordinary "stray closing brace" handling below -
+    // works the same whether the block is directly nested or reached
+    // through an intervening bare-type @media (which never touches this
+    // stack itself, so the ANCESTOR width constraint still applies).
+    struct MediaScope { size_t endPos; int minWidthPx, maxWidthPx; };
+    std::vector<MediaScope> mediaStack;
+
     while (i < css.size()) {
         while (i < css.size() && iswspace(css[i])) i++;
         if (i >= css.size()) break;
+
+        while (!mediaStack.empty() && i >= mediaStack.back().endPos) mediaStack.pop_back();
 
         if (css[i] == L'@') {
             // A bare-type @media (e.g. "@media screen{...}") that
@@ -261,7 +337,8 @@ std::vector<Rule> parseStylesheet(const std::wstring& cssIn) {
             // wrapped at all. Landing on the block's own closing '}' once
             // that content is exhausted is handled by the plain "stray
             // closing brace" branch just below - no explicit tracking of
-            // where the block ends is needed.
+            // where the block ends is needed (unlike the width-conditioned
+            // case just above, this one is fully decided right here).
             if (css.compare(i + 1, 5, L"media") == 0) {
                 size_t braceIdx = css.find_first_of(L"{;", i);
                 if (braceIdx != std::wstring::npos && css[braceIdx] == L'{') {
@@ -269,6 +346,22 @@ std::vector<Rule> parseStylesheet(const std::wstring& cssIn) {
                     if (isSimpleScreenMedia(condition)) {
                         i = braceIdx + 1;
                         continue;
+                    }
+                    MediaCondition mc = parseMediaCondition(condition);
+                    if (mc.supported) {
+                        size_t blockEnd = matchBrace(css, braceIdx);
+                        if (blockEnd != std::wstring::npos) {
+                            int minW = mc.minWidthPx, maxW = mc.maxWidthPx;
+                            if (!mediaStack.empty()) { // AND with any already-active constraint
+                                int outerMin = mediaStack.back().minWidthPx;
+                                int outerMax = mediaStack.back().maxWidthPx;
+                                if (outerMin > minW) minW = outerMin;
+                                if (outerMax >= 0 && (maxW < 0 || outerMax < maxW)) maxW = outerMax;
+                            }
+                            mediaStack.push_back({ blockEnd, minW, maxW });
+                            i = braceIdx + 1;
+                            continue;
+                        }
                     }
                 }
             }
@@ -298,6 +391,10 @@ std::vector<Rule> parseStylesheet(const std::wstring& cssIn) {
             rule.declarations = declarations;
             rule.specificity = specificityOf(rule.chain);
             rule.order = order;
+            if (!mediaStack.empty()) {
+                rule.mediaMinWidth = mediaStack.back().minWidthPx;
+                rule.mediaMaxWidth = mediaStack.back().maxWidthPx;
+            }
             rules.push_back(std::move(rule));
         }
         order++;
