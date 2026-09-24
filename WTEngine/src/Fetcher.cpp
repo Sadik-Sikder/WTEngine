@@ -45,6 +45,7 @@
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
 #include <openssl/x509.h>
+#include <zlib.h>
 
 #pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -246,6 +247,44 @@ static bool responseWantsClose(const http::response<http::string_body>& res) {
     return val.find("close") != std::string::npos;
 }
 
+// Decompresses a gzip- or deflate-encoded response body via zlib's
+// inflate(). windowBits 15+32 is zlib's own documented trick for "detect
+// either a gzip or a zlib/deflate header automatically" - one code path
+// serves both encodings without needing to know in advance which a given
+// server actually used. Some CDNs (confirmed against a real one, serving
+// static assets stored pre-compressed in S3/CloudFront) send
+// Content-Encoding: gzip unconditionally, regardless of whether the
+// request even sent an Accept-Encoding header asking for it - so this
+// isn't optional best-effort handling, every caller needs it. On any
+// failure (truncated/corrupt data, an encoding claimed but not actually
+// used), returns `compressed` unchanged rather than an empty result -
+// matches how a redirect with a bad URL or a failed connection already
+// degrade to "give back something rather than silently lose the page"
+// elsewhere in this file. Brotli ("br") isn't supported - would need a
+// separate library, and no server should send it unasked since this
+// file never advertises it in Accept-Encoding (see sendOneRequest).
+static std::string decompressBody(const std::string& compressed) {
+    z_stream zs{};
+    if (inflateInit2(&zs, 15 + 32) != Z_OK) return compressed;
+
+    zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressed.data()));
+    zs.avail_in = static_cast<uInt>(compressed.size());
+
+    std::string out;
+    char chunk[16384];
+    int ret;
+    do {
+        zs.next_out = reinterpret_cast<Bytef*>(chunk);
+        zs.avail_out = sizeof(chunk);
+        ret = inflate(&zs, Z_NO_FLUSH);
+        if (ret != Z_OK && ret != Z_STREAM_END) { inflateEnd(&zs); return compressed; }
+        out.append(chunk, sizeof(chunk) - zs.avail_out);
+    } while (ret != Z_STREAM_END);
+
+    inflateEnd(&zs);
+    return out;
+}
+
 // One shared pool for the process, keyed by "host:port" - separate maps
 // for plain and TLS connections since they're different C++ types, not
 // because the concept differs. Thread-safe: every method locks the same
@@ -329,6 +368,15 @@ static void writeAndRead(Stream& stream, const http::request<http::string_body>&
     auto loc = res.find(http::field::location);
     if (loc != res.end()) out.location.assign(loc->value());
     out.ok = true;
+
+    auto ce = res.find(http::field::content_encoding);
+    if (ce != res.end()) {
+        std::string encoding(ce->value());
+        for (auto& c : encoding) c = (char)std::tolower((unsigned char)c);
+        if (encoding.find("gzip") != std::string::npos || encoding.find("deflate") != std::string::npos)
+            out.body = decompressBody(out.body);
+        // "br" (Brotli) and anything else unrecognized passes through as-is.
+    }
 
     keepAlive = !responseWantsClose(res);
     keepAliveTimeout = kDefaultPoolTimeout;
@@ -436,6 +484,7 @@ static RawResponse sendOneRequest(const UrlParts& parts, http::verb method, cons
     req.set(http::field::host, host);
     req.set(http::field::user_agent, "WTEngine/0.1");
     if (accept) req.set(http::field::accept, accept); // "text/html" for a page, unset for an image
+    req.set(http::field::accept_encoding, "gzip, deflate"); // decompressBody (writeAndRead) handles both - see its comment
     req.set(http::field::connection, "keep-alive"); // was "close" - see ConnectionPool above
     if (!body.empty()) {
         req.set(http::field::content_type, "application/x-www-form-urlencoded");
