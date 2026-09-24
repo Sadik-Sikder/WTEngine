@@ -53,6 +53,7 @@ find_library(GLFW3_LIB glfw3 PATHS "${CMAKE_CURRENT_SOURCE_DIR}/libs/glfw" NO_DE
 
 find_package(boost_beast CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED) # gzip/deflate response decompression - see Fetcher.cpp's decompressBody
 
 target_link_libraries(WTEngine PRIVATE "${GLFW3_LIB}" opengl32 wininet qjs
-    Boost::beast OpenSSL::SSL OpenSSL::Crypto ws2_32 mswsock crypt32)
+    Boost::beast OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB ws2_32 mswsock crypt32)
