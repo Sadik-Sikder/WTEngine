@@ -101,6 +101,25 @@ Specificity specificityOf(const std::vector<CompoundSelector>& chain) {
     return sp;
 }
 
+// Finds the index of the '}' matching the '{' at `openBrace`, honoring
+// nested braces - npos if unterminated. Needed because real-world CSS
+// nests rules inside other rules' declaration blocks (native CSS nesting,
+// e.g. ".a{ .b{...} .c{...} }" - Wikipedia's stylesheets use this), so a
+// plain css.find('}', ...) from the body's start would stop at the first
+// nested rule's closing brace instead of the real end, desyncing every
+// rule parsed after it for the rest of the file.
+size_t matchBrace(const std::wstring& css, size_t openBrace) {
+    int depth = 1;
+    size_t j = openBrace + 1;
+    while (j < css.size() && depth > 0) {
+        if (css[j] == L'{') depth++;
+        else if (css[j] == L'}') depth--;
+        if (depth == 0) return j;
+        j++;
+    }
+    return std::wstring::npos;
+}
+
 // Skips a `@media (...) { ... }`-style at-rule (braces may nest) or a
 // `@import "x.css";`-style statement. Either way its content never takes
 // effect - a page's CSS only applies when unconditional.
@@ -109,14 +128,8 @@ size_t skipAtRule(const std::wstring& css, size_t i) {
     if (stop == std::wstring::npos) return css.size();
     if (css[stop] == L';') return stop + 1;
 
-    int depth = 1;
-    size_t j = stop + 1;
-    while (j < css.size() && depth > 0) {
-        if (css[j] == L'{') depth++;
-        else if (css[j] == L'}') depth--;
-        j++;
-    }
-    return j;
+    size_t close = matchBrace(css, stop);
+    return close == std::wstring::npos ? css.size() : close + 1;
 }
 
 std::vector<std::wstring> classesOfUncached(const Element* el) {
@@ -230,7 +243,7 @@ std::vector<Rule> parseStylesheet(const std::wstring& cssIn) {
         if (brace == std::wstring::npos) break; // trailing garbage; nothing more to parse
         std::wstring selectorText = css.substr(i, brace - i);
 
-        size_t close = css.find(L'}', brace);
+        size_t close = matchBrace(css, brace);
         size_t bodyEnd = (close == std::wstring::npos) ? css.size() : close;
         std::wstring body = css.substr(brace + 1, bodyEnd - brace - 1);
         i = (close == std::wstring::npos) ? css.size() : close + 1;
