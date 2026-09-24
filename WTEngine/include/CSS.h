@@ -47,8 +47,14 @@ bool parseSelector(const std::wstring& selector, std::vector<CompoundSelector>& 
 // Parses the text of one or more <style> blocks into rules. Understands
 // tag/.class/#id/* selectors, compounds (div.card), comma-separated groups,
 // and plain descendant combinators ("a b" - not necessarily a direct
-// parent); strips comments and drops @-rules (a conditional block like
-// @media is always skipped, never conditionally applied).
+// parent); strips comments. A bare-media-type @media block ("@media
+// screen{...}", "@media print{...}", "@media all{...}", or no type at
+// all) is evaluated outright (screen/all/none = always applies, print =
+// never) and its content parsed as if unwrapped; every other @-rule -
+// @supports, @import, @font-face, @keyframes, and any @media with a
+// parenthesized feature query (min-width, prefers-color-scheme, ...) or a
+// comma-separated query list - is still always skipped, never
+// conditionally applied.
 // Not supported: >, +, ~ combinators, attribute selectors, pseudo-classes.
 std::vector<Rule> parseStylesheet(const std::wstring& css);
 
