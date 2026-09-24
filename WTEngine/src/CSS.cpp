@@ -120,6 +120,24 @@ size_t matchBrace(const std::wstring& css, size_t openBrace) {
     return std::wstring::npos;
 }
 
+// Whether a @media condition (the raw text between "@media" and its "{")
+// is simple enough to evaluate outright: no parenthesized feature query
+// (min-width, prefers-color-scheme, hover, ...) and no comma-separated
+// query list - just a bare media type, or none at all. This engine only
+// ever renders on-screen, so "screen"/"all"/empty are always true and
+// anything else (chiefly "print") is always false - covering the very
+// common "exclude this from print" pattern real stylesheets use. A
+// feature query needs the current viewport size at *match* time (layout
+// re-runs it on resize), which this parser has no access to at all - left
+// unevaluated (falls back to skipAtRule, same as today) rather than
+// guessed at.
+bool isSimpleScreenMedia(const std::wstring& conditionRaw) {
+    std::wstring condition = trim(conditionRaw);
+    if (condition.find(L'(') != std::wstring::npos) return false;
+    if (condition.find(L',') != std::wstring::npos) return false;
+    return condition.empty() || condition == L"all" || condition == L"screen";
+}
+
 // Skips a `@media (...) { ... }`-style at-rule (braces may nest) or a
 // `@import "x.css";`-style statement. Either way its content never takes
 // effect - a page's CSS only applies when unconditional.
@@ -236,7 +254,27 @@ std::vector<Rule> parseStylesheet(const std::wstring& cssIn) {
         while (i < css.size() && iswspace(css[i])) i++;
         if (i >= css.size()) break;
 
-        if (css[i] == L'@') { i = skipAtRule(css, i); continue; }
+        if (css[i] == L'@') {
+            // A bare-type @media (e.g. "@media screen{...}") that
+            // evaluates true is descended into rather than skipped: its
+            // content is parsed by this same loop as if it weren't
+            // wrapped at all. Landing on the block's own closing '}' once
+            // that content is exhausted is handled by the plain "stray
+            // closing brace" branch just below - no explicit tracking of
+            // where the block ends is needed.
+            if (css.compare(i + 1, 5, L"media") == 0) {
+                size_t braceIdx = css.find_first_of(L"{;", i);
+                if (braceIdx != std::wstring::npos && css[braceIdx] == L'{') {
+                    std::wstring condition = css.substr(i + 6, braceIdx - (i + 6));
+                    if (isSimpleScreenMedia(condition)) {
+                        i = braceIdx + 1;
+                        continue;
+                    }
+                }
+            }
+            i = skipAtRule(css, i);
+            continue;
+        }
         if (css[i] == L'}') { i++; continue; } // stray closing brace; keep going
 
         size_t brace = css.find(L'{', i);
