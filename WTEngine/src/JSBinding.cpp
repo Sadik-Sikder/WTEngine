@@ -509,6 +509,7 @@ bool dispatchClick(JSContext* ctx, Element* target) {
         // the map iterator/vector this loop is walking.
         std::vector<JSValue> fns = it->second;
         for (JSValue fn : fns) {
+            ArmScriptWatchdog(ctx);
             JSValue result = JS_Call(ctx, fn, JS_UNDEFINED, 1, &eventObj);
             if (JS_IsException(result)) JS_FreeValue(ctx, JS_GetException(ctx)); // swallow; keep bubbling
             JS_FreeValue(ctx, result);
@@ -584,15 +585,29 @@ void fireDueTimers(JSContext* ctx, double nowSeconds) {
         bool repeating = it->repeating;
         double period = it->periodSeconds;
 
+        ArmScriptWatchdog(ctx);
         JSValue result = JS_Call(ctx, fn, JS_UNDEFINED, 0, nullptr);
-        if (JS_IsException(result)) JS_FreeValue(ctx, JS_GetException(ctx)); // swallow; keep firing the rest
+        bool killedByWatchdog = false;
+        if (JS_IsException(result)) {
+            JSValue exc = JS_GetException(ctx);
+            killedByWatchdog = JS_IsUncatchableError(exc); // vs. an ordinary script throw
+            JS_FreeValue(ctx, exc); // swallow; keep firing the rest
+        }
         JS_FreeValue(ctx, result);
         JS_FreeValue(ctx, fn);
         runPendingJobs(ctx); // this callback's promise continuations, before the next timer
 
         it = std::find_if(ts.timers.begin(), ts.timers.end(), [&](const Timer& t) { return t.id == id; });
         if (it == ts.timers.end()) continue; // cleared itself (or was cleared) during its own call
-        if (repeating) it->nextFire = nowSeconds + period; // resync to now, not backlog-catch-up
+        if (killedByWatchdog) {
+            // A watchdog-killed callback would just hang again next fire -
+            // repeating it would burn kScriptTimeout worth of CPU forever
+            // instead of the one-time freeze this whole mechanism exists to
+            // prevent. Drop it instead of rescheduling.
+            JS_FreeValue(ctx, it->callback);
+            ts.timers.erase(it);
+        }
+        else if (repeating) it->nextFire = nowSeconds + period; // resync to now, not backlog-catch-up
         else {
             JS_FreeValue(ctx, it->callback);
             ts.timers.erase(it);

@@ -40,9 +40,27 @@ static JSValue jsConsoleLog(JSContext* ctx, JSValueConst /*thisVal*/, int argc, 
     return JS_UNDEFINED;
 }
 
+// Polled by quickjs-ng from inside the bytecode interpreter every ~10000
+// ops (JS_INTERRUPT_COUNTER_INIT in quickjs.c) - frequent enough to catch
+// a tight infinite loop well within a couple hundred ms of the deadline.
+// Returning nonzero throws an uncatchable "interrupted" error (quickjs's
+// own JS_ThrowInterrupted/JS_SetUncatchableError), so a script's own
+// try/catch cannot swallow it.
+static int watchdogInterruptHandler(JSRuntime* /*rt*/, void* opaque) {
+    auto* state = static_cast<JSWatchdogState*>(opaque);
+    return std::chrono::steady_clock::now() >= state->deadline;
+}
+
+void ArmScriptWatchdog(JSContext* ctx) {
+    auto* state = static_cast<JSWatchdogState*>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
+    state->deadline = std::chrono::steady_clock::now() + kScriptTimeout;
+}
+
 JSEngine::JSEngine() {
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);
+    JS_SetRuntimeOpaque(rt, &watchdog_);
+    JS_SetInterruptHandler(rt, watchdogInterruptHandler, &watchdog_);
 
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue console = JS_NewObject(ctx);
@@ -61,6 +79,7 @@ JSEngine::~JSEngine() {
 void runPendingJobs(JSContext* ctx) {
     JSRuntime* rt = JS_GetRuntime(ctx);
     for (;;) {
+        ArmScriptWatchdog(ctx); // fresh budget per drained job, same as any other JS entry point
         JSContext* jobCtx = nullptr;
         int status = JS_ExecutePendingJob(rt, &jobCtx);
         if (status == 0) break; // queue is empty
@@ -78,6 +97,7 @@ void runPendingJobs(JSContext* ctx) {
 
 std::wstring JSEngine::eval(const std::wstring& code) {
     std::string src = wideToUtf8(code);
+    ArmScriptWatchdog(ctx);
     JSValue result = JS_Eval(ctx, src.c_str(), src.size(), "<eval>", JS_EVAL_TYPE_GLOBAL);
 
     std::wstring out;
