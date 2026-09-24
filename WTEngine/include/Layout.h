@@ -131,6 +131,12 @@ private:
         int marginTop = 6, marginBottom = 6, marginLeft = 0, marginRight = 0;
         int paddingTop = 6, paddingRight = 6, paddingBottom = 6, paddingLeft = 6;
         int width = -1; // -1 = auto: fill the container, same as if unset (today's only behavior)
+        // Parsed the same way as `width`, but only the exact value 0 has
+        // any effect anywhere in layout (layoutBlockChild collapses a
+        // box to zero content height regardless of its children's
+        // natural size when this is 0) - any other explicit height is
+        // parsed but intentionally ignored, same as before this existed.
+        int height = -1;
         int borderWidth = 0;
         std::wstring borderColor;
         BoxSizing boxSizing = BoxSizing::ContentBox;
