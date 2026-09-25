@@ -39,6 +39,11 @@ struct DOMBindingState {
     std::unique_ptr<ListenerStorage> listeners;
     std::unique_ptr<TimerStorage> timers; // pending setTimeout/setInterval callbacks
 
+    // The element `document` wraps (set by installDOMBindings) - so a
+    // property shared by every node, like `title`, can tell `document`
+    // apart from an ordinary element.
+    Element* documentEl = nullptr;
+
     // The page's own URL - set by Engine::runScripts before any script
     // runs. Used to resolve a relative URL passed to location.href=/
     // .replace()/.assign(), and as location.href's own value.
@@ -72,3 +77,8 @@ bool dispatchClick(JSContext* ctx, Element* target);
 // via main.cpp). Called once per frame from Engine::render, the same
 // per-frame polling pattern already used for domDirty/imageGeneration.
 void fireDueTimers(JSContext* ctx, double nowSeconds);
+
+// The document's title: the text of the first <title> element under
+// `root` (outside any <svg>), with runs of whitespace collapsed to single
+// spaces and trimmed, as browsers do. Empty if there's no <title>.
+std::wstring documentTitle(Element* root);

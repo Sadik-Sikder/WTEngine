@@ -33,6 +33,10 @@ public:
     int getDocumentHeight() const;
     int getScrollY() const { return scrollY; }
 
+    // The page's <title> text (whitespace-collapsed), or empty if it has
+    // none. Live: reflects a later document.title = ... from JS too.
+    std::wstring title() const;
+
     // Returns the href of the link under window-space point (x, y), or empty.
     std::wstring linkAt(int x, int y, Renderer& renderer) const;
 

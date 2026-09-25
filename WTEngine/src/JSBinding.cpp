@@ -698,6 +698,84 @@ static JSValue js_set_location(JSContext* ctx, JSValueConst /*this_val*/, JSValu
     return JS_UNDEFINED;
 }
 
+// --- title ----------------------------------------------------------------
+// document.title reads/writes the page's <title>; on any other element,
+// `title` is its title="" attribute (the tooltip text), as in a real DOM.
+
+static Element* findTitleElement(Element* el) {
+    if (!el || el->tag == L"svg") return nullptr; // an <svg>'s own <title> isn't the document's
+    if (el->tag == L"title") return el;
+    for (auto& c : el->children) {
+        if (c->type != Node::ELEMENT) continue;
+        if (Element* t = findTitleElement(static_cast<Element*>(c.get()))) return t;
+    }
+    return nullptr;
+}
+
+// `document` wraps <body>; the <title> normally lives in <head>, a sibling,
+// so the search starts from the top of the tree.
+static Element* topOf(Element* el) {
+    while (el && el->parent) el = el->parent;
+    return el;
+}
+
+std::wstring documentTitle(Element* root) {
+    Element* t = findTitleElement(root);
+    if (!t) return L"";
+    std::wstring raw, out;
+    gatherText(t, raw);
+    for (wchar_t c : raw) {
+        if (iswspace(c)) { if (!out.empty() && out.back() != L' ') out.push_back(L' '); }
+        else out.push_back(c);
+    }
+    if (!out.empty() && out.back() == L' ') out.pop_back();
+    return out;
+}
+
+static JSValue js_get_title(JSContext* ctx, JSValueConst this_val) {
+    Element* el = unwrapElement(this_val);
+    if (!el) return jsStr(ctx, L"");
+    DOMBindingState* state = bindingState(ctx);
+    if (state && el == state->documentEl) return jsStr(ctx, documentTitle(topOf(el)));
+    auto it = el->attrs.find(L"title");
+    return jsStr(ctx, it == el->attrs.end() ? L"" : it->second);
+}
+
+static JSValue js_set_title(JSContext* ctx, JSValueConst this_val, JSValueConst val) {
+    Element* el = unwrapElement(this_val);
+    if (!el) return JS_UNDEFINED;
+    const char* s = JS_ToCString(ctx, val);
+    std::wstring v = utf8ToWide(s);
+    JS_FreeCString(ctx, s);
+
+    DOMBindingState* state = bindingState(ctx);
+    if (!state || el != state->documentEl) {
+        el->attrs[L"title"] = v;
+        markDirty(ctx);
+        return JS_UNDEFINED;
+    }
+
+    // document.title = ...: rewrite the existing <title>, or create one in
+    // <head> (or at the top of the tree if there's no <head> either). The
+    // window title picks it up on the next frame (Engine::title()).
+    Element* top = topOf(el);
+    Element* t = findTitleElement(top);
+    if (!t) {
+        Element* head = nullptr;
+        for (auto& c : top->children)
+            if (c->type == Node::ELEMENT && static_cast<Element*>(c.get())->tag == L"head")
+                head = static_cast<Element*>(c.get());
+        Element* parent = head ? head : top;
+        auto created = std::make_shared<Element>(L"title");
+        created->parent = parent;
+        parent->children.insert(parent->children.begin(), created);
+        t = created.get();
+    }
+    t->children.clear();
+    if (!v.empty()) t->children.push_back(std::make_shared<TextNode>(v));
+    return JS_UNDEFINED;
+}
+
 // ---------------------------------------------------------------------
 
 static const JSCFunctionListEntry js_node_proto_funcs[] = {
@@ -706,6 +784,7 @@ static const JSCFunctionListEntry js_node_proto_funcs[] = {
     JS_CGETSET_DEF("tagName", js_get_tagName, nullptr),
     JS_CGETSET_MAGIC_DEF("id", js_get_attr_magic, js_set_attr_magic, 0),
     JS_CGETSET_MAGIC_DEF("className", js_get_attr_magic, js_set_attr_magic, 1),
+    JS_CGETSET_DEF("title", js_get_title, js_set_title),
     JS_CFUNC_DEF("getAttribute", 1, js_getAttribute),
     JS_CFUNC_DEF("setAttribute", 2, js_setAttribute),
     JS_CFUNC_DEF("hasAttribute", 1, js_hasAttribute),
@@ -733,6 +812,7 @@ void installDOMBindings(JSContext* ctx, Element* documentRoot, DOMBindingState* 
     JS_SetContextOpaque(ctx, state);
     state->listeners->ctx = ctx; // so ~ListenerStorage can free stored callbacks
     state->timers->ctx = ctx;    // so ~TimerStorage can free stored callbacks
+    state->documentEl = documentRoot;
 
     JSRuntime* rt = JS_GetRuntime(ctx);
     JS_NewClassID(rt, &js_node_class_id);

@@ -590,6 +590,10 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     drawOpenSelect(renderer); // on top of the page, same treatment main.cpp gives AddressBar
 }
 
+std::wstring Engine::title() const {
+    return document && document->root ? documentTitle(document->root.get()) : L"";
+}
+
 // A :hover restyle is a full relayout (there's no restyle-only path), so
 // on a page whose layout already takes longer than this, hover changes are
 // ignored rather than stalling the window on every mouse move.
