@@ -34,6 +34,7 @@ struct App {
     int pendingHistory = 0;  // -1 = go back, +1 = go forward (also handled in the main loop)
     PageHistory history;
     PageLoader pageLoader; // fetches navigate()'s target in the background; see applyFinishedNavigation
+    std::wstring shownTitle; // what the window title bar currently says - see updateWindowTitle
 };
 
 static std::string toUtf8(const std::wstring& w) {
@@ -63,6 +64,22 @@ static std::wstring escapeHtml(const std::wstring& in) {
     return out;
 }
 
+// Sets the window title from the page's <title> ("Title - WTEngine"),
+// falling back to its URL when it has none. Called every frame, so a
+// script's document.title = ... shows up too; only touches the window
+// when the text actually changes.
+static void updateWindowTitle(App& app) {
+    std::wstring title = app.engine->title();
+    std::wstring full;
+    if (title == L"WTEngine") full = title; // the built-in demo page
+    else if (!title.empty()) full = title + L" - WTEngine";
+    else if (!app.currentUrl.empty()) full = app.currentUrl + L" - WTEngine";
+    else full = L"WTEngine";
+    if (full == app.shownTitle) return;
+    app.shownTitle = full;
+    glfwSetWindowTitle(app.window, toUtf8(full).c_str());
+}
+
 // Displays a history entry: loads its page, restores its scroll position, and
 // updates the window title and address bar.
 static void showEntry(App& app, const HistoryEntry& entry) {
@@ -70,8 +87,7 @@ static void showEntry(App& app, const HistoryEntry& entry) {
     app.engine->loadHTML(entry.html, entry.url);
     app.engine->scroll(-1000000000); // to the top...
     app.engine->scroll(entry.scrollY); // ...then to where the user was (clamped)
-    glfwSetWindowTitle(app.window,
-                       toUtf8(entry.url.empty() ? L"WTEngine" : entry.url + L" - WTEngine").c_str());
+    updateWindowTitle(app);
     app.bar.setText(entry.url);
 }
 
@@ -297,7 +313,7 @@ int wmain(int argc, wchar_t** argv) {
 
     if (!glfwInit()) { timeEndPeriod(1); return -1; }
 
-    GLFWwindow* window = glfwCreateWindow(900, 600, "ToyEngine OpenGL", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(900, 600, "WTEngine", nullptr, nullptr);
     if (!window) { glfwTerminate(); timeEndPeriod(1); return -1; }
 
     glfwMakeContextCurrent(window);
@@ -366,6 +382,7 @@ int wmain(int argc, wchar_t** argv) {
         engine.onResize(width, height);
         renderer.beginFrame(width, height, 0);
         engine.render(renderer, glfwGetTime());
+        updateWindowTitle(app);
         app.bar.setNavEnabled(app.history.canGoBack(), app.history.canGoForward());
         app.bar.draw(renderer, width, glfwGetTime()); // after the page so it covers overscroll
 

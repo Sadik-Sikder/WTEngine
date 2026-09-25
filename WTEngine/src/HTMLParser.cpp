@@ -143,10 +143,16 @@ std::shared_ptr<Element> HTMLParser::parseElement() {
         }
         // <style> and <script> content is kept (as plain text, no entity
         // decoding - decoding would corrupt JS source, e.g. turning "&&"
-        // into "&") so it can be parsed/run later; title/textarea are
-        // dropped, since nothing reads an Element's raw text today.
+        // into "&") so it can be parsed/run later. <title> is kept too,
+        // entity-decoded like normal text ("Tom &amp; Jerry"), for the
+        // window title and document.title. <textarea> content is dropped,
+        // since the engine doesn't render textareas yet.
         if ((name == L"style" || name == L"script") && p != std::wstring::npos && p > start) {
             elem->children.push_back(std::make_shared<TextNode>(s.substr(start, p - start)));
+        }
+        if (name == L"title") {
+            size_t end = (p == std::wstring::npos) ? s.size() : p;
+            if (end > start) elem->children.push_back(std::make_shared<TextNode>(decodeEntities(s.substr(start, end - start))));
         }
         if (p == std::wstring::npos) { pos = s.size(); return elem; }
         size_t gt = s.find(L'>', p);
