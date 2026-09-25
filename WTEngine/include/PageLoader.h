@@ -6,6 +6,14 @@
 #include <chrono>
 #include "Fetcher.h"
 
+// How a finished navigation updates the history (see main.cpp's
+// applyFinishedNavigation and PageHistory):
+enum class NavigationKind {
+    Visit,   // a new Back-button stop (links, the address bar, forms)
+    Replace, // overwrite the current stop - JS location.replace()/.reload()
+    Reload,  // re-fetch the current stop, keeping Back *and* Forward (Reload button / F5)
+};
+
 // Fetches the top-level page (address bar, link clicks, form submits, JS
 // location changes - i.e. what main.cpp's navigate() starts) without
 // blocking the UI thread, so a slow or unreachable server doesn't freeze
@@ -19,9 +27,9 @@ public:
     // Abandons whatever was previously in flight: it's skipped if it
     // hadn't been sent yet, and otherwise its result is simply never read
     // - the same "a new load wins" behavior a real browser has for
-    // navigating away mid-load. `replace` is carried through unchanged to
+    // navigating away mid-load. `kind` is carried through unchanged to
     // poll()'s result.
-    void start(const std::wstring& url, const std::string* postBody, bool replace);
+    void start(const std::wstring& url, const std::string* postBody, NavigationKind kind);
 
     // Abandons whatever's in flight without starting a new one - for a
     // navigation that bypasses this loader entirely (Back/Forward, which
@@ -39,7 +47,7 @@ public:
     // is simply never read once current_ is dropped here. Returns false
     // while nothing is in flight, or while still within kTimeout with no
     // result yet.
-    bool poll(FetchResult& outResult, std::wstring& outUrl, bool& outReplace);
+    bool poll(FetchResult& outResult, std::wstring& outUrl, NavigationKind& outKind);
 
 private:
     static constexpr std::chrono::seconds kTimeout{ 8 };
@@ -51,7 +59,7 @@ private:
         bool done = false;
         FetchResult result;
         std::wstring url;
-        bool replace = false;
+        NavigationKind kind = NavigationKind::Visit;
     };
     std::shared_ptr<Pending> current_;
     std::chrono::steady_clock::time_point startedAt_;

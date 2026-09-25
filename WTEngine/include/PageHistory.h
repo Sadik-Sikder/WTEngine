@@ -43,6 +43,15 @@ public:
         forward_.clear(); // same as visit(): a new page invalidates the "future"
     }
 
+    // Swaps in a freshly re-fetched copy of the current page (the Reload
+    // button / F5). Unlike replaceCurrent(), both Back *and* Forward are
+    // kept: reloading is re-showing the same history stop, not moving on
+    // from it.
+    void reloadCurrent(HistoryEntry entry) {
+        current_ = std::move(entry);
+        hasCurrent_ = true;
+    }
+
     bool canGoBack() const { return !back_.empty(); }
     bool canGoForward() const { return !forward_.empty(); }
 

@@ -32,6 +32,7 @@ struct App {
     std::wstring currentUrl;
     std::wstring pendingUrl; // set by input callbacks, handled in the main loop
     int pendingHistory = 0;  // -1 = go back, +1 = go forward (also handled in the main loop)
+    bool pendingReload = false; // Reload button / F5 / Ctrl+R (also handled in the main loop)
     PageHistory history;
     PageLoader pageLoader; // fetches navigate()'s target in the background; see applyFinishedNavigation
     std::wstring shownTitle; // what the window title bar currently says - see updateWindowTitle
@@ -108,14 +109,43 @@ static void replacePage(App& app, const std::wstring& url, const std::wstring& h
     showEntry(app, *app.history.current());
 }
 
+// Shows a re-fetched copy of the current page (see reload()), keeping both
+// Back and Forward, and the scroll position of what's on screen right now
+// - the user may have scrolled while it loaded. (Restored once the new
+// page is laid out; content still loading below, like images, can make
+// the page shorter at that moment, which pulls the position up.)
+static void reloadPage(App& app, const std::wstring& url, const std::wstring& html) {
+    app.history.reloadCurrent(HistoryEntry{ url, html, app.engine->getScrollY() });
+    showEntry(app, *app.history.current());
+}
+
 // Starts fetching `url` in the background (as a POST if `postBody` is
 // given) - see PageLoader. Superseding whatever was previously in flight
 // (a second navigate() call, or goHistory()'s Back/Forward) is fine and
 // expected; nothing shows until applyFinishedNavigation picks up a result.
-// `replace` is carried through to it unchanged.
+// `kind` says how the result updates the history.
 static void navigate(App& app, const std::wstring& url, const std::string* postBody = nullptr,
-                     bool replace = false) {
-    app.pageLoader.start(url, postBody, replace);
+                     NavigationKind kind = NavigationKind::Visit) {
+    app.pageLoader.start(url, postBody, kind);
+}
+
+// Re-fetches the page being shown (Reload button, F5, Ctrl+R) - from the
+// network or disk, not the HTML cached in history the way Back/Forward
+// redisplay it, so edits to a local file show up too. Always a GET: a page
+// that came from a form POST is reloaded by URL rather than re-submitting
+// the form (a browser would ask first; re-sending could e.g. repeat an order).
+static void reload(App& app) {
+    const HistoryEntry* current = app.history.current();
+    if (!current) return;
+    if (current->url.empty()) {
+        // The built-in start page has nothing to fetch; showing it again
+        // still re-runs its scripts, like a reload.
+        app.pageLoader.cancel();
+        app.history.saveScroll(app.engine->getScrollY());
+        showEntry(app, *app.history.current());
+        return;
+    }
+    navigate(app, current->url, nullptr, NavigationKind::Reload);
 }
 
 // Called once per frame: shows a navigate()-started fetch's result the
@@ -125,10 +155,12 @@ static void navigate(App& app, const std::wstring& url, const std::string* postB
 static void applyFinishedNavigation(App& app) {
     FetchResult res;
     std::wstring url;
-    bool replace = false;
-    if (!app.pageLoader.poll(res, url, replace)) return;
+    NavigationKind kind = NavigationKind::Visit;
+    if (!app.pageLoader.poll(res, url, kind)) return;
 
-    auto show = replace ? replacePage : visitPage;
+    auto show = kind == NavigationKind::Reload ? reloadPage
+              : kind == NavigationKind::Replace ? replacePage
+              : visitPage;
     if (res.ok) {
         show(app, res.finalUrl.empty() ? url : res.finalUrl, res.html);
     }
@@ -185,11 +217,13 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
     int x, y;
     cursorInFramebuffer(window, x, y);
 
-    // Click on the address bar: Back / Forward buttons, or focus the field
+    // Click on the address bar: Back / Forward / Reload buttons, or focus the field
     if (y < AddressBar::kHeight) {
-        if (int nav = app->bar.navButtonAt(x, y)) {
-            app->pendingHistory = nav;
-            return;
+        switch (app->bar.navButtonAt(x, y)) {
+        case AddressBar::NavButton::Back:    app->pendingHistory = -1; return;
+        case AddressBar::NavButton::Forward: app->pendingHistory = 1; return;
+        case AddressBar::NavButton::Reload:  app->pendingReload = true; return;
+        case AddressBar::NavButton::None:    break;
         }
         app->engine->blurInput();
         app->bar.onClick(x, *app->renderer, glfwGetTime());
@@ -234,6 +268,12 @@ static void onKey(GLFWwindow* window, int key, int, int action, int mods) {
     // Alt+Left / Alt+Right: back / forward (works even while typing in a field)
     if ((mods & GLFW_MOD_ALT) && (key == GLFW_KEY_LEFT || key == GLFW_KEY_RIGHT)) {
         app->pendingHistory = key == GLFW_KEY_LEFT ? -1 : 1;
+        return;
+    }
+
+    // F5 / Ctrl+R: reload (also works while typing in a field, as in browsers)
+    if (key == GLFW_KEY_F5 || (ctrl && key == GLFW_KEY_R)) {
+        if (action == GLFW_PRESS) app->pendingReload = true; // not on key-repeat: holding F5 shouldn't reload 30 times a second
         return;
     }
 
@@ -357,6 +397,11 @@ int wmain(int argc, wchar_t** argv) {
             goHistory(app, direction);
         }
 
+        if (app.pendingReload) {
+            app.pendingReload = false;
+            reload(app);
+        }
+
         if (!app.pendingUrl.empty()) {
             std::wstring url = std::move(app.pendingUrl);
             app.pendingUrl.clear();
@@ -368,7 +413,8 @@ int wmain(int argc, wchar_t** argv) {
 
         std::wstring navUrl;
         bool navReplace = false;
-        if (engine.takeNavigation(navUrl, navReplace)) navigate(app, navUrl, nullptr, navReplace);
+        if (engine.takeNavigation(navUrl, navReplace))
+            navigate(app, navUrl, nullptr, navReplace ? NavigationKind::Replace : NavigationKind::Visit);
 
         applyFinishedNavigation(app); // shows a navigate()-started fetch's result once it's ready
 
@@ -383,7 +429,7 @@ int wmain(int argc, wchar_t** argv) {
         renderer.beginFrame(width, height, 0);
         engine.render(renderer, glfwGetTime());
         updateWindowTitle(app);
-        app.bar.setNavEnabled(app.history.canGoBack(), app.history.canGoForward());
+        app.bar.setNavEnabled(app.history.canGoBack(), app.history.canGoForward(), app.history.current() != nullptr);
         app.bar.draw(renderer, width, glfwGetTime()); // after the page so it covers overscroll
 
         // I-beam over the address bar and text fields, hand over links and
@@ -392,7 +438,7 @@ int wmain(int argc, wchar_t** argv) {
         cursorInFramebuffer(window, cx, cy);
         GLFWcursor* wanted = nullptr;
         if (cy < AddressBar::kHeight) {
-            wanted = app.bar.navButtonAt(cx, cy) ? handCursor : ibeamCursor;
+            wanted = app.bar.navButtonAt(cx, cy) != AddressBar::NavButton::None ? handCursor : ibeamCursor;
         }
         else {
             switch (engine.cursorAt(cx, cy, renderer)) {
