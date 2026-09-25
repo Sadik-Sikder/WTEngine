@@ -149,6 +149,7 @@ Page fetching is **backgrounded**: `navigate(url, postBody?)` calls `app.pageLoa
 - `showEntry` calls `engine.loadHTML(html, url)`, restores the scroll position, and updates the window title and address bar.
 - **Window title** (`updateWindowTitle`, also called every frame right after `engine.render`): `"<title> - WTEngine"` from `Engine::title()` (the first `<title>` outside any `<svg>`, whitespace-collapsed - `documentTitle` in `JSBinding.cpp`), falling back to `"<url> - WTEngine"` for a page without one. Because it's re-read every frame, a script's `document.title = ...` shows up too; `App::shownTitle` keeps it from calling `glfwSetWindowTitle` unless the text changed.
 - `goHistory(±1)` re-displays a stored entry **from its saved HTML** — no network request, and a POSTed result is not re-sent.
+- **Reload** (`reload()` - the ↻ button, F5, Ctrl+R) is the opposite: it re-fetches the current URL (`NavigationKind::Reload`), so it picks up changes, including edits to a local file. When it arrives, `PageHistory::reloadCurrent` swaps it into the current entry keeping both Back *and* Forward (unlike `replaceCurrent`, used by JS `location.replace()`/`.reload()`, which drops Forward), and the scroll position is kept - whatever it is when the new page arrives, since the old page stays up while it loads. Content still loading below (images) can make the new page shorter at that moment, pulling the position up. Always a GET: a page that came from a form POST is reloaded by URL rather than re-submitting the form, which browsers only do after asking. The built-in start page (no URL) is just re-shown, which still re-runs its scripts.
 
 ### Progressive resource loading (`ResourceLoader`)
 A page's own `<script src>` and `<link rel="stylesheet">` fetches are **also backgrounded**, and concurrently rather than serially - fixing the bypass `PageLoader` couldn't cover (above). `Engine::parseAndBuild` and `beginScripts` don't fetch anything themselves: they collect every external stylesheet/script URL in document order and hand the list to a `ResourceLoader` (one per resource kind: `styleLoader_`, `scriptLoader_`).
@@ -166,10 +167,11 @@ The page paints once immediately after `parseAndBuild`/`beginScripts` return - w
 
 | Input | Behaviour |
 |---|---|
-| Left click in the top 40 px | Back/Forward buttons, or focus/place the caret in the address bar |
+| Left click in the top 40 px | Back/Forward/Reload buttons (`AddressBar::navButtonAt`), or focus/place the caret in the address bar |
 | Left click on the page | 1. `Engine::onClick` (form controls): if it hit a control it runs that control's JS click listeners, then performs the control's action unless a listener called `preventDefault()`; the click is then finished. 2. Otherwise find a link with `linkAt`. 3. `Engine::dispatchClick` runs JS click listeners. 4. If a listener did **not** call `preventDefault()` and there was a link, navigate |
 | Mouse 4/5, Alt+←/→ | Back / forward |
 | Ctrl+L, F6 | Focus the address bar |
+| F5, Ctrl+R | Reload (works while typing in a field too; ignored on key-repeat) |
 | Keys / chars | Go to the address bar if focused, otherwise to the focused page input |
 | Tab / Shift+Tab | Next/previous text field |
 | Ctrl+V / C / A | Paste / copy / select all (clipboard via GLFW). Copy is blocked for password fields |
@@ -549,7 +551,7 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 ## 15. Shared helpers
 
 - **`TextEditor`** — text + caret + selection for one line. Used by both the address bar and page inputs, and knows nothing about drawing. Handles typing (with UTF-16 surrogate pairs), paste, Backspace/Delete/←/→/Home/End, click-to-caret, double-click word select, and masking. There is no Shift-selection with the keyboard.
-- **`AddressBar`** — wraps a `TextEditor`; adds focus state, Back/Forward buttons, drawing, and URL normalisation.
+- **`AddressBar`** — wraps a `TextEditor`; adds focus state, Back/Forward/Reload buttons, drawing, and URL normalisation.
 - **`PageHistory`** — two stacks around `current_`. `visit()` clears forward history; back stack is capped at 50 entries. Stores each page's HTML and scroll offset.
 
 ## 16. Life of a click on a link
