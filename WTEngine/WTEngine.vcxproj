@@ -139,7 +139,10 @@
     <ClCompile Include="src\Engine.cpp" />
     <ClCompile Include="src\EngineForms.cpp" />
     <ClCompile Include="src\TextEditor.cpp" />
-    <ClCompile Include="src\Fetcher.cpp" />
+    <ClCompile Include="src\Fetcher.cpp">
+      <!-- Asio coroutine templates (fetchHttpAsync) exceed the default section limit; mirrored in CMakeLists.txt -->
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="src\HTMLParser.cpp" />
     <ClCompile Include="src\JSBinding.cpp" />
     <ClCompile Include="src\JSEngine.cpp" />

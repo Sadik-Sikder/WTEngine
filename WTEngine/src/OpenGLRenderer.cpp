@@ -72,22 +72,23 @@ OpenGLRenderer::OpenGLRenderer() {
     // initialized COM on this thread with a compatible concurrency model.
     comInitialized = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
 
-    for (int i = 0; i < kImageLoaderThreads; i++)
-        loaderThreads.emplace_back([this] { imageLoaderThreadMain(); });
+    for (int i = 0; i < kImageDecodeThreads; i++)
+        decodeThreads.emplace_back([this] { decodeThreadMain(); });
 }
 
 OpenGLRenderer::~OpenGLRenderer() {
-    // Wake the pool so idle workers can see shuttingDown and exit; one still
-    // fetching finishes that request first, then sees it on its next loop
-    // iteration. Join before tearing anything down - the threads capture
-    // `this` by pointer, so none may still be running once member
-    // destruction starts below.
+    // Wake the pool so idle decoders can see shuttingDown and exit; one
+    // still decoding finishes that image first. Join before tearing
+    // anything down - the threads capture `this` by pointer, so none may
+    // still be running once member destruction starts below. Downloads
+    // still in flight on the network thread only hold a weak_ptr to the
+    // queue, so they can't reach this renderer once it's gone.
     {
-        std::lock_guard<std::mutex> lock(queueMutex);
-        shuttingDown = true;
+        std::lock_guard<std::mutex> lock(decodeQueue->mutex);
+        decodeQueue->shuttingDown = true;
     }
-    queueCv.notify_all();
-    for (auto& t : loaderThreads) if (t.joinable()) t.join();
+    decodeQueue->cv.notify_all();
+    for (auto& t : decodeThreads) if (t.joinable()) t.join();
 
     for (auto& [size, font] : measureFonts) DeleteObject(font);
     if (measureDC) DeleteDC(measureDC);
@@ -238,40 +239,47 @@ const ImageTexture& OpenGLRenderer::getOrCreateImageTexture(const std::wstring& 
     return result.first->second;
 }
 
-// Queues `url` for one of the pool's worker threads to pick up - never
-// spawns a new thread, so an image-heavy page still only ever uses
-// kImageLoaderThreads OS threads.
+// Starts downloading `url` on the network thread; when the bytes arrive,
+// they're queued for a decode thread. Never spawns a thread, so an
+// image-heavy page uses the one network thread plus kImageDecodeThreads.
 void OpenGLRenderer::startLoadingImage(const std::wstring& url) {
-    {
-        std::lock_guard<std::mutex> lock(queueMutex);
-        loadQueue.push_back(url);
-    }
-    queueCv.notify_one();
+    std::weak_ptr<DecodeQueue> weak = decodeQueue;
+    FetchOptions options;
+    options.priority = FetchPriority::Image; // behind the page's own scripts/stylesheets on a busy host
+    fetchBytesAsync(url, std::move(options), [weak, url](bool ok, std::vector<unsigned char> bytes) {
+        std::shared_ptr<DecodeQueue> queue = weak.lock();
+        if (!queue) return; // the renderer is gone
+        {
+            std::lock_guard<std::mutex> lock(queue->mutex);
+            if (queue->shuttingDown) return;
+            queue->items.push_back({ url, ok, std::move(bytes) });
+        }
+        queue->cv.notify_one();
+    });
 }
 
-// One worker's whole lifetime: pull a URL off the queue, fetch + decode it
-// (no GL calls, so no need for the GL context), post the result, repeat
-// until shutdown. WIC (used by decodeImage) needs COM initialized per
-// thread, not just once process-wide, hence the Co(Un)InitializeEx - once
-// per worker thread here, not once per image like a thread-per-image
-// version would need.
-void OpenGLRenderer::imageLoaderThreadMain() {
+// One decode thread's whole lifetime: take downloaded bytes off the queue,
+// decode them (no GL calls, so no need for the GL context), post the
+// result, repeat until shutdown. A failed download still posts a result
+// (ok = false), so the image leaves the Loading state. WIC (used by
+// decodeImage) needs COM initialized per thread, hence the
+// Co(Un)InitializeEx - once per decode thread, not once per image.
+void OpenGLRenderer::decodeThreadMain() {
     bool comInit = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
 
     for (;;) {
-        std::wstring url;
+        DecodeItem item;
         {
-            std::unique_lock<std::mutex> lock(queueMutex);
-            queueCv.wait(lock, [this] { return shuttingDown || !loadQueue.empty(); });
-            if (loadQueue.empty()) break; // shuttingDown, and nothing left to drain
-            url = std::move(loadQueue.front());
-            loadQueue.pop_front();
+            std::unique_lock<std::mutex> lock(decodeQueue->mutex);
+            decodeQueue->cv.wait(lock, [this] { return decodeQueue->shuttingDown || !decodeQueue->items.empty(); });
+            if (decodeQueue->shuttingDown) break; // pending decodes are pointless once the renderer is closing
+            item = std::move(decodeQueue->items.front());
+            decodeQueue->items.pop_front();
         }
 
         PendingImageUpload upload;
-        upload.url = url;
-        std::vector<unsigned char> bytes;
-        upload.ok = fetchBytes(url, bytes) && decodeImage(bytes, upload.rgba, upload.width, upload.height);
+        upload.url = item.url;
+        upload.ok = item.ok && decodeImage(item.bytes, upload.rgba, upload.width, upload.height);
 
         std::lock_guard<std::mutex> lock(uploadMutex);
         pendingUploads.push_back(std::move(upload));
