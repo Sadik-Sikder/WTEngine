@@ -13,24 +13,140 @@
 #include <cwctype>
 #include <string>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 
-// Minimal color struct for OpenGL
+// ------------------ Colors ------------------
 
-Color parseColor(const std::wstring& str) {
-    bool valid = str.size() == 7 && str[0] == L'#';
-    for (size_t i = 1; valid && i < str.size(); i++) valid = iswxdigit(str[i]) != 0;
+// The CSS named colors (CSS Color Module Level 4), as 0xRRGGBB.
+static const std::unordered_map<std::wstring, unsigned>& namedColors() {
+    static const std::unordered_map<std::wstring, unsigned> kNames = {
+        {L"aliceblue",0xf0f8ff},{L"antiquewhite",0xfaebd7},{L"aqua",0x00ffff},{L"aquamarine",0x7fffd4},
+        {L"azure",0xf0ffff},{L"beige",0xf5f5dc},{L"bisque",0xffe4c4},{L"black",0x000000},
+        {L"blanchedalmond",0xffebcd},{L"blue",0x0000ff},{L"blueviolet",0x8a2be2},{L"brown",0xa52a2a},
+        {L"burlywood",0xdeb887},{L"cadetblue",0x5f9ea0},{L"chartreuse",0x7fff00},{L"chocolate",0xd2691e},
+        {L"coral",0xff7f50},{L"cornflowerblue",0x6495ed},{L"cornsilk",0xfff8dc},{L"crimson",0xdc143c},
+        {L"cyan",0x00ffff},{L"darkblue",0x00008b},{L"darkcyan",0x008b8b},{L"darkgoldenrod",0xb8860b},
+        {L"darkgray",0xa9a9a9},{L"darkgreen",0x006400},{L"darkgrey",0xa9a9a9},{L"darkkhaki",0xbdb76b},
+        {L"darkmagenta",0x8b008b},{L"darkolivegreen",0x556b2f},{L"darkorange",0xff8c00},{L"darkorchid",0x9932cc},
+        {L"darkred",0x8b0000},{L"darksalmon",0xe9967a},{L"darkseagreen",0x8fbc8f},{L"darkslateblue",0x483d8b},
+        {L"darkslategray",0x2f4f4f},{L"darkslategrey",0x2f4f4f},{L"darkturquoise",0x00ced1},{L"darkviolet",0x9400d3},
+        {L"deeppink",0xff1493},{L"deepskyblue",0x00bfff},{L"dimgray",0x696969},{L"dimgrey",0x696969},
+        {L"dodgerblue",0x1e90ff},{L"firebrick",0xb22222},{L"floralwhite",0xfffaf0},{L"forestgreen",0x228b22},
+        {L"fuchsia",0xff00ff},{L"gainsboro",0xdcdcdc},{L"ghostwhite",0xf8f8ff},{L"gold",0xffd700},
+        {L"goldenrod",0xdaa520},{L"gray",0x808080},{L"green",0x008000},{L"greenyellow",0xadff2f},
+        {L"grey",0x808080},{L"honeydew",0xf0fff0},{L"hotpink",0xff69b4},{L"indianred",0xcd5c5c},
+        {L"indigo",0x4b0082},{L"ivory",0xfffff0},{L"khaki",0xf0e68c},{L"lavender",0xe6e6fa},
+        {L"lavenderblush",0xfff0f5},{L"lawngreen",0x7cfc00},{L"lemonchiffon",0xfffacd},{L"lightblue",0xadd8e6},
+        {L"lightcoral",0xf08080},{L"lightcyan",0xe0ffff},{L"lightgoldenrodyellow",0xfafad2},{L"lightgray",0xd3d3d3},
+        {L"lightgreen",0x90ee90},{L"lightgrey",0xd3d3d3},{L"lightpink",0xffb6c1},{L"lightsalmon",0xffa07a},
+        {L"lightseagreen",0x20b2aa},{L"lightskyblue",0x87cefa},{L"lightslategray",0x778899},{L"lightslategrey",0x778899},
+        {L"lightsteelblue",0xb0c4de},{L"lightyellow",0xffffe0},{L"lime",0x00ff00},{L"limegreen",0x32cd32},
+        {L"linen",0xfaf0e6},{L"magenta",0xff00ff},{L"maroon",0x800000},{L"mediumaquamarine",0x66cdaa},
+        {L"mediumblue",0x0000cd},{L"mediumorchid",0xba55d3},{L"mediumpurple",0x9370db},{L"mediumseagreen",0x3cb371},
+        {L"mediumslateblue",0x7b68ee},{L"mediumspringgreen",0x00fa9a},{L"mediumturquoise",0x48d1cc},{L"mediumvioletred",0xc71585},
+        {L"midnightblue",0x191970},{L"mintcream",0xf5fffa},{L"mistyrose",0xffe4e1},{L"moccasin",0xffe4b5},
+        {L"navajowhite",0xffdead},{L"navy",0x000080},{L"oldlace",0xfdf5e6},{L"olive",0x808000},
+        {L"olivedrab",0x6b8e23},{L"orange",0xffa500},{L"orangered",0xff4500},{L"orchid",0xda70d6},
+        {L"palegoldenrod",0xeee8aa},{L"palegreen",0x98fb98},{L"paleturquoise",0xafeeee},{L"palevioletred",0xdb7093},
+        {L"papayawhip",0xffefd5},{L"peachpuff",0xffdab9},{L"peru",0xcd853f},{L"pink",0xffc0cb},
+        {L"plum",0xdda0dd},{L"powderblue",0xb0e0e6},{L"purple",0x800080},{L"rebeccapurple",0x663399},
+        {L"red",0xff0000},{L"rosybrown",0xbc8f8f},{L"royalblue",0x4169e1},{L"saddlebrown",0x8b4513},
+        {L"salmon",0xfa8072},{L"sandybrown",0xf4a460},{L"seagreen",0x2e8b57},{L"seashell",0xfff5ee},
+        {L"sienna",0xa0522d},{L"silver",0xc0c0c0},{L"skyblue",0x87ceeb},{L"slateblue",0x6a5acd},
+        {L"slategray",0x708090},{L"slategrey",0x708090},{L"snow",0xfffafa},{L"springgreen",0x00ff7f},
+        {L"steelblue",0x4682b4},{L"tan",0xd2b48c},{L"teal",0x008080},{L"thistle",0xd8bfd8},
+        {L"tomato",0xff6347},{L"turquoise",0x40e0d0},{L"violet",0xee82ee},{L"wheat",0xf5deb3},
+        {L"white",0xffffff},{L"whitesmoke",0xf5f5f5},{L"yellow",0xffff00},{L"yellowgreen",0x9acd32},
+    };
+    return kNames;
+}
 
-    if (!valid) {
-        // default light gray (also for "#gggggg", which std::stoi below would throw on)
-        return { 0.94f, 0.94f, 0.94f, 1.0f };
+static int hexDigit(wchar_t c) {
+    if (c >= L'0' && c <= L'9') return c - L'0';
+    c = (wchar_t)towlower(c);
+    if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+    return -1;
+}
+
+// One rgb()/rgba() argument: a number (0-255, or 0-1 for alpha) or a
+// percentage. False if `t` isn't entirely a number/percentage.
+static bool parseColorComponent(const std::wstring& t, bool isAlpha, float& out) {
+    if (t.empty()) return false;
+    size_t used = 0;
+    float v;
+    try { v = std::stof(t, &used); } catch (...) { return false; }
+    bool percent = used < t.size() && t[used] == L'%';
+    if (used + (percent ? 1 : 0) != t.size()) return false;
+    if (percent) v /= 100.0f;
+    else if (!isAlpha) v /= 255.0f;
+    out = std::clamp(v, 0.0f, 1.0f);
+    return true;
+}
+
+bool tryParseColor(const std::wstring& raw, Color& out) {
+    // Trim, lowercase, and drop a trailing "!important" (the declaration
+    // parser leaves it on the value).
+    std::wstring s;
+    for (wchar_t c : raw) s += (wchar_t)towlower(c);
+    size_t bang = s.find(L'!');
+    if (bang != std::wstring::npos) s.erase(bang);
+    while (!s.empty() && iswspace(s.back())) s.pop_back();
+    size_t lead = 0;
+    while (lead < s.size() && iswspace(s[lead])) lead++;
+    s.erase(0, lead);
+    if (s.empty()) return false;
+
+    if (s[0] == L'#') {
+        std::vector<int> d;
+        for (size_t i = 1; i < s.size(); i++) {
+            int h = hexDigit(s[i]);
+            if (h < 0) return false;
+            d.push_back(h);
+        }
+        float c[4] = { 1, 1, 1, 1 };
+        if (d.size() == 3 || d.size() == 4) {       // #rgb / #rgba: each digit doubled
+            for (size_t i = 0; i < d.size(); i++) c[i] = (d[i] * 17) / 255.0f;
+        } else if (d.size() == 6 || d.size() == 8) { // #rrggbb / #rrggbbaa
+            for (size_t i = 0; i < d.size() / 2; i++) c[i] = (d[2 * i] * 16 + d[2 * i + 1]) / 255.0f;
+        } else {
+            return false;
+        }
+        out = { c[0], c[1], c[2], c[3] };
+        return true;
     }
 
-    int r = std::stoi(std::string(str.begin() + 1, str.begin() + 3), nullptr, 16);
-    int g = std::stoi(std::string(str.begin() + 3, str.begin() + 5), nullptr, 16);
-    int b = std::stoi(std::string(str.begin() + 5, str.begin() + 7), nullptr, 16);
+    if (s.rfind(L"rgb(", 0) == 0 || s.rfind(L"rgba(", 0) == 0) {
+        size_t open = s.find(L'('), close = s.rfind(L')');
+        if (close == std::wstring::npos || close < open) return false;
+        // Both the legacy "r, g, b[, a]" and the modern "r g b [/ a]"
+        // syntaxes: treat commas and '/' as whitespace, then split.
+        std::wstring args = s.substr(open + 1, close - open - 1);
+        for (auto& c : args) if (c == L',' || c == L'/') c = L' ';
+        std::wistringstream ss(args);
+        std::vector<std::wstring> parts;
+        for (std::wstring t; ss >> t;) parts.push_back(t);
+        if (parts.size() != 3 && parts.size() != 4) return false;
+        float c[4] = { 0, 0, 0, 1 };
+        for (size_t i = 0; i < parts.size(); i++)
+            if (!parseColorComponent(parts[i], i == 3, c[i])) return false;
+        out = { c[0], c[1], c[2], c[3] };
+        return true;
+    }
 
-    return { r / 255.0f, g / 255.0f, b / 255.0f, 1.0f };
+    if (s == L"transparent") { out = { 0, 0, 0, 0 }; return true; }
+
+    auto it = namedColors().find(s);
+    if (it == namedColors().end()) return false;
+    unsigned v = it->second;
+    out = { ((v >> 16) & 0xff) / 255.0f, ((v >> 8) & 0xff) / 255.0f, (v & 0xff) / 255.0f, 1.0f };
+    return true;
+}
+
+Color parseColor(const std::wstring& str) {
+    Color c;
+    if (tryParseColor(str, c)) return c;
+    return { 0.94f, 0.94f, 0.94f, 1.0f }; // default light gray
 }
 
 // ------------------ Engine Implementation ------------------
@@ -47,8 +163,8 @@ static std::wstring resolveImageSrc(const std::wstring& baseUrl, const std::wstr
 Engine::Engine(int w, int h)
     : width(w), height(h) {
     layoutRoot.viewportWidth = width;
-    layoutRoot.measureText = [this](const std::wstring& text, int fontSize) {
-        return measurer ? measurer->measureText(text, (float)fontSize)
+    layoutRoot.measureText = [this](const std::wstring& text, int fontSize, bool bold) {
+        return measurer ? measurer->measureText(text, (float)fontSize, bold)
                         : text.size() * fontSize * 0.55f;
     };
     layoutRoot.loadImage = [this](const std::wstring& src, int& w, int& h) {
@@ -450,14 +566,16 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
             continue;
         }
 
-        // Draw text
+        // Draw text. An empty color means black; links arrive already
+        // colored blue by layout (computeStyle), unless CSS overrode it.
         if (!b.text.empty()) {
             renderer.drawText(
                 b.x + 4,
                 screenY + 4,
                 b.text,
                 b.fontSize > 0 ? b.fontSize : 14,
-                b.href.empty() ? Color{ 0, 0, 0, 1 } : Color{ 0.0f, 0.2f, 0.8f, 1.0f } // links are blue
+                b.color.empty() ? Color{ 0, 0, 0, 1 } : parseColor(b.color),
+                b.bold
             );
         }
     }
@@ -477,7 +595,7 @@ std::wstring Engine::linkAt(int x, int y, Renderer& renderer) const {
         // Text is drawn at (x + 4, y + 4) and is only as wide as its glyphs,
         // so hit-test that area rather than the whole row.
         float fontSize = b.fontSize > 0 ? b.fontSize : 14;
-        int textW = static_cast<int>(renderer.measureText(b.text, fontSize));
+        int textW = static_cast<int>(renderer.measureText(b.text, fontSize, b.bold));
         int left = b.x + 4, top = b.y + 4;
         if (x >= left && x < left + textW && docY >= top && docY < top + b.height)
             return b.href;

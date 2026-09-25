@@ -19,6 +19,11 @@ struct LayoutBox {
     std::wstring href; // link target if this text is inside an <a href>
     std::wstring imageSrc; // <img>'s raw (unresolved) src attribute; empty for non-image boxes
     int fontSize = 14;
+    // Text colour (any CSS color string - see parseColor; empty = the default
+    // black) and weight, both inherited like font-size. Links get their blue
+    // from computeStyle as a default, so an author rule can override it.
+    std::wstring color;
+    bool bold = false;
 
     // A border, drawn as a hollow frame (see Engine::render) so an
     // unset `background` still shows whatever's behind the box through
@@ -53,7 +58,7 @@ struct LayoutRoot {
 
     // Returns the pixel width of `text` at `fontSize`. Used to wrap text; a
     // rough per-character estimate is used when unset.
-    std::function<float(const std::wstring&, int)> measureText;
+    std::function<float(const std::wstring&, int, bool bold)> measureText;
 
     // Resolves an <img>'s raw `src`, fetching/decoding (and caching) it if
     // not already cached, and returns its natural pixel size via (outW,
@@ -63,11 +68,20 @@ struct LayoutRoot {
 
     void layout(); // compute boxes from rootNode
 private:
+    // The inherited text properties besides font-size: `color` (a raw CSS
+    // color string, empty = default black) and bold (font-weight). Passed
+    // down the tree alongside inheritedFontSize, exactly the same way.
+    struct TextPaint {
+        std::wstring color;
+        bool bold = false;
+    };
+
     // `inheritedFontSize` is the size to use for `el`'s own direct text, and
     // the default for its children's font-size unless they set their own -
     // i.e. plain CSS inheritance, not reset to a hardcoded size each level.
+    // `inheritedPaint` works the same way for color/font-weight.
     void layoutElement(Element* el, int x, int& y, int containingWidth, int inheritedFontSize,
-                        bool inheritedVisuallyHidden);
+                        bool inheritedVisuallyHidden, const TextPaint& inheritedPaint);
     std::wstring getAttr(Element* el, const std::wstring& key, const std::wstring& def = L"");
     int parseFontSize(const std::wstring& s, int def = 14);
     int resolveFontSize(const std::wstring& s, int baseFontSize, int def);
@@ -80,7 +94,7 @@ private:
     // there's no single obviously-right base to multiply), and fall back
     // to `def` like any other unrecognized unit.
     int resolveLength(const std::wstring& s, int base, int def);
-    float textWidth(const std::wstring& text, int fontSize);
+    float textWidth(const std::wstring& text, int fontSize, bool bold = false);
 
     // One word of flowing inline content (from a text node, or from an
     // inline-level element like <a>/<b> flattened into its container's
@@ -94,12 +108,14 @@ private:
         Element* owner = nullptr;
         bool isBreak = false;
         bool visuallyHidden = false;
+        TextPaint paint;
     };
     // Splits `text` on whitespace, appending one InlineItem per word.
     void appendWords(const std::wstring& text, int fontSize, const std::wstring& href,
-                      Element* owner, std::vector<InlineItem>& out, bool visuallyHidden);
+                      Element* owner, std::vector<InlineItem>& out, bool visuallyHidden,
+                      const TextPaint& paint);
     void collectInline(Element* el, int inheritedFontSize, int containingWidth, std::vector<InlineItem>& out,
-                        bool inheritedVisuallyHidden);
+                        bool inheritedVisuallyHidden, const TextPaint& inheritedPaint);
     void layoutInlineRun(const std::vector<InlineItem>& items, int x, int& y, int containingWidth);
 
     // The subset of an element's cascaded style that layout cares about -
@@ -194,9 +210,13 @@ private:
         float opacity = 1.0f;
         bool visibilityHidden = false;
         bool visuallyHidden = false;
+        // Resolved color/font-weight: inherited unless this element's own
+        // rules (or its tag's default - <a href> is blue, <b>/<strong>/<th>/
+        // headings are bold) set them.
+        TextPaint paint;
     };
     ComputedStyle computeStyle(Element* e, int inheritedFontSize, int containingWidth,
-                                bool inheritedVisuallyHidden);
+                                bool inheritedVisuallyHidden, const TextPaint& inheritedPaint);
     // Splits a shorthand value like "4px 8px" on whitespace and expands it
     // to all four sides per CSS's 1/2/3/4-value shorthand rule (used for
     // both `margin` and `padding`). Missing tokens, or a value that fails
