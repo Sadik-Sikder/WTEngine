@@ -1,10 +1,10 @@
 // PageLoader.cpp
 #include "PageLoader.h"
 
-void PageLoader::start(const std::wstring& url, const std::string* postBody, bool replace) {
+void PageLoader::start(const std::wstring& url, const std::string* postBody, NavigationKind kind) {
     auto pending = std::make_shared<Pending>();
     pending->url = url;
-    pending->replace = replace;
+    pending->kind = kind;
     current_ = pending; // drops (abandons) whatever was previously in flight
     startedAt_ = std::chrono::steady_clock::now();
 
@@ -30,7 +30,7 @@ void PageLoader::cancel() {
     current_.reset();
 }
 
-bool PageLoader::poll(FetchResult& outResult, std::wstring& outUrl, bool& outReplace) {
+bool PageLoader::poll(FetchResult& outResult, std::wstring& outUrl, NavigationKind& outKind) {
     if (!current_) return false;
 
     // A local copy, not just current_ itself: this keeps `Pending` (and
@@ -46,7 +46,7 @@ bool PageLoader::poll(FetchResult& outResult, std::wstring& outUrl, bool& outRep
         done = pending->done;
         if (done) outResult = std::move(pending->result);
     } // lock released before touching current_ below (and before the timeout check,
-      // which doesn't need it - `url`/`replace` are set once in start() and never
+      // which doesn't need it - `url`/`kind` are set once in start() and never
       // touched by the network thread, so they're safe to read unlocked)
 
     if (!done && std::chrono::steady_clock::now() - startedAt_ < kTimeout) return false;
@@ -56,7 +56,7 @@ bool PageLoader::poll(FetchResult& outResult, std::wstring& outUrl, bool& outRep
         outResult.error = L"Timed out";
     }
     outUrl = pending->url;
-    outReplace = pending->replace;
+    outKind = pending->kind;
     current_.reset();
     return true;
 }

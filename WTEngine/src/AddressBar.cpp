@@ -11,11 +11,13 @@ namespace {
     // Arrow glyphs are spelled as numbers so the source file encoding can not garble them.
     const wchar_t kArrowLeft[] = { 0x2190, 0 };
     const wchar_t kArrowRight[] = { 0x2192, 0 };
+    const wchar_t kReloadArrow[] = { 0x21BB, 0 }; // clockwise open circle arrow
 
-    const int kNavSize = 28;    // Back / Forward buttons are kNavSize wide
+    const int kNavSize = 28;    // Back / Forward / Reload buttons are kNavSize wide
     const int kNavBackX = 10;
     const int kNavFwdX = kNavBackX + kNavSize + 4;
-    const int kFieldX = kNavFwdX + kNavSize + 8; // field's left edge (right of the buttons)
+    const int kNavReloadX = kNavFwdX + kNavSize + 4;
+    const int kFieldX = kNavReloadX + kNavSize + 8; // field's left edge (right of the buttons)
     const int kFieldY = 6;
     const int kFieldH = 28;
     const int kBarMargin = 10;  // gap to the window's right edge
@@ -57,11 +59,12 @@ void AddressBar::onClick(int x, Renderer& renderer, double now) {
     else ed_.placeCaretAt(localX, renderer, kFontSize);
 }
 
-int AddressBar::navButtonAt(int x, int y) const {
-    if (y < kFieldY || y >= kFieldY + kFieldH) return 0;
-    if (canBack_ && x >= kNavBackX && x < kNavBackX + kNavSize) return -1;
-    if (canForward_ && x >= kNavFwdX && x < kNavFwdX + kNavSize) return 1;
-    return 0;
+AddressBar::NavButton AddressBar::navButtonAt(int x, int y) const {
+    if (y < kFieldY || y >= kFieldY + kFieldH) return NavButton::None;
+    if (canBack_ && x >= kNavBackX && x < kNavBackX + kNavSize) return NavButton::Back;
+    if (canForward_ && x >= kNavFwdX && x < kNavFwdX + kNavSize) return NavButton::Forward;
+    if (canReload_ && x >= kNavReloadX && x < kNavReloadX + kNavSize) return NavButton::Reload;
+    return NavButton::None;
 }
 
 void AddressBar::draw(Renderer& r, int windowWidth, double t) {
@@ -80,7 +83,7 @@ void AddressBar::draw(Renderer& r, int windowWidth, double t) {
     // Bar background, then the field with a border
     r.drawRect(0, 0, (float)windowWidth, (float)kHeight, kBarBg);
 
-    // Back / Forward buttons: arrows, grayed out when there's nowhere to go
+    // Back / Forward / Reload buttons: arrows, grayed out when there's nowhere to go
     auto navButton = [&](int x, const wchar_t* arrow, bool enabled) {
         r.drawRect((float)x - 1, (float)kFieldY - 1, (float)kNavSize + 2, (float)kFieldH + 2, kBorder);
         r.drawRect((float)x, (float)kFieldY, (float)kNavSize, (float)kFieldH, kField);
@@ -89,6 +92,7 @@ void AddressBar::draw(Renderer& r, int windowWidth, double t) {
     };
     navButton(kNavBackX, kArrowLeft, canBack_);
     navButton(kNavFwdX, kArrowRight, canForward_);
+    navButton(kNavReloadX, kReloadArrow, canReload_);
 
     r.drawRect((float)kFieldX - 1, (float)kFieldY - 1, (float)fieldW + 2, (float)kFieldH + 2,
                focused_ ? kBorderFocus : kBorder);
