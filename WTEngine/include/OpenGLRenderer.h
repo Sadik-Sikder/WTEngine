@@ -7,6 +7,7 @@
 #include <GLFW/glfw3.h>
 #include <string>
 #include <map>
+#include <memory>
 #include <vector>
 #include <deque>
 #include <thread>
@@ -73,25 +74,40 @@ private:
     const TextTexture& getOrCreateTextTexture(const std::wstring& text, float fontSize, bool bold);
 
     // --- Background image loading -------------------------------------
-    // A fixed-size pool of worker threads (not one thread per image, which
-    // would grow unbounded on an image-heavy page) pulls URLs off a shared
-    // queue and does the fetch + decode (network/CPU work, no GL calls).
-    // The main thread uploads finished pixels as a texture in beginFrame(),
-    // since only the thread that owns the GL context may call GL functions.
-    static constexpr int kImageLoaderThreads = 4;
+    // Three stages, each on the thread suited to it:
+    // 1. Download: Fetcher's network thread (fetchBytesAsync, async I/O -
+    //    any number of images in flight, no thread each).
+    // 2. Decode: WIC decoding is CPU work, so it runs on a small fixed pool
+    //    of decode threads fed by `decodeQueue`.
+    // 3. Upload: only the thread that owns the GL context may call GL, so
+    //    the main thread uploads finished pixels as a texture in
+    //    beginFrame() (drainPendingImageUploads).
+    static constexpr int kImageDecodeThreads = 4;
+
+    // Downloaded bytes waiting to be decoded. Shared with the network
+    // thread's callbacks through a weak_ptr, so a download that finishes
+    // after this renderer is gone is simply dropped.
+    struct DecodeItem {
+        std::wstring url;
+        bool ok = false; // false = the download failed; decoding is skipped
+        std::vector<unsigned char> bytes;
+    };
+    struct DecodeQueue {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::deque<DecodeItem> items; // guarded by mutex
+        bool shuttingDown = false;    // guarded by mutex
+    };
 
     std::map<std::wstring, ImageTexture> imageCache;
-    std::vector<std::thread> loaderThreads; // the fixed pool, started once in the constructor
-    std::mutex queueMutex;
-    std::condition_variable queueCv;
-    std::deque<std::wstring> loadQueue;     // guarded by queueMutex
-    bool shuttingDown = false;              // guarded by queueMutex
+    std::shared_ptr<DecodeQueue> decodeQueue = std::make_shared<DecodeQueue>();
+    std::vector<std::thread> decodeThreads; // the fixed pool, started once in the constructor
     std::mutex uploadMutex;
     std::vector<PendingImageUpload> pendingUploads; // guarded by uploadMutex
     int imageGen = 0; // bumped each time an upload completes; lets Engine know to re-layout
 
     const ImageTexture& getOrCreateImageTexture(const std::wstring& url);
     void startLoadingImage(const std::wstring& url);
-    void imageLoaderThreadMain();
+    void decodeThreadMain();
     void drainPendingImageUploads();
 };

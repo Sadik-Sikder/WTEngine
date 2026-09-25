@@ -29,16 +29,21 @@
 #include <cctype>
 #include <cwctype>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include <chrono>
 
 #include <boost/asio.hpp>
+#include <boost/asio/as_tuple.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/ssl/host_name_verification.hpp>
 #include <boost/beast/core.hpp>
@@ -156,57 +161,30 @@ static ssl::context& sharedSslContext() {
 }
 
 // ---------------------------------------------------------------------
-// The raw result of one HTTP round-trip - defined here (ahead of where
-// the rest of this file's comments put "the actual network I/O") because
-// the connection-pooling code just below needs it as a parameter type.
+// The raw result of one HTTP round-trip, before it's turned into the
+// public FetchResult/HttpResponse/bytes a caller asked for.
 
 struct RawResponse {
     bool ok = false;
     int status = 0;
     std::string body;
-    std::string location; // Location header, for the redirect loop below
-    std::string contentType; // Content-Type header, for fetchHttp
+    std::string location;    // Location header, for the redirect loop (followRedirect)
+    std::string contentType; // Content-Type header, for fetchHttpAsync
     std::wstring finalUrl;
     std::wstring error;
 };
 
 // ---------------------------------------------------------------------
-// Connection pooling: reusing an already-open, already-TLS-handshaked
-// connection for a second request to the same host skips resolve/connect/
-// handshake entirely - measured (see HOW_IT_WORKS.md) at roughly 200ms of
-// pure overhead per connection, dominated by the TLS handshake alone, and
-// a page very commonly sends several requests to the same host (its own
-// origin, or a shared CDN for stylesheets/scripts/images).
-//
-// Each pooled connection owns its net::io_context: an Asio/Beast stream
-// is permanently bound to the io_context it was constructed with (an
-// executor can't be rebound afterward), so reusing a stream across
-// separate sendOneRequest() calls - potentially from different background
-// threads, since PageLoader/ResourceLoader/the image loader all call into
-// this file concurrently - means keeping its io_context alive alongside
-// it, not just the stream itself.
-
-struct PooledPlainConnection {
-    net::io_context ioc;
-    beast::tcp_stream stream;
-    std::chrono::steady_clock::time_point idleSince;
-    std::chrono::seconds serverTimeout;
-    explicit PooledPlainConnection(std::chrono::seconds timeout) : stream(ioc), serverTimeout(timeout) {}
-};
-
-struct PooledSslConnection {
-    net::io_context ioc;
-    beast::ssl_stream<beast::tcp_stream> stream;
-    std::chrono::steady_clock::time_point idleSince;
-    std::chrono::seconds serverTimeout;
-    PooledSslConnection(ssl::context& sslCtx, std::chrono::seconds timeout)
-        : stream(ioc, sslCtx), serverTimeout(timeout) {}
-};
+// Connection reuse: a second request to the same host skips resolve/
+// connect/TLS handshake entirely by reusing an idle kept-alive connection
+// - measured (see HOW_IT_WORKS.md) at roughly 200ms of pure overhead per
+// new connection, dominated by the TLS handshake, and a page very commonly
+// sends many requests to the same host (its own origin, or a shared CDN).
 
 // How long to keep an idle connection when the response didn't say (no
 // Keep-Alive: timeout=N) - conservative, safely under most servers' actual
 // defaults (commonly 5-15s), so guessing wrong in the "kept it too long"
-// direction stays rare. The write/read failure path in sendOneRequest
+// direction stays rare. The stale-connection retry in NetworkThread::sendOne
 // covers it when a guess is wrong anyway, so this only needs to be a
 // reasonable default, not a guarantee.
 static constexpr std::chrono::seconds kDefaultPoolTimeout{ 4 };
@@ -214,13 +192,13 @@ static constexpr std::chrono::seconds kDefaultPoolTimeout{ 4 };
 // they're reused - a low ceiling is fine since the goal is avoiding
 // *repeat* handshakes to a host being fetched from concurrently right
 // now, not maintaining a large persistent cache of every host ever visited.
-static constexpr size_t kMaxPooledPerHost = 4;
+static constexpr size_t kMaxPooledPerHost = 6; // = HostLimiter's per-host connection limit
 
 // Parses a "Keep-Alive: timeout=N, max=N" response header. `max` (the
 // number of requests the server will still allow on this connection)
 // isn't tracked here - running into it is just another way a pooled
 // connection turns out to be unusable, already handled reactively by the
-// write/read failure fallback in sendOneRequest, so there's nothing extra
+// stale-connection retry in NetworkThread::sendOne, so there's nothing extra
 // to do with knowing it in advance.
 static std::optional<int> parseKeepAliveTimeout(const std::string& value) {
     std::istringstream ss(value);
@@ -237,7 +215,7 @@ static std::optional<int> parseKeepAliveTimeout(const std::string& value) {
     return std::nullopt;
 }
 
-// HTTP/1.1 (the only version this file ever sends - see sendOneRequest)
+// HTTP/1.1 (the only version this file ever sends - see buildRequest)
 // defaults to keeping the connection open; only an explicit "close" token
 // says otherwise.
 static bool responseWantsClose(const http::response<http::string_body>& res) {
@@ -263,7 +241,7 @@ static bool responseWantsClose(const http::response<http::string_body>& res) {
 // degrade to "give back something rather than silently lose the page"
 // elsewhere in this file. Brotli ("br") isn't supported - would need a
 // separate library, and no server should send it unasked since this
-// file never advertises it in Accept-Encoding (see sendOneRequest).
+// file never advertises it in Accept-Encoding (see buildRequest).
 static std::string decompressBody(const std::string& compressed) {
     z_stream zs{};
     if (inflateInit2(&zs, 15 + 32) != Z_OK) return compressed;
@@ -286,84 +264,10 @@ static std::string decompressBody(const std::string& compressed) {
     return out;
 }
 
-// One shared pool for the process, keyed by "host:port" - separate maps
-// for plain and TLS connections since they're different C++ types, not
-// because the concept differs. Thread-safe: every method locks the same
-// mutex, matching PageLoader/ResourceLoader's established pattern of one
-// mutex per shared structure rather than anything more elaborate.
-class ConnectionPool {
-public:
-    std::unique_ptr<PooledPlainConnection> takePlain(const std::string& key) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return take(plain_, key);
-    }
-    void givePlain(const std::string& key, std::unique_ptr<PooledPlainConnection> conn) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        give(plain_, key, std::move(conn));
-    }
-    std::unique_ptr<PooledSslConnection> takeSsl(const std::string& key) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return take(ssl_, key);
-    }
-    void giveSsl(const std::string& key, std::unique_ptr<PooledSslConnection> conn) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        give(ssl_, key, std::move(conn));
-    }
-
-private:
-    template <class Conn>
-    static std::unique_ptr<Conn> take(std::unordered_map<std::string, std::vector<std::unique_ptr<Conn>>>& map,
-                                       const std::string& key) {
-        auto it = map.find(key);
-        if (it == map.end()) return nullptr;
-        auto& bucket = it->second;
-        auto now = std::chrono::steady_clock::now();
-        while (!bucket.empty()) {
-            auto conn = std::move(bucket.back());
-            bucket.pop_back();
-            if (now - conn->idleSince <= conn->serverTimeout) return conn;
-            // else: past its advertised lifetime, likely already closed by
-            // the server - discard without even trying it, and check the
-            // next one (there's rarely more than one, but a burst of
-            // concurrent requests can leave a few queued up).
-        }
-        return nullptr;
-    }
-    template <class Conn>
-    static void give(std::unordered_map<std::string, std::vector<std::unique_ptr<Conn>>>& map,
-                      const std::string& key, std::unique_ptr<Conn> conn) {
-        auto& bucket = map[key];
-        if (bucket.size() >= kMaxPooledPerHost) return; // conn (and its connection) is closed by falling out of scope here
-        conn->idleSince = std::chrono::steady_clock::now();
-        bucket.push_back(std::move(conn));
-    }
-
-    std::mutex mutex_;
-    std::unordered_map<std::string, std::vector<std::unique_ptr<PooledPlainConnection>>> plain_;
-    std::unordered_map<std::string, std::vector<std::unique_ptr<PooledSslConnection>>> ssl_;
-};
-
-static ConnectionPool& sharedConnectionPool() {
-    static ConnectionPool pool;
-    return pool;
-}
-
-// Sends `req` on an already-connected `stream` (freshly opened, or reused
-// from the pool) and fills `out` from the response - shared between the
-// plain-TCP and TLS paths in sendOneRequest below via the template
-// parameter, since both stream types support the same write/read API;
-// only connecting and tearing down differ between them, which stays with
-// their respective callers. Throws on failure (a stale pooled connection,
-// most commonly), same as the write/read calls it wraps - the caller
-// decides what that means.
-template <class Stream>
-static void writeAndRead(Stream& stream, const http::request<http::string_body>& req, RawResponse& out,
-                          bool& keepAlive, std::chrono::seconds& keepAliveTimeout) {
-    beast::flat_buffer buffer;
-    http::response<http::string_body> res;
-    http::write(stream, req);
-    http::read(stream, buffer, res);
-
+// Fills `out` from a received response: status, the headers this file
+// cares about, and the body - decompressed if the server compressed it.
+// Used by the network thread's exchange().
+static void fillRawResponse(http::response<http::string_body>& res, RawResponse& out) {
     out.status = res.result_int();
     out.body = std::move(res.body());
     auto loc = res.find(http::field::location);
@@ -380,218 +284,52 @@ static void writeAndRead(Stream& stream, const http::request<http::string_body>&
             out.body = decompressBody(out.body);
         // "br" (Brotli) and anything else unrecognized passes through as-is.
     }
-
-    keepAlive = !responseWantsClose(res);
-    keepAliveTimeout = kDefaultPoolTimeout;
-    auto ka = res.find(http::field::keep_alive);
-    if (ka != res.end()) {
-        if (auto t = parseKeepAliveTimeout(std::string(ka->value()))) keepAliveTimeout = std::chrono::seconds(*t);
-    }
 }
 
-// ---------------------------------------------------------------------
-// The actual network I/O.
-
-// Connects to the resolved address(es) for host:port, trying each in turn
-// with a short per-attempt deadline - see the file header comment for why
-// this (not a longer overall timeout) is what actually avoids a long
-// stall on a host with an unreachable address in its DNS results.
-static void connectStream(beast::tcp_stream& stream, const std::string& host, const std::string& port) {
-    tcp::resolver resolver(stream.get_executor());
-    auto const results = resolver.resolve(host, port);
-    stream.expires_after(std::chrono::seconds(3));
-    stream.connect(results);
-}
-
-// Opens a fresh HTTPS connection (SNI + hostname verification + connect +
-// handshake), sends `req` on it, and either returns it to the pool or
-// shuts it down, depending on what the response said. Split out of
-// sendOneRequest below only because it's used from two places there (the
-// normal path, and the fallback after a pooled connection turns out to be
-// stale) - not a general-purpose helper otherwise.
-static void sendFreshHttps(const std::string& host, const std::string& port, const std::string& poolKey,
-                            const http::request<http::string_body>& req, RawResponse& out) {
-    auto fresh = std::make_unique<PooledSslConnection>(sharedSslContext(), kDefaultPoolTimeout);
-
-    // SNI: without this, many hosts (anything relying on virtual hosting
-    // by hostname, i.e. most of the web) return the wrong certificate or
-    // reject the handshake outright.
-    if (!SSL_set_tlsext_host_name(fresh->stream.native_handle(), host.c_str())) {
-        beast::error_code ec{static_cast<int>(::ERR_get_error()), net::error::get_ssl_category()};
-        throw beast::system_error(ec);
-    }
-    // verify_peer (set on the shared context) alone only checks the
-    // certificate chains to a trusted CA - not that it's actually FOR
-    // this host. Without this, any validly-CA-signed certificate for any
-    // site would be accepted, defeating the point.
-    fresh->stream.set_verify_callback(ssl::host_name_verification(host));
-
-    connectStream(beast::get_lowest_layer(fresh->stream), host, port);
-    beast::get_lowest_layer(fresh->stream).expires_after(std::chrono::seconds(10));
-    fresh->stream.handshake(ssl::stream_base::client);
-
-    bool keepAlive; std::chrono::seconds timeout;
-    writeAndRead(fresh->stream, req, out, keepAlive, timeout);
-
-    if (keepAlive) {
-        fresh->serverTimeout = timeout;
-        sharedConnectionPool().giveSsl(poolKey, std::move(fresh));
-    } else {
-        beast::error_code ec;
-        beast::get_lowest_layer(fresh->stream).expires_after(std::chrono::seconds(3));
-        fresh->stream.shutdown(ec); // the peer closing first is routine, not an error - ignore ec
-    }
-}
-
-// Same shape as sendFreshHttps, for plain (non-TLS) HTTP.
-static void sendFreshPlain(const std::string& host, const std::string& port, const std::string& poolKey,
-                            const http::request<http::string_body>& req, RawResponse& out) {
-    auto fresh = std::make_unique<PooledPlainConnection>(kDefaultPoolTimeout);
-    connectStream(fresh->stream, host, port);
-    fresh->stream.expires_after(std::chrono::seconds(10));
-
-    bool keepAlive; std::chrono::seconds timeout;
-    writeAndRead(fresh->stream, req, out, keepAlive, timeout);
-
-    if (keepAlive) {
-        fresh->serverTimeout = timeout;
-        sharedConnectionPool().givePlain(poolKey, std::move(fresh));
-    } else {
-        beast::error_code ec;
-        fresh->stream.socket().shutdown(tcp::socket::shutdown_both, ec);
-    }
-}
-
-// Sends one request (no redirect following - fetchRaw below loops) and
-// returns the raw response. Tries a pooled connection for this host
-// first, if one's available - just write+read, skipping resolve/connect/
-// (for HTTPS) handshake entirely. If that throws (the connection had
-// already been silently closed by the server while it sat idle - the one
-// failure mode pooling can't avoid, only recover from), the exception is
-// swallowed here and a fresh connection is opened instead, transparently;
-// only a fresh connection's own failure is reported to the caller.
-// Exceptions from anywhere in the Beast/Asio call chain (resolve/connect/
-// handshake/write/read failures, including a connect that exhausted every
-// resolved address) are caught and reported via RawResponse::error,
-// matching how the rest of this file signals failure (a bool/empty-error
-// pattern, not exceptions, at the API boundary fetchPage/fetchBytes expose).
-// Extra request headers beyond the ones sendOneRequest always sets; an
+// Extra request headers beyond the ones buildRequest always sets; an
 // entry here overrides a default of the same name (e.g. Content-Type).
 using HeaderList = std::vector<std::pair<std::string, std::string>>;
 
-static RawResponse sendOneRequest(const UrlParts& parts, http::verb method, const std::string& body,
-                                   const char* accept, const HeaderList& extraHeaders = {}) {
-    RawResponse out;
-    std::string host = wideToUtf8(parts.host);
-    std::string port = std::to_string(parts.port);
-    std::string target = wideToUtf8(parts.pathAndQuery);
-    std::string poolKey = host + ":" + port;
-
-    http::request<http::string_body> req{method, target, 11};
-    req.set(http::field::host, host);
+// Builds the request for one hop. `keepAlive` false sends "Connection:
+// close", for a connection that won't be pooled.
+static http::request<http::string_body> buildRequest(const UrlParts& parts, http::verb method,
+                                                     const std::string& body, const char* accept,
+                                                     const HeaderList& extraHeaders, bool keepAlive) {
+    http::request<http::string_body> req{method, wideToUtf8(parts.pathAndQuery), 11};
+    req.set(http::field::host, wideToUtf8(parts.host));
     req.set(http::field::user_agent, "WTEngine/0.1");
     if (accept) req.set(http::field::accept, accept); // "text/html" for a page, unset for an image
-    req.set(http::field::accept_encoding, "gzip, deflate"); // decompressBody (writeAndRead) handles both - see its comment
-    req.set(http::field::connection, "keep-alive"); // was "close" - see ConnectionPool above
+    req.set(http::field::accept_encoding, "gzip, deflate"); // decompressBody (fillRawResponse) handles both - see its comment
+    req.set(http::field::connection, keepAlive ? "keep-alive" : "close"); // keep-alive: see ConnectionPool above
     if (!body.empty()) req.set(http::field::content_type, "application/x-www-form-urlencoded");
     for (const auto& [name, value] : extraHeaders) req.set(name, value);
     if (!body.empty() || method == http::verb::post || method == http::verb::put || method == http::verb::patch) {
         req.body() = body;
         req.prepare_payload(); // Content-Length (0 for an empty POST, which some servers require)
     }
-
-    try {
-        if (parts.https) {
-            if (auto pooled = sharedConnectionPool().takeSsl(poolKey)) {
-                try {
-                    bool keepAlive; std::chrono::seconds timeout;
-                    beast::get_lowest_layer(pooled->stream).expires_after(std::chrono::seconds(10));
-                    writeAndRead(pooled->stream, req, out, keepAlive, timeout);
-                    if (keepAlive) {
-                        pooled->serverTimeout = timeout;
-                        sharedConnectionPool().giveSsl(poolKey, std::move(pooled));
-                    }
-                    return out; // succeeded via the pooled connection - done
-                }
-                catch (std::exception const&) {
-                    // Stale - `pooled` is destroyed here (closing whatever's
-                    // left of it), and a fresh connection is tried below.
-                }
-            }
-            sendFreshHttps(host, port, poolKey, req, out);
-        } else {
-            if (auto pooled = sharedConnectionPool().takePlain(poolKey)) {
-                try {
-                    bool keepAlive; std::chrono::seconds timeout;
-                    pooled->stream.expires_after(std::chrono::seconds(10));
-                    writeAndRead(pooled->stream, req, out, keepAlive, timeout);
-                    if (keepAlive) {
-                        pooled->serverTimeout = timeout;
-                        sharedConnectionPool().givePlain(poolKey, std::move(pooled));
-                    }
-                    return out;
-                }
-                catch (std::exception const&) {
-                    // fall through to a fresh connection, same as above
-                }
-            }
-            sendFreshPlain(host, port, poolKey, req, out);
-        }
-    }
-    catch (std::exception const& e) {
-        out.error = utf8ToWide(e.what());
-    }
-    return out;
+    return req;
 }
 
-// Sends a GET or POST, following up to 10 redirects (always as a GET
-// after the first hop - matches how real browsers treat 301/302/303; a
-// stricter implementation would preserve the method for 307/308, not
-// done here to keep this simple), returning the final raw response.
-//
-// `method`/`headers` are for fetchHttp (JS fetch()): a 307/308 redirect
-// keeps the method and body there, as the spec requires, and an HTTP error
-// status is still a completed response (`ok` stays true) - it's up to the
-// caller to look at `status`. The page/image path (`errorOnHttpStatus`)
-// keeps the original behavior of treating 4xx/5xx as a failure.
-static RawResponse fetchRaw(std::wstring url, http::verb method, std::string body, const char* accept,
-                            const HeaderList& headers = {}, bool errorOnHttpStatus = true) {
-    RawResponse raw;
-
-    for (int redirect = 0; redirect < 10; redirect++) {
-        UrlParts parts;
-        if (!crackUrl(url, parts)) { raw = RawResponse{}; raw.error = L"Bad URL"; return raw; }
-
-        raw = sendOneRequest(parts, method, body, accept, headers);
-        if (!raw.ok) return raw;
-
-        if (raw.status >= 300 && raw.status < 400 && !raw.location.empty()) {
-            std::wstring loc = utf8ToWide(raw.location);
-            wchar_t combined[4096]; DWORD sz = 4096;
-            if (!InternetCombineUrlW(url.c_str(), loc.c_str(), combined, &sz, ICU_BROWSER_MODE)) {
-                raw.ok = false;
-                raw.error = L"Bad redirect URL";
-                return raw;
-            }
-            url = combined;
-            if (raw.status != 307 && raw.status != 308) {
-                method = http::verb::get;
-                body.clear();
-            }
-            continue;
-        }
-
-        raw.finalUrl = url;
-        if (errorOnHttpStatus && raw.status >= 400) {
-            raw.ok = false;
-            raw.error = L"HTTP " + std::to_wstring(raw.status);
-        }
-        return raw;
+// If `raw` is a redirect, points `url` at its target and returns true (the
+// caller sends the next hop). A 301/302/303 turns the next hop into a
+// body-less GET, as browsers do; a 307/308 keeps the method and body.
+// Returns false when `raw` isn't a redirect - or when its Location can't
+// be resolved, in which case `raw` is also marked failed.
+static bool followRedirect(std::wstring& url, http::verb& method, std::string& body, RawResponse& raw) {
+    if (raw.status < 300 || raw.status >= 400 || raw.location.empty()) return false;
+    std::wstring loc = utf8ToWide(raw.location);
+    wchar_t combined[4096]; DWORD sz = 4096;
+    if (!InternetCombineUrlW(url.c_str(), loc.c_str(), combined, &sz, ICU_BROWSER_MODE)) {
+        raw.ok = false;
+        raw.error = L"Bad redirect URL";
+        return false;
     }
-
-    raw.ok = false;
-    raw.error = L"Too many redirects";
-    return raw;
+    url = combined;
+    if (raw.status != 307 && raw.status != 308) {
+        method = http::verb::get;
+        body.clear();
+    }
+    return true;
 }
 
 static FetchResult readLocalFile(const std::wstring& path) {
@@ -601,48 +339,6 @@ static FetchResult readLocalFile(const std::wstring& path) {
     std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     res.html = utf8ToWide(body);
     res.ok = true;
-    return res;
-}
-
-FetchResult fetchPage(const std::wstring& url, const std::string* postBody) {
-    if (!isHttpUrl(url)) return readLocalFile(url); // a POST body makes no sense for a file
-
-    RawResponse raw = fetchRaw(url, postBody ? http::verb::post : http::verb::get,
-                               postBody ? *postBody : std::string(), "text/html");
-    FetchResult res;
-    res.ok = raw.ok;
-    res.error = raw.error;
-    res.finalUrl = raw.finalUrl;
-    if (raw.ok) res.html = utf8ToWide(raw.body);
-    return res;
-}
-
-HttpResponse fetchHttp(const HttpRequest& request) {
-    HttpResponse res;
-    if (!isHttpUrl(request.url)) {
-        // A local file - only reachable from a page that was itself loaded
-        // from disk (see JS fetch()), read the same way as a page.
-        std::ifstream in(request.url, std::ios::binary);
-        if (!in) { res.error = L"Could not open file: " + request.url; return res; }
-        res.body.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-        res.ok = true;
-        res.status = 200;
-        res.finalUrl = request.url;
-        return res;
-    }
-
-    std::string methodName = request.method;
-    for (auto& c : methodName) c = (char)std::toupper((unsigned char)c);
-    http::verb verb = http::string_to_verb(methodName);
-    if (verb == http::verb::unknown) { res.error = L"Unsupported method"; return res; }
-
-    RawResponse raw = fetchRaw(request.url, verb, request.body, "*/*", request.headers, false);
-    res.ok = raw.ok;
-    res.status = raw.status;
-    res.body = std::move(raw.body);
-    res.contentType = std::move(raw.contentType);
-    res.finalUrl = raw.finalUrl;
-    res.error = raw.error;
     return res;
 }
 
@@ -672,22 +368,431 @@ static bool decodeDataUri(const std::wstring& uri, std::vector<unsigned char>& o
     return true;
 }
 
-bool fetchBytes(const std::wstring& url, std::vector<unsigned char>& outBytes) {
-    outBytes.clear();
+// ---------------------------------------------------------------------
+// The network thread.
+//
+// Every request - pages, scripts, stylesheets, images, JS fetch() - runs
+// as a C++20 coroutine on one io_context, driven by one thread. Each
+// co_await (resolve, connect, handshake, write, read) suspends that
+// request and frees the thread for the others; Asio waits on all their
+// sockets at once through an I/O completion port (IOCP) on Windows and
+// resumes whichever one has data. So the number of requests in flight is
+// no longer tied to a number of threads, and a slow server holds up
+// nothing but its own request.
+//
+// Everything below the public API runs only on that thread, which is what
+// lets the connection pool and the per-host limiter work without locks.
+// Results reach callers through their `onDone` callbacks - also run on the
+// network thread, so they only hand results off (see Fetcher.h).
 
-    if (url.rfind(L"data:", 0) == 0) return decodeDataUri(url, outBytes);
+namespace {
 
-    if (!isHttpUrl(url)) {
-        std::ifstream in(url, std::ios::binary);
-        if (!in) return false;
-        outBytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-        return true;
+// A connection that can be kept alive and reused: exactly one of `tls` /
+// `plain` is set.
+struct Connection {
+    std::unique_ptr<ssl::stream<beast::tcp_stream>> tls;
+    std::unique_ptr<beast::tcp_stream> plain;
+    std::chrono::steady_clock::time_point idleSince;
+    std::chrono::seconds serverTimeout = kDefaultPoolTimeout;
+    beast::tcp_stream& tcp() { return tls ? beast::get_lowest_layer(*tls) : *plain; }
+};
+
+// Idle kept-alive connections by "scheme://host:port".
+class ConnectionPool {
+public:
+    std::unique_ptr<Connection> take(const std::string& key) {
+        auto it = idle_.find(key);
+        if (it == idle_.end()) return nullptr;
+        auto now = std::chrono::steady_clock::now();
+        auto& bucket = it->second;
+        while (!bucket.empty()) {
+            auto conn = std::move(bucket.back());
+            bucket.pop_back();
+            if (now - conn->idleSince <= conn->serverTimeout) return conn;
+            // else: past its advertised lifetime, likely already closed by
+            // the server - discard without even trying it.
+        }
+        return nullptr;
     }
 
-    RawResponse raw = fetchRaw(url, http::verb::get, std::string(), nullptr);
-    if (!raw.ok) return false;
-    outBytes.assign(raw.body.begin(), raw.body.end());
-    return true;
+    void give(const std::string& key, std::unique_ptr<Connection> conn) {
+        auto& bucket = idle_[key];
+        if (bucket.size() >= kMaxPooledPerHost) return; // closed by falling out of scope
+        conn->tcp().expires_never(); // no stale deadline left armed while it sits idle
+        conn->idleSince = std::chrono::steady_clock::now();
+        bucket.push_back(std::move(conn));
+    }
+
+    void clear() { idle_.clear(); }
+
+private:
+    std::unordered_map<std::string, std::vector<std::unique_ptr<Connection>>> idle_;
+};
+
+// At most kMaxConnectionsPerHost requests in flight to one host at once -
+// the same limit browsers use for HTTP/1.1. Without it, a page with 100
+// images on one CDN would open 100 connections at once (which servers
+// throttle or refuse) and bury the page's own scripts behind them. The
+// rest wait here and are admitted highest priority first (FetchPriority
+// order), first-come-first-served within a priority - so a script queued
+// behind 50 images still goes next.
+class HostLimiter {
+public:
+    net::awaitable<void> acquire(const std::string& key, FetchPriority priority) {
+        Host& host = hosts_[key];
+        if (host.active < kMaxConnectionsPerHost) { host.active++; co_return; }
+
+        // Wait on a timer that never expires on its own; release() cancels
+        // it to wake this request, handing over its slot (so `active`
+        // doesn't change).
+        auto timer = std::make_shared<net::steady_timer>(co_await net::this_coro::executor,
+                                                         net::steady_timer::time_point::max());
+        host.waiting.push_back({ priority, nextSeq_++, timer });
+        co_await timer->async_wait(net::as_tuple(net::use_awaitable)); // "cancelled" is the wake-up, not an error
+    }
+
+    void release(const std::string& key) {
+        auto it = hosts_.find(key);
+        if (it == hosts_.end()) return;
+        Host& host = it->second;
+        if (host.waiting.empty()) {
+            if (--host.active == 0) hosts_.erase(it);
+            return;
+        }
+        auto next = std::min_element(host.waiting.begin(), host.waiting.end(),
+            [](const Waiter& a, const Waiter& b) {
+                return a.priority != b.priority ? a.priority < b.priority : a.seq < b.seq;
+            });
+        auto timer = next->timer;
+        host.waiting.erase(next);
+        timer->cancel();
+    }
+
+private:
+    static constexpr int kMaxConnectionsPerHost = 6;
+    struct Waiter {
+        FetchPriority priority;
+        uint64_t seq;
+        std::shared_ptr<net::steady_timer> timer;
+    };
+    struct Host {
+        int active = 0;
+        std::vector<Waiter> waiting;
+    };
+    std::unordered_map<std::string, Host> hosts_;
+    uint64_t nextSeq_ = 0;
+};
+
+// Holds one of a host's slots for as long as it's alive.
+class HostSlot {
+public:
+    HostSlot(HostLimiter& limiter, std::string key) : limiter_(&limiter), key_(std::move(key)) {}
+    ~HostSlot() { limiter_->release(key_); }
+    HostSlot(const HostSlot&) = delete;
+    HostSlot& operator=(const HostSlot&) = delete;
+private:
+    HostLimiter* limiter_;
+    std::string key_;
+};
+
+// Sends `req` on a connected stream and reads the response. Throws on
+// failure, like the Asio operations it wraps.
+template <class Stream>
+net::awaitable<void> exchange(Stream& stream, http::request<http::string_body>& req, RawResponse& out,
+                              bool& keepAlive, std::chrono::seconds& keepAliveTimeout) {
+    co_await http::async_write(stream, req, net::use_awaitable);
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    co_await http::async_read(stream, buffer, res, net::use_awaitable);
+    fillRawResponse(res, out);
+    out.ok = true;
+
+    keepAlive = !responseWantsClose(res);
+    keepAliveTimeout = kDefaultPoolTimeout;
+    auto ka = res.find(http::field::keep_alive);
+    if (ka != res.end()) {
+        if (auto t = parseKeepAliveTimeout(std::string(ka->value()))) keepAliveTimeout = std::chrono::seconds(*t);
+    }
+}
+
+net::awaitable<void> exchangeOn(Connection& conn, http::request<http::string_body>& req, RawResponse& out,
+                                bool& keepAlive, std::chrono::seconds& keepAliveTimeout) {
+    if (conn.tls) co_await exchange(*conn.tls, req, out, keepAlive, keepAliveTimeout);
+    else co_await exchange(*conn.plain, req, out, keepAlive, keepAliveTimeout);
+}
+
+// Resolves, connects and (for HTTPS) handshakes a new connection. The 3s
+// connect deadline covers trying every resolved address - see the file
+// header for why a short deadline, not the OS's own connect timeout, is
+// what avoids long stalls on a host with an unreachable address.
+net::awaitable<std::unique_ptr<Connection>> openConnection(const UrlParts& parts, const std::string& host,
+                                                          const std::string& port) {
+    auto executor = co_await net::this_coro::executor;
+    tcp::resolver resolver(executor);
+    auto results = co_await resolver.async_resolve(host, port, net::use_awaitable);
+
+    auto conn = std::make_unique<Connection>();
+    if (parts.https) {
+        conn->tls = std::make_unique<ssl::stream<beast::tcp_stream>>(executor, sharedSslContext());
+        // SNI: without this, many hosts (anything relying on virtual hosting
+        // by hostname, i.e. most of the web) return the wrong certificate or
+        // reject the handshake outright.
+        if (!SSL_set_tlsext_host_name(conn->tls->native_handle(), host.c_str())) {
+            beast::error_code ec{static_cast<int>(::ERR_get_error()), net::error::get_ssl_category()};
+            throw beast::system_error(ec);
+        }
+        // verify_peer (set on the shared context) alone only checks the
+        // certificate chains to a trusted CA - not that it's actually FOR
+        // this host. Without this, any validly-CA-signed certificate for
+        // any site would be accepted, defeating the point.
+        conn->tls->set_verify_callback(ssl::host_name_verification(host));
+
+        conn->tcp().expires_after(std::chrono::seconds(3));
+        co_await conn->tcp().async_connect(results, net::use_awaitable);
+        conn->tcp().expires_after(std::chrono::seconds(10));
+        co_await conn->tls->async_handshake(ssl::stream_base::client, net::use_awaitable);
+    } else {
+        conn->plain = std::make_unique<beast::tcp_stream>(executor);
+        conn->tcp().expires_after(std::chrono::seconds(3));
+        co_await conn->tcp().async_connect(results, net::use_awaitable);
+    }
+    co_return conn;
+}
+
+// What a request needs besides its URL and body.
+struct RequestSpec {
+    http::verb method = http::verb::get;
+    const char* accept = nullptr;
+    HeaderList headers;
+    bool errorOnHttpStatus = true; // 4xx/5xx is a failure (pages, resources, images) vs a normal response (fetch())
+    FetchPriority priority = FetchPriority::Fetch;
+    std::function<bool()> stillWanted;
+};
+
+class NetworkThread {
+public:
+    static NetworkThread& instance() {
+        static NetworkThread thread;
+        return thread;
+    }
+
+    template <class Awaitable>
+    void spawn(Awaitable&& work) {
+        net::co_spawn(io_, std::forward<Awaitable>(work), net::detached);
+    }
+
+    // A whole request, redirects included. Never throws: every failure
+    // becomes RawResponse::error.
+    net::awaitable<RawResponse> fetch(std::wstring url, std::string body, RequestSpec spec) {
+        RawResponse raw;
+        for (int redirect = 0; redirect < 10; redirect++) {
+            UrlParts parts;
+            if (!crackUrl(url, parts)) { raw = RawResponse{}; raw.error = L"Bad URL"; co_return raw; }
+            std::string key = std::string(parts.https ? "https://" : "http://") +
+                              wideToUtf8(parts.host) + ":" + std::to_string(parts.port);
+
+            // Per hop: a redirect can lead to a different host.
+            co_await limiter_.acquire(key, spec.priority);
+            HostSlot slot(limiter_, key);
+
+            // Checked after waiting for a slot, when nothing has been sent
+            // yet: a superseded page load or script batch costs nothing.
+            if (spec.stillWanted && !spec.stillWanted()) {
+                raw = RawResponse{};
+                raw.error = L"Cancelled";
+                co_return raw;
+            }
+
+            std::string failure;
+            try {
+                raw = co_await sendOne(parts, key, spec, body);
+            } catch (const std::exception& e) {
+                failure = e.what(); // can't co_return from inside a catch block
+            }
+            if (!failure.empty()) { raw = RawResponse{}; raw.error = utf8ToWide(failure); co_return raw; }
+
+            if (followRedirect(url, spec.method, body, raw)) continue;
+            if (!raw.ok) co_return raw; // a redirect with an unusable Location
+
+            raw.finalUrl = url;
+            if (spec.errorOnHttpStatus && raw.status >= 400) {
+                raw.ok = false;
+                raw.error = L"HTTP " + std::to_wstring(raw.status);
+            }
+            co_return raw;
+        }
+        raw = RawResponse{};
+        raw.error = L"Too many redirects";
+        co_return raw;
+    }
+
+    ~NetworkThread() {
+        io_.stop();
+        if (thread_.joinable()) thread_.join();
+        pool_.clear(); // close pooled sockets while io_ (their owner) is still alive
+    }
+
+private:
+    NetworkThread() : work_(net::make_work_guard(io_)) {
+        sharedSslContext(); // construct it first so it's destroyed after this (static destruction is reverse order)
+        thread_ = std::thread([this] { io_.run(); });
+    }
+
+    // One hop: reuse a pooled connection if there is one, else open a new
+    // one. A pooled connection can turn out to be stale (the server closed
+    // it while it sat idle - the one failure pooling can't avoid, only
+    // recover from); that failure is swallowed and the request retried on
+    // a fresh connection, whose own failures do propagate.
+    net::awaitable<RawResponse> sendOne(const UrlParts& parts, const std::string& key,
+                                        const RequestSpec& spec, const std::string& body) {
+        // fetch() may legitimately wait on a slow API; everything else
+        // keeps the original page-load deadline.
+        auto deadline = std::chrono::seconds(spec.priority == FetchPriority::Fetch ? 30 : 10);
+        http::request<http::string_body> req = buildRequest(parts, spec.method, body, spec.accept, spec.headers, true);
+        RawResponse out;
+        bool keepAlive = false;
+        std::chrono::seconds keepAliveTimeout{};
+
+        if (auto conn = pool_.take(key)) {
+            bool stale = false;
+            try {
+                conn->tcp().expires_after(deadline);
+                co_await exchangeOn(*conn, req, out, keepAlive, keepAliveTimeout);
+            } catch (const std::exception&) {
+                stale = true;
+            }
+            if (!stale) {
+                if (keepAlive) { conn->serverTimeout = keepAliveTimeout; pool_.give(key, std::move(conn)); }
+                co_return out;
+            }
+            out = RawResponse{};
+        }
+
+        auto conn = co_await openConnection(parts, wideToUtf8(parts.host), std::to_string(parts.port));
+        conn->tcp().expires_after(deadline);
+        co_await exchangeOn(*conn, req, out, keepAlive, keepAliveTimeout);
+        if (keepAlive) { conn->serverTimeout = keepAliveTimeout; pool_.give(key, std::move(conn)); }
+        // else `conn` closes as it goes out of scope. No TLS close_notify:
+        // the server has said it's closing anyway, and waiting on its reply
+        // could stall this request.
+        co_return out;
+    }
+
+    // Declared before io_, so destroyed after it: coroutine frames still
+    // pending at exit are destroyed along with io_, and their HostSlots
+    // release into the limiter on the way out.
+    HostLimiter limiter_;
+    ConnectionPool pool_;
+    net::io_context io_{1}; // concurrency hint: exactly one thread runs this loop
+    net::executor_work_guard<net::io_context::executor_type> work_; // keeps run() alive while idle
+    std::thread thread_;
+};
+
+// --- The per-API coroutines: run a request, convert its result, call onDone.
+
+net::awaitable<void> runPage(std::wstring url, std::string body, bool isPost, FetchOptions options,
+                             std::function<void(FetchResult)> onDone) {
+    FetchResult res;
+    if (!isHttpUrl(url)) {
+        res = readLocalFile(url); // a POST body makes no sense for a file
+    } else {
+        RequestSpec spec;
+        spec.method = isPost ? http::verb::post : http::verb::get;
+        // "text/html" for a top-level page; a script/stylesheet is whatever it is.
+        spec.accept = options.priority == FetchPriority::Page ? "text/html" : "*/*";
+        spec.priority = options.priority;
+        spec.stillWanted = std::move(options.stillWanted);
+        RawResponse raw = co_await NetworkThread::instance().fetch(url, std::move(body), std::move(spec));
+        res.ok = raw.ok;
+        res.error = raw.error;
+        res.finalUrl = raw.finalUrl;
+        if (raw.ok) res.html = utf8ToWide(raw.body);
+    }
+    onDone(std::move(res));
+}
+
+net::awaitable<void> runBytes(std::wstring url, FetchOptions options,
+                              std::function<void(bool, std::vector<unsigned char>)> onDone) {
+    std::vector<unsigned char> bytes;
+    bool ok = false;
+    if (url.rfind(L"data:", 0) == 0) {
+        ok = decodeDataUri(url, bytes);
+    } else if (!isHttpUrl(url)) {
+        std::ifstream in(url, std::ios::binary);
+        if (in) {
+            bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            ok = true;
+        }
+    } else {
+        RequestSpec spec;
+        spec.priority = options.priority;
+        spec.stillWanted = std::move(options.stillWanted);
+        RawResponse raw = co_await NetworkThread::instance().fetch(url, std::string(), std::move(spec));
+        if (raw.ok) {
+            bytes.assign(raw.body.begin(), raw.body.end());
+            ok = true;
+        }
+    }
+    onDone(ok, std::move(bytes));
+}
+
+net::awaitable<void> runHttp(HttpRequest request, std::function<void(HttpResponse)> onDone) {
+    HttpResponse res;
+    std::string methodName = request.method;
+    for (auto& c : methodName) c = (char)std::toupper((unsigned char)c);
+    http::verb method = http::string_to_verb(methodName);
+
+    if (!isHttpUrl(request.url)) {
+        // A local file - only reachable from a page that was itself loaded
+        // from disk (see JS fetch()).
+        std::ifstream in(request.url, std::ios::binary);
+        if (!in) {
+            res.error = L"Could not open file: " + request.url;
+        } else {
+            res.body.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            res.ok = true;
+            res.status = 200;
+            res.finalUrl = request.url;
+        }
+    } else if (method == http::verb::unknown) {
+        res.error = L"Unsupported method";
+    } else {
+        RequestSpec spec;
+        spec.method = method;
+        spec.accept = "*/*";
+        spec.headers = std::move(request.headers);
+        spec.errorOnHttpStatus = false;
+        spec.priority = FetchPriority::Fetch;
+        RawResponse raw = co_await NetworkThread::instance().fetch(request.url, std::move(request.body), std::move(spec));
+        res.ok = raw.ok;
+        res.status = raw.status;
+        res.body = std::move(raw.body);
+        res.contentType = std::move(raw.contentType);
+        res.finalUrl = raw.finalUrl;
+        res.error = raw.error;
+    }
+    onDone(std::move(res));
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------
+// Public API - each just starts a coroutine on the network thread.
+
+void fetchPageAsync(std::wstring url, const std::string* postBody, FetchOptions options,
+                    std::function<void(FetchResult)> onDone) {
+    bool isPost = postBody != nullptr;
+    NetworkThread::instance().spawn(runPage(std::move(url), isPost ? *postBody : std::string(), isPost,
+                                            std::move(options), std::move(onDone)));
+}
+
+void fetchBytesAsync(std::wstring url, FetchOptions options,
+                     std::function<void(bool, std::vector<unsigned char>)> onDone) {
+    NetworkThread::instance().spawn(runBytes(std::move(url), std::move(options), std::move(onDone)));
+}
+
+void fetchHttpAsync(HttpRequest request, std::function<void(HttpResponse)> onDone) {
+    NetworkThread::instance().spawn(runHttp(std::move(request), std::move(onDone)));
 }
 
 std::wstring resolveUrl(const std::wstring& baseUrl, const std::wstring& href) {

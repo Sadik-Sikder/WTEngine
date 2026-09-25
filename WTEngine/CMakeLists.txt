@@ -49,6 +49,10 @@ add_executable(WTEngine
 
 target_include_directories(WTEngine PRIVATE include)
 
+# Asio's coroutine templates (fetchHttpAsync) exceed MSVC's default limit on
+# sections per object file. Mirrored in WTEngine.vcxproj.
+set_source_files_properties(src/Fetcher.cpp PROPERTIES COMPILE_OPTIONS /bigobj)
+
 find_library(GLFW3_LIB glfw3 PATHS "${CMAKE_CURRENT_SOURCE_DIR}/libs/glfw" NO_DEFAULT_PATH)
 
 find_package(boost_beast CONFIG REQUIRED)

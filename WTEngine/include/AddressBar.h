@@ -42,7 +42,7 @@ public:
 
     void draw(Renderer& renderer, int windowWidth, double timeSeconds);
 
-    // Turns what the user typed into something fetchPage can load:
+    // Turns what the user typed into something fetchPageAsync can load:
     // adds https:// to bare hosts, leaves URLs and local paths alone.
     static std::wstring normalizeInput(const std::wstring& input);
 

@@ -1,8 +1,37 @@
 // Fetcher.h
 #pragma once
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
+
+// All network I/O goes through one shared network thread, which drives
+// every socket through an I/O completion port (IOCP) - no thread per
+// request, and no caller ever blocks on the network (see Fetcher.cpp).
+// Each fetch*Async function returns immediately; its `onDone` runs exactly
+// once, *on that network thread* (not the caller's), when the request
+// completes or fails - so it must only hand the result off (e.g. into a
+// mutex-guarded slot the caller polls), never touch UI/JS/GL state
+// directly. `onDone` is skipped only if the process is exiting.
+
+// When several requests to the same host are waiting for one of its
+// connections (at most 6 at once, like browsers), lower values go first.
+enum class FetchPriority {
+    Page = 0,     // the top-level page
+    Blocking = 1, // scripts and stylesheets - the page can't finish without them
+    Fetch = 2,    // JS fetch()
+    Image = 3,
+};
+
+struct FetchOptions {
+    FetchPriority priority = FetchPriority::Fetch;
+    // If set, called (on the network thread - so it must be thread-safe,
+    // e.g. checking a weak_ptr) right before the request is sent. Returning
+    // false skips it; `onDone` then gets a failure ("Cancelled"). Lets a
+    // superseded page load or script batch cost nothing if it hadn't
+    // started yet.
+    std::function<bool()> stillWanted;
+};
 
 struct FetchResult {
     bool ok = false;
@@ -11,13 +40,20 @@ struct FetchResult {
     std::wstring error;
 };
 
-// Loads a page from an http(s):// URL, or from a local file path.
-// With `postBody` (already form-encoded), sends it as an HTTP POST instead.
-FetchResult fetchPage(const std::wstring& url, const std::string* postBody = nullptr);
+// Loads a page, script or stylesheet as text from an http(s):// URL, or
+// from a local file path. With `postBody` (already form-encoded), sends it
+// as an HTTP POST instead. An HTTP error status (4xx/5xx) is a failure.
+void fetchPageAsync(std::wstring url, const std::string* postBody, FetchOptions options,
+                    std::function<void(FetchResult)> onDone);
+
+// Fetches raw bytes - for binary resources like images - from an http(s)
+// URL, a local file path, or a data:...;base64 URI. `ok` false on failure.
+void fetchBytesAsync(std::wstring url, FetchOptions options,
+                     std::function<void(bool ok, std::vector<unsigned char> bytes)> onDone);
 
 // A general HTTP request, for JS fetch(): any method, extra headers, and a
-// body. Unlike fetchPage, an HTTP error status (404, 500, ...) is still a
-// completed response - `ok` means only that a response arrived at all.
+// body. Unlike fetchPageAsync, an HTTP error status (404, 500, ...) is
+// still a completed response - `ok` means only that a response arrived.
 struct HttpRequest {
     std::wstring url;       // absolute http(s) URL, or a local file path (read as a GET)
     std::string method = "GET";
@@ -32,11 +68,7 @@ struct HttpResponse {
     std::wstring finalUrl;   // after redirects
     std::wstring error;
 };
-HttpResponse fetchHttp(const HttpRequest& request);
-
-// Fetches raw bytes from an http(s) URL or local file path, with no text
-// decoding — used for binary resources like images. Returns false on failure.
-bool fetchBytes(const std::wstring& url, std::vector<unsigned char>& outBytes);
+void fetchHttpAsync(HttpRequest request, std::function<void(HttpResponse)> onDone);
 
 // Resolves `href` against `baseUrl`. Returns an empty string for links that
 // can't be navigated to (fragments, javascript:, mailto:, non-http bases).

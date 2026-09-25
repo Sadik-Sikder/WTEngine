@@ -12,7 +12,6 @@
 #include <cwctype>
 #include <map>
 #include <mutex>
-#include <thread>
 
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
 
@@ -93,13 +92,14 @@ struct TimerStorage {
 };
 
 // ---------------------------------------------------------------------
-// In-flight fetch() calls. The request itself runs on a detached
-// background thread (the same abandon-in-place pattern PageLoader uses),
-// which only ever touches its FetchSlot - never a JSValue, since quickjs
-// isn't thread-safe. pollFetches, on the UI thread, settles the promise
-// once the slot is done. A navigation drops the storage (freeing the
-// promise functions); a still-running thread then finishes into a slot
-// nothing reads anymore.
+// In-flight fetch() calls. The request itself runs on Fetcher's shared
+// network thread (fetchHttpAsync - async I/O, no thread per request),
+// whose completion callback only ever touches its FetchSlot - never a
+// JSValue, since quickjs isn't thread-safe. pollFetches, on the UI
+// thread, settles the promise once the slot is done. A navigation drops
+// the storage (freeing the promise functions); a request still in flight
+// then completes into a slot nothing reads anymore (the same
+// abandon-in-place pattern PageLoader uses).
 struct FetchSlot {
     std::mutex mutex;
     bool done = false;
@@ -947,12 +947,12 @@ static JSValue js_native_fetch(JSContext* ctx, JSValueConst /*this_val*/, int ar
 
     auto slot = std::make_shared<FetchSlot>();
     state->fetches->pending.push_back({ slot, funcs[0], funcs[1] });
-    std::thread([slot, req = std::move(req)]() {
-        HttpResponse res = fetchHttp(req);
+    fetchHttpAsync(std::move(req), [slot](HttpResponse res) {
+        // On Fetcher's network thread - only hand the result over.
         std::lock_guard<std::mutex> lock(slot->mutex);
         slot->response = std::move(res);
         slot->done = true;
-    }).detach();
+    });
     return promise;
 }
 
