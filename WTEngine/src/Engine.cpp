@@ -8,6 +8,7 @@
 #include "JSEngine.h"
 #include <windows.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cwctype>
@@ -163,6 +164,7 @@ static std::wstring resolveImageSrc(const std::wstring& baseUrl, const std::wstr
 Engine::Engine(int w, int h)
     : width(w), height(h) {
     layoutRoot.viewportWidth = width;
+    layoutRoot.hover = &hoverSet;
     layoutRoot.measureText = [this](const std::wstring& text, int fontSize, bool bold) {
         return measurer ? measurer->measureText(text, (float)fontSize, bold)
                         : text.size() * fontSize * 0.55f;
@@ -401,6 +403,8 @@ void Engine::parseAndBuild(const std::wstring& html) {
     focusedForm = nullptr;
     hasSubmission = false;
     openSelect = nullptr;
+    hoverSet.clear(); // points into the old DOM
+    hoverSetLive = false;
 
     HTMLParser parser;
     document = parser.parse(html);
@@ -456,8 +460,10 @@ void Engine::doLayout() {
     // scroll/resize in a real browser.
     openSelect = nullptr;
 
+    auto layoutStart = std::chrono::steady_clock::now();
     layoutRoot.boxes.clear();
     layoutRoot.layout();
+    lastLayoutMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - layoutStart).count();
 
     // Calculate document height
     documentHeight = 0;
@@ -514,6 +520,7 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     // innerHTML=, ...) since the last layout - re-layout to pick it up.
     if (domState.domDirty) {
         domState.domDirty = false;
+        hoverSetLive = false; // the mutation may have freed hovered elements
         doLayout();
     }
 
@@ -581,6 +588,44 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     }
 
     drawOpenSelect(renderer); // on top of the page, same treatment main.cpp gives AddressBar
+}
+
+// A :hover restyle is a full relayout (there's no restyle-only path), so
+// on a page whose layout already takes longer than this, hover changes are
+// ignored rather than stalling the window on every mouse move.
+static constexpr double kHoverRelayoutBudgetMs = 50;
+
+void Engine::updateHover(int x, int y) {
+    // A pending DOM mutation means layoutRoot.boxes may point at freed
+    // elements; render() will relayout first, and the next call catches up.
+    if (!document || domState.domDirty) return;
+
+    CSS::HoverSet next;
+    for (const Element* el = elementAt(x, y); el; el = el->parent) next.insert(el);
+    if (next == hoverSet) return;
+
+    bool matters = false;
+    if (layoutRoot.rules && CSS::hasHoverRules(*layoutRoot.rules)) {
+        std::vector<const Element*> changed;
+        for (const Element* el : next) if (!hoverSet.count(el)) changed.push_back(el);
+        for (const Element* el : hoverSet) {
+            if (next.count(el)) continue;
+            // An element that left the hover set can only be tested if it's
+            // known to still be alive; otherwise assume the worst.
+            if (hoverSetLive) changed.push_back(el);
+            else matters = true;
+        }
+        matters = matters || CSS::hoverCouldAffect(*layoutRoot.rules, changed);
+    }
+
+    // A relayout would close an open <select> dropdown (see doLayout), so
+    // hold off - leaving hoverSet as-is means this is retried every frame
+    // and applied once the dropdown closes.
+    if (matters && openSelect) return;
+
+    hoverSet = std::move(next);
+    hoverSetLive = true;
+    if (matters && lastLayoutMs <= kHoverRelayoutBudgetMs) doLayout();
 }
 
 std::wstring Engine::linkAt(int x, int y, Renderer& renderer) const {

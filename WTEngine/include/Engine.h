@@ -54,6 +54,14 @@ public:
     // skip its own default handling (e.g. following a link) for this click.
     bool dispatchClick(int x, int y);
 
+    // Tells the engine where the mouse is (window coordinates; anywhere
+    // off the page, e.g. over the address bar, clears the hover). Call
+    // once per frame after render(). If the change could affect a :hover
+    // rule, re-lays-out the page so the next frame shows it - unless the
+    // last layout was too slow to repeat on every mouse move (see
+    // kHoverRelayoutBudgetMs in Engine.cpp).
+    void updateHover(int x, int y);
+
     bool hasFocusedInput() const { return focusedEl != nullptr; }
     void blurInput();
     void onChar(unsigned int codepoint);
@@ -133,9 +141,20 @@ private:
     Element* openSelect = nullptr;
     LayoutBox openSelectBox;
 
+    // :hover state - the hovered element and its ancestors (see
+    // CSS::HoverSet). `hoverSetLive` is false once a JS DOM mutation has
+    // happened since the set was built, since its elements may then have
+    // been freed: they're still safe to compare against, but not to
+    // dereference (updateHover needs to, to test :hover rules against them).
+    CSS::HoverSet hoverSet;
+    bool hoverSetLive = false;
+    double lastLayoutMs = 0; // how long the last doLayout() took
+
     void parseAndBuild(const std::wstring& html);
     void doLayout();
 
+    // The topmost element whose box contains window point (x, y), or nullptr.
+    Element* elementAt(int x, int y) const;
     const LayoutBox* controlAt(int x, int y) const;
     void focusInput(const LayoutBox& box);
     void syncValue();

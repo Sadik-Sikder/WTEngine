@@ -464,15 +464,35 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
 
     if (rules) {
         std::vector<const CSS::Rule*> matched;
-        for (const auto& rule : *rules) {
-            // A width-conditioned @media's rule carries the viewport
-            // bound it needs (CSS::Rule's comment); checked here, against
-            // the live viewport, rather than once at parse time - so a
-            // resize (a full relayout, hence a fresh computeStyle pass)
-            // re-evaluates it for free, no separate reactivity needed.
-            if (rule.mediaMinWidth >= 0 && viewportWidth < rule.mediaMinWidth) continue;
-            if (rule.mediaMaxWidth >= 0 && viewportWidth > rule.mediaMaxWidth) continue;
-            if (CSS::matches(rule, ancestorStack, e, &classCache)) matched.push_back(&rule);
+        auto consider = [&](const std::vector<const CSS::Rule*>& bucket) {
+            for (const CSS::Rule* rule : bucket) {
+                // A width-conditioned @media's rule carries the viewport
+                // bound it needs (CSS::Rule's comment); checked here, against
+                // the live viewport, rather than once at parse time - so a
+                // resize (a full relayout, hence a fresh computeStyle pass)
+                // re-evaluates it for free, no separate reactivity needed.
+                if (rule->mediaMinWidth >= 0 && viewportWidth < rule->mediaMinWidth) continue;
+                if (rule->mediaMaxWidth >= 0 && viewportWidth > rule->mediaMaxWidth) continue;
+                if (CSS::matches(*rule, ancestorStack, e, &classCache, hover)) matched.push_back(rule);
+            }
+        };
+        auto lookup = [&](const std::unordered_map<std::wstring, std::vector<const CSS::Rule*>>& map,
+                          const std::wstring& key) {
+            auto it = map.find(key);
+            if (it != map.end()) consider(it->second);
+        };
+        // Only the buckets this element could possibly satisfy (see RuleIndex).
+        consider(ruleIndex.universal);
+        lookup(ruleIndex.byTag, e->tag);
+        auto id = e->attrs.find(L"id");
+        if (id != e->attrs.end()) lookup(ruleIndex.byId, id->second);
+        if (!ruleIndex.byClass.empty() && e->attrs.count(L"class")) {
+            auto [it, inserted] = classCache.try_emplace(e);
+            if (inserted) {
+                std::wistringstream ss(e->attrs[L"class"]);
+                for (std::wstring c; ss >> c;) it->second.push_back(c);
+            }
+            for (const auto& c : it->second) lookup(ruleIndex.byClass, c);
         }
         std::stable_sort(matched.begin(), matched.end(),
             [](const CSS::Rule* a, const CSS::Rule* b) {
@@ -733,10 +753,24 @@ void LayoutRoot::layoutImage(Element* e, int x, int& y, int containingWidth, con
     y += box.height + style.marginBottom;
 }
 
+void LayoutRoot::rebuildRuleIndex() {
+    ruleIndex = RuleIndex{};
+    if (!rules) return;
+    for (const auto& rule : *rules) {
+        if (rule.chain.empty()) continue;
+        const CSS::CompoundSelector& last = rule.chain.back();
+        if (!last.id.empty()) ruleIndex.byId[last.id].push_back(&rule);
+        else if (!last.classes.empty()) ruleIndex.byClass[last.classes.front()].push_back(&rule);
+        else if (!last.tag.empty()) ruleIndex.byTag[last.tag].push_back(&rule);
+        else ruleIndex.universal.push_back(&rule);
+    }
+}
+
 void LayoutRoot::layout() {
     boxes.clear();
     ancestorStack.clear();
     classCache.clear(); // safe to reuse within this pass only - see its declaration in Layout.h
+    rebuildRuleIndex();
     if (!rootNode) return;
 
     int y = 10;
