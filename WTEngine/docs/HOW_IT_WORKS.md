@@ -231,7 +231,9 @@ Every other `@`-rule - `@supports`, `@import`, `@font-face`, `@keyframes`, a com
 
 | Property | Handling |
 |---|---|
-| `background`, `background-color` | Kept as a string; only `#rrggbb` is understood |
+| `background`, `background-color` | Any CSS color (see `color` below). `background-color` ignores an invalid value; the `background` shorthand keeps its first color token and drops the rest (`url(...)`, `no-repeat`, …), and a shorthand with no color at all (`none`, or only an image) clears it |
+| `color` | `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`, `rgb()`/`rgba()` (comma or space syntax, numbers or `%`, optional alpha), the 148 CSS named colors, and `transparent` (`tryParseColor`, `Engine.cpp`). Inherited (`LayoutRoot::TextPaint`, threaded down alongside `inheritedFontSize`). An invalid value, `inherit` or `currentcolor` keeps the inherited color. `<a href>` defaults to blue, which an author rule on the link overrides |
+| `font-weight` | `bold`/`bolder`/numeric >= 600 = bold; `normal`/`lighter`/numeric < 600 = regular. Only two weights exist (GDI Segoe UI regular/bold). Inherited. `<b>`, `<strong>`, `<th>` and `<h1>`-`<h6>` default to bold. Bold text is measured bold too, so wrapping stays correct |
 | `margin`, `padding` | Shorthand: 1/2/3/4 space-separated values, expanded per the usual CSS rule (`T`, `T/R`, `T/R-L/B`, `T/R/B/L`) |
 | `margin-top/right/bottom/left`, `padding-top/right/bottom/left` | Individually, px or `%` (of the containing block's width - CSS's rule for percentage margin/padding on every side, top/bottom included) |
 | `width` | px or `%` of the containing block's width; unset (or `auto`) fills the container, as always |
@@ -252,7 +254,7 @@ Every other `@`-rule - `@supports`, `@import`, `@font-face`, `@keyframes`, a com
 | `opacity`, `visibility` | `opacity <= 0` or `visibility: hidden`/`collapse` (own or inherited from an ancestor) makes an element's boxes skip painting (`LayoutBox::visuallyHidden`, checked in `Engine::render`) - but *not* layout: it still occupies its normal space, matching real CSS, unlike `display:none`. Click hit-testing is unaffected (a simplification - real CSS only blocks it for `visibility:hidden`, not `opacity`) |
 | `height` | Only the exact value `0` has any effect: it collapses a block box's content height to zero regardless of its children's natural size (`layoutBlockChild`), the same as real CSS's `height:0` - any other explicit value is parsed but ignored, same as before this existed. No `overflow` model exists to clip children that don't fit, so a `height:0` box's children still paint at their own real, un-collapsed positions unless they're also hidden via `opacity`/`visibility` - the pairing real pages actually use this for |
 
-Everything else (`color`, `float`, `position`, `font-weight`, …) is parsed and ignored. Text is always black; links are always blue. `em`/`rem` aren't supported for `width`/`margin`/`padding`/`border-width`/grid tracks/`gap` (only `font-size` resolves those) - use px or `%`.
+Everything else (`float`, `position`, `font-family`, `font-style`, the `font` shorthand, …) is parsed and ignored. `em`/`rem` aren't supported for `width`/`margin`/`padding`/`border-width`/grid tracks/`gap` (only `font-size` resolves those) - use px or `%`.
 
 `CSS::parseSelector` and `CSS::matches` are also reused by JS `querySelector`.
 
@@ -356,7 +358,7 @@ Clears any open dropdown, runs `layoutRoot.layout()`, recomputes `documentHeight
 3. If `domDirty` → clear it and re-layout.
 4. For each box: convert to screen space (`screenY = b.y − scrollY + topInset`), cull if off-screen, then
    - controls → `drawControl`,
-   - otherwise background rect → image (`drawImage`, then `continue`) → text (blue if it has an `href`, else black; drawn at `+4,+4` inside the box).
+   - otherwise background rect → image (`drawImage`, then `continue`) → text (`LayoutBox::color`, black when empty, and `LayoutBox::bold`; drawn at `+4,+4` inside the box).
 5. `drawOpenSelect` overlay.
 
 ### Coordinates
@@ -478,11 +480,11 @@ The user agent is `WTEngine/0.1`. Every caller of `fetchPage`/`fetchBytes` now r
 
 ## 14. Rendering (`Renderer.h`, `OpenGLRenderer.cpp`)
 
-`Renderer` is an abstract interface (`drawRect`, `drawText`, `measureText`, `drawImage`, `preloadImage`, `imageGeneration`, `setClip`, `clearClip`); `OpenGLRenderer` is the only implementation. `parseColor` (declared in `Renderer.h`, defined in `Engine.cpp`) turns `#rrggbb` into a `Color`.
+`Renderer` is an abstract interface (`drawRect`, `drawText`, `measureText`, `drawImage`, `preloadImage`, `imageGeneration`, `setClip`, `clearClip`); `OpenGLRenderer` is the only implementation. `parseColor`/`tryParseColor` (declared in `Renderer.h`, defined in `Engine.cpp`) turn any CSS color from §8 into a `Color`; `parseColor` falls back to light gray, `tryParseColor` returns false so callers can ignore invalid values. `drawText`/`measureText` take an optional `bold` flag.
 
 - **Projection:** `glOrtho(0, w, h, 0)` — top-left origin, y down. `scrollY` is not passed to the renderer; `Engine` subtracts it before drawing.
 - **Rects:** immediate-mode `GL_QUADS`.
-- **Text:** rendered once with GDI (white on black into a DIB, Segoe UI, anti-aliased), converted so brightness becomes alpha, and uploaded as an RGBA texture. The colour is applied at draw time via `glColor4f`, so one texture serves any colour. Cached in `textCache` keyed by `text@size`. **The cache never evicts.**
+- **Text:** rendered once with GDI (white on black into a DIB, Segoe UI, anti-aliased), converted so brightness becomes alpha, and uploaded as an RGBA texture. The colour is applied at draw time via `glColor4f`, so one texture serves any colour. Cached in `textCache` keyed by `text@size` (plus a `b` suffix for bold). **The cache never evicts.**
 - **`measureText`:** GDI `GetTextExtentPoint32W` with a cached `HFONT` per size, so measuring doesn't create textures.
 - **Clipping:** `glScissor`, with y flipped to OpenGL's bottom-left origin.
 
@@ -519,10 +521,10 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 **HTML / CSS**
 - Sloppy HTML nests wrongly (any end tag closes the current element; no implied end tags).
 - `<title>` is discarded, so the window title is the URL.
-- Colours: only `#rrggbb`. Named colours (`red`), `#rgb`, `rgb(...)` and malformed values (e.g. `#gggggg`) all fall back to light gray. (`parseColor` validates the hex digits, so bad input can't crash the engine.)
+- Colours: `hsl()`, `color-mix()`, `currentcolor` as a background, and `var(--x)` custom properties are not understood (an invalid `color` is ignored; an invalid background falls back to light gray). Only regular and bold weights exist; no italics or `font-family`.
 - External stylesheets (`<link rel=stylesheet>`) are fetched and applied, but always cascade after every inline `<style>` block regardless of true document order (§10). `@media` is evaluated for a bare type and/or `min-width`/`max-width` (§8, resize-reactive since layout already fully re-runs on resize); everything else (`@supports`, other features, comma query lists, pseudo-classes, attribute selectors, child/sibling combinators) is not. **Confirmed fixed end-to-end on a real page:** Wikipedia's collapsible "Main menu" panel was hidden by `.vector-dropdown-content{opacity:0;height:0;visibility:hidden;...}`, nested inside a real ~36KB `@media screen{...}` block - fixed by `opacity`/`visibility` support, bare-media-type `@media`, and `height:0` collapse landing together (all §8). Verified by reloading the real page: the dropdown's menu items no longer render inline at the top, replaced by just the real "Main menu"/"Search" labels - the header box is still taller than a real browser's, most likely from other hidden dropdowns in the same header or generic box-model padding differences, not investigated further.
 - **Partially confirmed on the same real page:** Wikipedia's responsive sidebar-beside-content layout (`grid-template-areas` on `.mw-page-container-inner`/`.mw-body`) is gated behind `@media screen and (min-width:1120px)`, now evaluated (§8). At a wide window, the page visibly changes - header items spread out differently and the article text now renders in a constrained, centered column instead of full window width, confirming the width-conditioned rules are reaching real elements - but no left-hand navigation sidebar appears beside the content in that view. Not narrowed down further: real candidates are JS-toggled "pinned" state classes (`vector-feature-main-menu-pinned-disabled` and similar - already noted elsewhere as a likely gap given this engine's limited JS/DOM surface) or another still-unevaluated rule overriding the sidebar's own hidden state specifically at wide viewports. Treat as an open, layered investigation, not a confirmed fix.
-- Only the properties in §8 are honoured. `width`/`border`/`box-sizing` work for plain block and grid/flex-item elements (not for form controls or `<img>`); `height` only has an effect at exactly `0` (§8) - any other value is still ignored, and there's no `overflow` model to clip a non-collapsed box's overflowing content. No floats, positioning, or text colour/weight. Border is always solid-colored; `border-radius`/`border-style` aren't read. `opacity`/`visibility` are supported as a "keep the space, skip the paint" hide mechanism (§8) - not a general implementation of either property (no partial-opacity blending, no `visibility:collapse`'s table-specific behavior).
+- Only the properties in §8 are honoured. `width`/`border`/`box-sizing` work for plain block and grid/flex-item elements (not for form controls or `<img>`); `height` only has an effect at exactly `0` (§8) - any other value is still ignored, and there's no `overflow` model to clip a non-collapsed box's overflowing content. No floats or positioning. Border is always solid-colored; `border-radius`/`border-style` aren't read. `opacity`/`visibility` are supported as a "keep the space, skip the paint" hide mechanism (§8) - not a general implementation of either property (no partial-opacity blending, no `visibility:collapse`'s table-specific behavior).
 - Grid supports column and row tracks (px/%/fr for columns; `fr` rows fall back to auto - no definite container height to distribute against), `gap`, row-major auto-placement, named-area placement (`grid-template-areas`/`grid-area`, and the `grid-template` shorthand's area-string form), and explicit line-based placement (`grid-column`/`grid-row`, both axes required together - see §9). Auto-placed items fill gaps left by explicit ones less tightly than real CSS's own algorithm does; a named area's cells aren't checked for forming a proper rectangle (its bounding box is used regardless). Not supported: `justify-*`/`align-*` and subgrid. A bare text node directly inside a grid container is dropped rather than becoming an anonymous item.
 - Flex supports `flex-direction` (row/column), `justify-content`, `align-items`, `flex-grow`, and `gap` - see §9's Flex subsection for exactly what each does and doesn't do on each axis. Not spec-accurate for row-direction sizing: an item with neither an explicit `width` nor `flex-grow` gets an equal share of leftover space rather than being sized by its content, since this engine has no min/max-content sizing anywhere to size it by. Not supported at all: `flex-wrap`, `flex-shrink`, `flex-basis`, `align-content`, `align-self`, `order`.
 - Radio buttons, file inputs, `<textarea>` (content dropped), and multi-line inputs are not supported. A `<select>` shows only direct `<option>` children (no `<optgroup>`).
@@ -583,14 +585,12 @@ Rules of thumb for any binding: convert strings with `argStr` / `jsStr`; never s
 2. Push a `LayoutBox` with `background = L"#999999"`, `height = 2`, `width = containingWidth`, at the current `y`; advance `y` by the height plus margins.
 3. Nothing else is needed — `Engine::render` already paints any box that has a background.
 
-### Example C — a new CSS property: `color`
-This one crosses several layers, because `color` is **inherited** (like `font-size`):
-1. `Layout.h`: add `std::wstring color` to `ComputedStyle` and `LayoutBox`, and to `InlineItem`.
-2. `Layout.cpp`, `computeStyle`: start `sv.color` from an inherited value passed in (thread an `inheritedColor` parameter through `layoutElement`, `collectInline` and `computeStyle`, exactly as `inheritedFontSize` is), and handle `k == L"color"` in `applyDecl`.
-3. `appendWords` / `layoutInlineRun`: copy the colour from `InlineItem` into the emitted `LayoutBox`.
-4. `Engine::render` (`Engine.cpp`): where text is drawn, use `parseColor(b.color)` when set, otherwise the current black/blue-link default.
-
-Start by making it non-inherited (apply only to an element's own direct text) if you want a quick first version, then add inheritance.
+### Example C — an inherited CSS property: `color` / `font-weight` (implemented)
+Read this as a map of how `color` and `font-weight` were added; a new inherited text property follows the same path. It crosses several layers, because both are **inherited** (like `font-size`):
+1. `Layout.h`: the value lives in `LayoutRoot::TextPaint` (`color`, `bold`), held by `ComputedStyle::paint` and `InlineItem::paint`, and copied onto `LayoutBox::color`/`bold`.
+2. `Layout.cpp`, `computeStyle`: `sv.paint` starts from the `inheritedPaint` parameter (threaded through `layoutElement`, `collectInline`, `computeStyle` and the grid/flex item calls, exactly as `inheritedFontSize` is), then the tag's default (`<a href>` blue, `<b>`/`<strong>`/`<th>`/headings bold), then `applyDecl`'s `color`/`font-weight` branches.
+3. `appendWords` / `layoutInlineRun`: copy `paint` from `InlineItem` into the emitted `LayoutBox`. Anything that changes glyph width (like bold) must also reach `textWidth`, or wrapping will be measured with the wrong font.
+4. `Engine::render` (`Engine.cpp`): text is drawn with `parseColor(b.color)` (black when empty) and `b.bold`.
 
 ### Example D — a new event type (e.g. `mouseover`, `keydown`)
 1. Decide where the native event is caught (`main.cpp` callback) and forward it into `Engine` (like `dispatchClick`).
