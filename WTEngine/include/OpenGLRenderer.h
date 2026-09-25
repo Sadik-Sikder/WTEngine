@@ -56,8 +56,8 @@ public:
 
     void drawRect(float x, float y, float w, float h, Color color) override;
     void drawText(float x, float y, const std::wstring& text,
-        float fontSize, Color color) override;
-    float measureText(const std::wstring& text, float fontSize) override;
+        float fontSize, Color color, bool bold = false) override;
+    float measureText(const std::wstring& text, float fontSize, bool bold = false) override;
     void drawImage(float x, float y, float w, float h, const std::wstring& url) override;
     bool preloadImage(const std::wstring& url, int& outWidth, int& outHeight) override;
     int imageGeneration() const override { return imageGen; }
@@ -68,9 +68,9 @@ private:
     std::map<std::wstring, TextTexture> textCache;
     int frameHeight = 0; // framebuffer height, for flipping scissor coordinates
     HDC measureDC = nullptr;
-    std::map<int, HFONT> measureFonts; // font size -> font, for measureText
+    std::map<std::pair<int, bool>, HFONT> measureFonts; // (font size, bold) -> font, for measureText
     bool comInitialized = false; // whether we own COM's lifetime (needed for WIC image decoding)
-    const TextTexture& getOrCreateTextTexture(const std::wstring& text, float fontSize);
+    const TextTexture& getOrCreateTextTexture(const std::wstring& text, float fontSize, bool bold);
 
     // --- Background image loading -------------------------------------
     // A fixed-size pool of worker threads (not one thread per image, which

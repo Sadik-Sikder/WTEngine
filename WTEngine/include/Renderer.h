@@ -6,8 +6,12 @@ struct Color {
     float r, g, b, a;
 };
 
-// Parses a CSS-style "#rrggbb" color; anything else (empty, malformed, a
-// named color) falls back to light gray. Defined in Engine.cpp.
+// Parses a CSS color: #rgb/#rgba/#rrggbb/#rrggbbaa, rgb()/rgba() (comma or
+// space syntax, numbers or percentages), a named color, or "transparent".
+// tryParseColor returns false for anything else (so a caller can tell
+// "inherit"/garbage apart from a real color); parseColor instead falls back
+// to light gray. Both defined in Engine.cpp.
+bool tryParseColor(const std::wstring& str, Color& out);
 Color parseColor(const std::wstring& str);
 
 class Renderer {
@@ -18,9 +22,12 @@ public:
     virtual void endFrame() = 0;
 
     virtual void drawRect(float x, float y, float w, float h, Color color) = 0;
+    // `bold` selects the bold weight of the same face; measureText must be
+    // given the same flag the text will be drawn with, since bold glyphs
+    // are wider.
     virtual void drawText(float x, float y, const std::wstring& text,
-        float fontSize, Color color) = 0;
-    virtual float measureText(const std::wstring& text, float fontSize) = 0;
+        float fontSize, Color color, bool bold = false) = 0;
+    virtual float measureText(const std::wstring& text, float fontSize, bool bold = false) = 0;
 
     // Draws the image at `url` (already resolved to an absolute URL or local
     // path) into the given box. Fetches and decodes lazily on first use and

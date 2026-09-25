@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "Layout.h"
+#include "Renderer.h" // tryParseColor
 #include <windows.h>
 #include <string>
 #include <sstream>
@@ -120,8 +121,8 @@ void LayoutRoot::parseBoxShorthand(const std::wstring& v, int containingWidth, i
     }
 }
 
-float LayoutRoot::textWidth(const std::wstring& text, int fontSize) {
-    if (measureText) return measureText(text, fontSize);
+float LayoutRoot::textWidth(const std::wstring& text, int fontSize, bool bold) {
+    if (measureText) return measureText(text, fontSize, bold);
     return text.size() * fontSize * 0.55f; // rough fallback
 }
 
@@ -142,14 +143,15 @@ static bool isInlineTag(const std::wstring& tag) {
 // `fontSize`/`href`/`owner` - the same tokenization layoutInlineRun's
 // predecessor (layoutText) used to wrap a single string.
 void LayoutRoot::appendWords(const std::wstring& text, int fontSize, const std::wstring& href,
-                              Element* owner, std::vector<InlineItem>& out, bool visuallyHidden) {
+                              Element* owner, std::vector<InlineItem>& out, bool visuallyHidden,
+                              const TextPaint& paint) {
     size_t i = 0;
     while (i < text.size()) {
         while (i < text.size() && iswspace(text[i])) i++;
         size_t start = i;
         while (i < text.size() && !iswspace(text[i])) i++;
         if (start == i) break;
-        out.push_back({ text.substr(start, i - start), fontSize, href, owner, false, visuallyHidden });
+        out.push_back({ text.substr(start, i - start), fontSize, href, owner, false, visuallyHidden, paint });
     }
 }
 
@@ -161,13 +163,13 @@ void LayoutRoot::appendWords(const std::wstring& text, int fontSize, const std::
 // <a><div>) is flattened into the run rather than specially promoted, since
 // that combination is rare and not worth the extra complexity.
 void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containingWidth, std::vector<InlineItem>& out,
-                                bool inheritedVisuallyHidden) {
+                                bool inheritedVisuallyHidden, const TextPaint& inheritedPaint) {
     ancestorStack.push_back(el);
 
     for (auto& child : el->children) {
         if (child->type == Node::TEXT) {
             auto tnode = static_cast<TextNode*>(child.get());
-            appendWords(tnode->text, inheritedFontSize, currentHref, el, out, inheritedVisuallyHidden);
+            appendWords(tnode->text, inheritedFontSize, currentHref, el, out, inheritedVisuallyHidden, inheritedPaint);
             continue;
         }
 
@@ -178,11 +180,11 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containin
             continue;
 
         if (e->tag == L"br") {
-            out.push_back({ L"", inheritedFontSize, L"", nullptr, true, inheritedVisuallyHidden });
+            out.push_back({ L"", inheritedFontSize, L"", nullptr, true, inheritedVisuallyHidden, inheritedPaint });
             continue;
         }
 
-        ComputedStyle sv = computeStyle(e, inheritedFontSize, containingWidth, inheritedVisuallyHidden);
+        ComputedStyle sv = computeStyle(e, inheritedFontSize, containingWidth, inheritedVisuallyHidden, inheritedPaint);
         if (sv.display == Display::None) continue;
 
         std::wstring savedHref = currentHref;
@@ -190,7 +192,7 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containin
             auto href = e->attrs.find(L"href");
             if (href != e->attrs.end()) currentHref = href->second;
         }
-        collectInline(e, sv.fontSize, containingWidth, out, sv.visuallyHidden);
+        collectInline(e, sv.fontSize, containingWidth, out, sv.visuallyHidden, sv.paint);
         currentHref = savedHref;
     }
 
@@ -220,11 +222,13 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
             LayoutBox box;
             box.x = x + (int)std::lround(p.offset);
             box.y = y;
-            box.width = (int)std::lround(textWidth(p.item.word, p.item.fontSize));
+            box.width = (int)std::lround(textWidth(p.item.word, p.item.fontSize, p.item.paint.bold));
             box.height = lineHeight;
             box.text = p.item.word;
             box.href = p.item.href;
             box.fontSize = p.item.fontSize;
+            box.color = p.item.paint.color;
+            box.bold = p.item.paint.bold;
             box.el = p.item.owner;
             box.visuallyHidden = p.item.visuallyHidden;
             boxes.push_back(box);
@@ -239,7 +243,7 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
         if (raw.word.empty()) continue;
 
         InlineItem item = raw;
-        float wordWidth = textWidth(item.word, item.fontSize);
+        float wordWidth = textWidth(item.word, item.fontSize, item.paint.bold);
 
         // A word wider than the line on its own gets broken by characters,
         // one fragment per line, before whatever's left of it (now short
@@ -247,17 +251,17 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
         while (wordWidth > maxWidth && item.word.size() > 1) {
             if (!line.empty()) emitLine();
             size_t n = 1;
-            while (n < item.word.size() && textWidth(item.word.substr(0, n + 1), item.fontSize) <= maxWidth) n++;
+            while (n < item.word.size() && textWidth(item.word.substr(0, n + 1), item.fontSize, item.paint.bold) <= maxWidth) n++;
             InlineItem fragment = item;
             fragment.word = item.word.substr(0, n);
             line.push_back({ fragment, 0 });
             emitLine();
             item.word.erase(0, n);
-            wordWidth = textWidth(item.word, item.fontSize);
+            wordWidth = textWidth(item.word, item.fontSize, item.paint.bold);
         }
         if (item.word.empty()) continue;
 
-        float spaceWidth = line.empty() ? 0 : textWidth(L" ", item.fontSize);
+        float spaceWidth = line.empty() ? 0 : textWidth(L" ", item.fontSize, item.paint.bold);
         if (!line.empty() && lineWidth + spaceWidth + wordWidth > maxWidth) emitLine();
 
         float offset = line.empty() ? 0 : lineWidth + spaceWidth;
@@ -289,13 +293,63 @@ static std::wstring firstText(Element* el) {
 // specific, source order breaking ties), then inline style="" - which, per
 // CSS, always wins regardless of specificity.
 LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFontSize, int containingWidth,
-                                                     bool inheritedVisuallyHidden) {
+                                                     bool inheritedVisuallyHidden, const TextPaint& inheritedPaint) {
     ComputedStyle sv;
     sv.fontSize = inheritedFontSize; // inherited unless a rule below overrides it
     sv.display = isInlineTag(e->tag) ? Display::Inline : Display::Block;
 
+    // color/font-weight: inherited, then the tag's own default (what a
+    // browser's built-in stylesheet would give it), then author rules.
+    sv.paint = inheritedPaint;
+    if (e->tag == L"a" && e->attrs.count(L"href")) sv.paint.color = L"#0033cc";
+    if (e->tag == L"b" || e->tag == L"strong" || e->tag == L"th" ||
+        (e->tag.size() == 2 && e->tag[0] == L'h' && e->tag[1] >= L'1' && e->tag[1] <= L'6'))
+        sv.paint.bold = true;
+
     auto applyDecl = [&](const std::wstring& k, const std::wstring& v) {
-        if (k == L"background" || k == L"background-color") sv.background = v;
+        if (k == L"background-color") {
+            Color unused;
+            if (tryParseColor(v, unused)) sv.background = v;
+        }
+        else if (k == L"background") {
+            // The shorthand can carry an image, position, repeat, etc.
+            // alongside the color ("#fff url(x.png) no-repeat") - keep just
+            // the first whitespace-separated token that's a color. Tokens
+            // are split outside parentheses so "rgb(1, 2, 3)" stays whole.
+            std::wstring token;
+            int depth = 0;
+            Color unused;
+            bool found = false;
+            for (size_t i = 0; i <= v.size() && !found; i++) {
+                wchar_t c = i < v.size() ? v[i] : L' ';
+                if (c == L'(') depth++;
+                else if (c == L')') depth--;
+                if (iswspace(c) && depth <= 0) {
+                    if (!token.empty() && tryParseColor(token, unused)) { sv.background = token; found = true; }
+                    token.clear();
+                } else {
+                    token += c;
+                }
+            }
+            // "background: none" (or only an image) clears any earlier color.
+            if (!found) sv.background.clear();
+        }
+        else if (k == L"color") {
+            // inherit/currentcolor keep the inherited value; anything that
+            // isn't a valid color is ignored, same as a real browser.
+            Color unused;
+            if (v == L"initial" || v == L"unset") sv.paint.color.clear();
+            else if (tryParseColor(v, unused)) sv.paint.color = v;
+        }
+        else if (k == L"font-weight") {
+            if (v == L"bold" || v == L"bolder") sv.paint.bold = true;
+            else if (v == L"normal" || v == L"lighter" || v == L"initial" || v == L"unset") sv.paint.bold = false;
+            else {
+                // Numeric weight: 600 and up is what GDI (and browsers,
+                // with only a regular/bold pair of faces) render as bold.
+                try { sv.paint.bold = std::stoi(v) >= 600; } catch (...) {}
+            }
+        }
         else if (k == L"margin") {
             parseBoxShorthand(v, containingWidth, 6, sv.marginTop, sv.marginRight, sv.marginBottom, sv.marginLeft);
         }
@@ -686,11 +740,11 @@ void LayoutRoot::layout() {
     if (!rootNode) return;
 
     int y = 10;
-    layoutElement(static_cast<Element*>(rootNode), 10, y, viewportWidth - 20, 14, false);
+    layoutElement(static_cast<Element*>(rootNode), 10, y, viewportWidth - 20, 14, false, TextPaint{});
 }
 
 void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, int inheritedFontSize,
-                                bool inheritedVisuallyHidden) {
+                                bool inheritedVisuallyHidden, const TextPaint& inheritedPaint) {
     if (!el) return;
     ancestorStack.push_back(el); // `el` is an ancestor of every child laid out below
 
@@ -712,7 +766,7 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
         // Case 1: Text node (simple paragraph text)
         if (child->type == Node::TEXT) {
             auto tnode = static_cast<TextNode*>(child.get());
-            appendWords(tnode->text, inheritedFontSize, currentHref, el, pendingInline, inheritedVisuallyHidden);
+            appendWords(tnode->text, inheritedFontSize, currentHref, el, pendingInline, inheritedVisuallyHidden, inheritedPaint);
         }
 
         //  Case 2: Element node (<div>, <p>, <span>, etc.)
@@ -730,11 +784,11 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
                 continue;
 
             if (e->tag == L"br") {
-                pendingInline.push_back({ L"", inheritedFontSize, L"", nullptr, true, inheritedVisuallyHidden });
+                pendingInline.push_back({ L"", inheritedFontSize, L"", nullptr, true, inheritedVisuallyHidden, inheritedPaint });
                 continue;
             }
 
-            ComputedStyle sv = computeStyle(e, inheritedFontSize, containingWidth, inheritedVisuallyHidden);
+            ComputedStyle sv = computeStyle(e, inheritedFontSize, containingWidth, inheritedVisuallyHidden, inheritedPaint);
             if (sv.display == Display::None) continue; // this element and its subtree take no space
 
             if (e->tag == L"input" || e->tag == L"button" || e->tag == L"select") {
@@ -758,7 +812,7 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
                     auto href = e->attrs.find(L"href");
                     if (href != e->attrs.end()) currentHref = href->second;
                 }
-                collectInline(e, sv.fontSize, containingWidth, pendingInline, sv.visuallyHidden);
+                collectInline(e, sv.fontSize, containingWidth, pendingInline, sv.visuallyHidden, sv.paint);
                 currentHref = savedHref;
                 continue;
             }
@@ -833,7 +887,7 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     int childX = boxX + sv.borderWidth + sv.paddingLeft;
     if (sv.display == Display::Grid) layoutGrid(e, childX, y, contentWidth, sv);
     else if (sv.display == Display::Flex) layoutFlex(e, childX, y, contentWidth, sv);
-    else layoutElement(e, childX, y, contentWidth, sv.fontSize, sv.visuallyHidden);
+    else layoutElement(e, childX, y, contentWidth, sv.fontSize, sv.visuallyHidden, sv.paint);
 
     currentHref = savedHref;
     currentForm = savedForm;
@@ -885,7 +939,7 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
         if (ce->tag == L"head" || ce->tag == L"script" || ce->tag == L"style" ||
             ce->tag == L"title" || ce->tag == L"meta" || ce->tag == L"link" || ce->tag == L"base")
             continue;
-        ComputedStyle cs = computeStyle(ce, style.fontSize, containingWidth, style.visuallyHidden);
+        ComputedStyle cs = computeStyle(ce, style.fontSize, containingWidth, style.visuallyHidden, style.paint);
         if (cs.display == Display::None) continue;
 
         ItemPlacement p;
@@ -995,7 +1049,7 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
         // Re-resolve against the item's real span width, not the
         // container's - matters for any %-based property on the item
         // itself (its own padding/margin/width), same reason layoutFlex does.
-        ComputedStyle real = computeStyle(p.el, style.fontSize, spanWidth, p.style.visuallyHidden);
+        ComputedStyle real = computeStyle(p.el, style.fontSize, spanWidth, p.style.visuallyHidden, style.paint);
 
         std::vector<LayoutBox> scratch;
         std::swap(boxes, scratch); // redirect every push_back below into `scratch`
@@ -1114,7 +1168,7 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
         if (ce->tag == L"head" || ce->tag == L"script" || ce->tag == L"style" ||
             ce->tag == L"title" || ce->tag == L"meta" || ce->tag == L"link" || ce->tag == L"base")
             continue;
-        ComputedStyle cs = computeStyle(ce, style.fontSize, containingWidth, style.visuallyHidden);
+        ComputedStyle cs = computeStyle(ce, style.fontSize, containingWidth, style.visuallyHidden, style.paint);
         if (cs.display == Display::None) continue;
         if (cs.display == Display::Inline) cs.display = Display::Block; // a flex item is always block-level, like a grid item
         items.push_back(ce);
@@ -1144,7 +1198,7 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
             // - matters for any %-based property on the item itself (e.g.
             // its own padding/margin), same reason layoutGrid re-resolves
             // per column width instead of reusing its first pass.
-            ComputedStyle real = computeStyle(items[i], style.fontSize, itemWidth, itemStyles[i].visuallyHidden);
+            ComputedStyle real = computeStyle(items[i], style.fontSize, itemWidth, itemStyles[i].visuallyHidden, style.paint);
 
             std::vector<LayoutBox> scratch;
             std::swap(boxes, scratch);
@@ -1205,7 +1259,7 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
     std::vector<int> itemHeights(n);
     int rowHeight = 0;
     for (int i = 0; i < n; i++) {
-        ComputedStyle real = computeStyle(items[i], style.fontSize, itemWidths[i], itemStyles[i].visuallyHidden); // see the column-direction branch's comment on why
+        ComputedStyle real = computeStyle(items[i], style.fontSize, itemWidths[i], itemStyles[i].visuallyHidden, style.paint); // see the column-direction branch's comment on why
         std::vector<LayoutBox> scratch;
         std::swap(boxes, scratch);
         int localY = 0;

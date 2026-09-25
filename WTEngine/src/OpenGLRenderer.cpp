@@ -105,8 +105,8 @@ OpenGLRenderer::~OpenGLRenderer() {
 // brightness becomes its alpha. Drawing that texture with glColor4f(color)
 // then tints the (already anti-aliased) glyph shapes to any color we want,
 // without baking a color into the cached texture itself.
-const TextTexture& OpenGLRenderer::getOrCreateTextTexture(const std::wstring& text, float fontSize) {
-    std::wstring key = text + L"@" + std::to_wstring((int)fontSize);
+const TextTexture& OpenGLRenderer::getOrCreateTextTexture(const std::wstring& text, float fontSize, bool bold) {
+    std::wstring key = text + L"@" + std::to_wstring((int)fontSize) + (bold ? L"b" : L"");
     auto it = textCache.find(key);
     if (it != textCache.end()) return it->second;
 
@@ -114,7 +114,7 @@ const TextTexture& OpenGLRenderer::getOrCreateTextTexture(const std::wstring& te
     HDC memDC = CreateCompatibleDC(screenDC);
 
     HFONT font = CreateFontW(
-        -(int)fontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        -(int)fontSize, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     HFONT oldFont = (HFONT)SelectObject(memDC, font);
@@ -205,10 +205,10 @@ void OpenGLRenderer::drawRect(float x, float y, float w, float h, Color color) {
 }
 
 void OpenGLRenderer::drawText(float x, float y, const std::wstring& text,
-    float fontSize, Color color) {
+    float fontSize, Color color, bool bold) {
     if (text.empty()) return;
 
-    const TextTexture& tex = getOrCreateTextTexture(text, fontSize);
+    const TextTexture& tex = getOrCreateTextTexture(text, fontSize, bold);
 
     glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, tex.id);
@@ -343,19 +343,19 @@ bool OpenGLRenderer::preloadImage(const std::wstring& url, int& outWidth, int& o
 
 // Measures with the same font the textures are rasterized with, but without
 // creating a texture (layout measures many strings that are never drawn).
-float OpenGLRenderer::measureText(const std::wstring& text, float fontSize) {
+float OpenGLRenderer::measureText(const std::wstring& text, float fontSize, bool bold) {
     if (text.empty()) return 0;
 
     if (!measureDC) measureDC = CreateCompatibleDC(nullptr);
 
     int size = (int)fontSize;
-    auto it = measureFonts.find(size);
+    auto it = measureFonts.find({ size, bold });
     if (it == measureFonts.end()) {
         HFONT font = CreateFontW(
-            -size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            -size, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        it = measureFonts.emplace(size, font).first;
+        it = measureFonts.emplace(std::make_pair(size, bold), font).first;
     }
 
     HFONT old = (HFONT)SelectObject(measureDC, it->second);
