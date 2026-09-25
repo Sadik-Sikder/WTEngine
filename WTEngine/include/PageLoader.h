@@ -38,6 +38,11 @@ public:
     // eventually finishes.
     void cancel();
 
+    // True while a navigation is in flight - from start() until poll()
+    // hands its result over (or cancel()). Drives the Reload button's
+    // Stop state.
+    bool loading() const { return current_ != nullptr; }
+
     // Called once per frame. Returns true (and fills every out-param) the
     // moment the in-flight fetch finishes - or once it's been running
     // longer than kTimeout, in which case outResult.ok is false and
