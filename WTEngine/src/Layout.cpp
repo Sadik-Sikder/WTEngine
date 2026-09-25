@@ -278,6 +278,27 @@ static std::wstring lowerCase(std::wstring s) {
     return s;
 }
 
+// Splits a shorthand value into whitespace-separated tokens, keeping
+// anything inside parentheses whole - "1px solid rgb(0, 0, 0)" gives
+// {"1px", "solid", "rgb(0, 0, 0)"}.
+static std::vector<std::wstring> cssTokens(const std::wstring& v) {
+    std::vector<std::wstring> out;
+    std::wstring token;
+    int depth = 0;
+    for (size_t i = 0; i <= v.size(); i++) {
+        wchar_t c = i < v.size() ? v[i] : L' ';
+        if (c == L'(') depth++;
+        else if (c == L')' && depth > 0) depth--;
+        if (iswspace(c) && depth == 0) {
+            if (!token.empty()) out.push_back(token);
+            token.clear();
+        } else {
+            token += c;
+        }
+    }
+    return out;
+}
+
 // First piece of text inside an element (used for <button> labels).
 static std::wstring firstText(Element* el) {
     for (auto& child : el->children) {
@@ -314,25 +335,13 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         else if (k == L"background") {
             // The shorthand can carry an image, position, repeat, etc.
             // alongside the color ("#fff url(x.png) no-repeat") - keep just
-            // the first whitespace-separated token that's a color. Tokens
-            // are split outside parentheses so "rgb(1, 2, 3)" stays whole.
-            std::wstring token;
-            int depth = 0;
+            // the first token that's a color. "background: none" (or only
+            // an image) clears any earlier color.
             Color unused;
-            bool found = false;
-            for (size_t i = 0; i <= v.size() && !found; i++) {
-                wchar_t c = i < v.size() ? v[i] : L' ';
-                if (c == L'(') depth++;
-                else if (c == L')') depth--;
-                if (iswspace(c) && depth <= 0) {
-                    if (!token.empty() && tryParseColor(token, unused)) { sv.background = token; found = true; }
-                    token.clear();
-                } else {
-                    token += c;
-                }
+            sv.background.clear();
+            for (const auto& tok : cssTokens(v)) {
+                if (tryParseColor(tok, unused)) { sv.background = tok; break; }
             }
-            // "background: none" (or only an image) clears any earlier color.
-            if (!found) sv.background.clear();
         }
         else if (k == L"color") {
             // inherit/currentcolor keep the inherited value; anything that
@@ -374,13 +383,13 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         else if (k == L"border-width") sv.borderWidth = resolveLength(v, containingWidth, 0);
         else if (k == L"border") {
             // Shorthand, e.g. "1px solid #333": scan whitespace-separated
-            // tokens for a length and a "#rrggbb" color. The style keyword
+            // tokens for a length and a color (any CSS color). The style keyword
             // (solid/dashed/...) is accepted but has nothing to key off of -
             // every border is drawn the same way, a solid-colored frame.
-            std::wistringstream ss(v);
-            std::wstring tok;
-            while (ss >> tok) {
-                if (!tok.empty() && tok[0] == L'#') sv.borderColor = tok;
+            Color unused;
+            for (const auto& tok : cssTokens(v)) {
+                if (tryParseColor(tok, unused)) sv.borderColor = tok;
+                else if (tok == L"none" || tok == L"hidden") sv.borderWidth = 0;
                 else {
                     int len = resolveLength(tok, containingWidth, -1);
                     if (len >= 0) sv.borderWidth = len;
