@@ -124,6 +124,7 @@ private:
     // controls, so both respond to the same CSS/inline styling.
     enum class Display { Block, Inline, None, Grid, Flex };
     enum class FlexDirection { Row, Column };
+    enum class FlexWrap { NoWrap, Wrap, WrapReverse };
     enum class JustifyContent { FlexStart, Center, FlexEnd, SpaceBetween, SpaceAround };
     // Only Stretch (the default) and FlexStart/Center/FlexEnd's cross-axis
     // *positioning* are supported - see layoutFlex's comment for exactly
@@ -202,6 +203,15 @@ private:
         // 0 (unset) is the real CSS default too - an item only grows if
         // this is explicitly positive.
         float flexGrow = 0;
+        bool flexGrowSet = false; // distinguishes an explicit flex-grow:0 (or flex:none) from unset
+        // How much of a line's overflow this item gives up, weighted by
+        // its basis (the spec's "scaled shrink factor"). 1 is the CSS default.
+        float flexShrink = 1;
+        // Outer px, or -1 for auto (fall back to `width`). Set by
+        // flex-basis or the `flex` shorthand (`flex: 1` means a basis of 0).
+        int flexBasis = -1;
+        // Only meaningful with display:flex, on the container.
+        FlexWrap flexWrap = FlexWrap::NoWrap;
         // Raw `opacity`/`visibility` as authored, plus the resolved,
         // inheritance-aware flag layout code actually checks (own opacity
         // <= 0, own visibility:hidden, or an ancestor already hidden this
@@ -307,6 +317,16 @@ private:
     // that axis - the same behavior real CSS shows for an auto-height
     // flex column, not a shortcut unique to this engine.
     void layoutFlex(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
+    // Lays out one flex/grid item (a control, an image, or a block) at
+    // local origin (0, 0) and `width`, returning its boxes instead of
+    // appending them to `boxes`; `height` receives how tall it came out.
+    std::vector<LayoutBox> layoutItemDetached(Element* item, int width, const ComputedStyle& style, int& height);
+    // A shrink-to-fit width for an item with no width of its own: lays it
+    // out at `available` and measures how far right its content (text,
+    // images, controls) actually reaches, plus its right padding/border/
+    // margin. Stands in for the max-content size this engine otherwise has
+    // no notion of; capped at `available`.
+    int shrinkToFitWidth(Element* item, const ComputedStyle& style, int available);
 
     // Ancestors of the element layoutElement is currently iterating the
     // children of (root first); used to match descendant selectors ("a b").

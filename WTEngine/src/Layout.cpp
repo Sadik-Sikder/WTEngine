@@ -443,7 +443,9 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             else if (v == L"flex") sv.display = Display::Flex;
         }
         else if (k == L"flex-direction") {
-            sv.flexDirection = (v == L"column") ? FlexDirection::Column : FlexDirection::Row; // any other/unrecognized value falls back to row, the real default
+            // The -reverse variants are laid out unreversed; anything
+            // unrecognized falls back to row, the real default.
+            sv.flexDirection = (v == L"column" || v == L"column-reverse") ? FlexDirection::Column : FlexDirection::Row;
         }
         else if (k == L"justify-content") {
             if (v == L"center") sv.justifyContent = JustifyContent::Center;
@@ -459,15 +461,54 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             else sv.alignItems = AlignItems::Stretch;
         }
         else if (k == L"flex-grow") {
-            try { sv.flexGrow = std::stof(v); } catch (...) {}
+            try { sv.flexGrow = std::stof(v); sv.flexGrowSet = true; } catch (...) {}
+        }
+        else if (k == L"flex-shrink") {
+            try { sv.flexShrink = std::max(std::stof(v), 0.0f); } catch (...) {}
+        }
+        else if (k == L"flex-basis") {
+            sv.flexBasis = (v == L"auto" || v == L"content") ? -1 : resolveLength(v, containingWidth, -1);
+        }
+        else if (k == L"flex-wrap") {
+            sv.flexWrap = v == L"wrap" ? FlexWrap::Wrap : v == L"wrap-reverse" ? FlexWrap::WrapReverse : FlexWrap::NoWrap;
+        }
+        else if (k == L"flex-flow") {
+            // "<direction> <wrap>" in either order, either part optional.
+            for (const auto& tok : cssTokens(v)) {
+                if (tok == L"row" || tok == L"row-reverse") sv.flexDirection = FlexDirection::Row;
+                else if (tok == L"column" || tok == L"column-reverse") sv.flexDirection = FlexDirection::Column;
+                else if (tok == L"wrap") sv.flexWrap = FlexWrap::Wrap;
+                else if (tok == L"wrap-reverse") sv.flexWrap = FlexWrap::WrapReverse;
+                else if (tok == L"nowrap") sv.flexWrap = FlexWrap::NoWrap;
+            }
         }
         else if (k == L"flex") {
-            // Simplified shorthand: a bare number sets flex-grow only. Real
-            // CSS's `flex: N` also sets flex-shrink:1 and flex-basis:0,
-            // neither modeled here (see FlexGrow's comment in Layout.h) -
-            // covers the overwhelmingly common `flex: 1` (and similar)
-            // pattern, not the shorthand's full 1-3-value grammar.
-            try { sv.flexGrow = std::stof(v); } catch (...) {}
+            // The shorthand, per spec: none = 0 0 auto; auto = 1 1 auto;
+            // otherwise up to two numbers (grow, then shrink) and a basis,
+            // where a unitless number sets grow/shrink and anything else is
+            // the basis. A basis left out becomes 0 - so `flex: 1` makes
+            // items share the whole line equally, regardless of `width`.
+            if (v == L"none") { sv.flexGrow = 0; sv.flexShrink = 0; sv.flexBasis = -1; sv.flexGrowSet = true; }
+            else if (v == L"auto") { sv.flexGrow = 1; sv.flexShrink = 1; sv.flexBasis = -1; sv.flexGrowSet = true; }
+            else if (v != L"initial") {
+                int numbers = 0;
+                bool basisSet = false;
+                float grow = 1, shrink = 1;
+                int basis = 0;
+                for (const auto& tok : cssTokens(v)) {
+                    size_t used = 0;
+                    float num = 0;
+                    bool isNumber = false;
+                    try { num = std::stof(tok, &used); isNumber = used == tok.size(); } catch (...) {}
+                    if (isNumber && numbers < 2) { (numbers++ == 0 ? grow : shrink) = std::max(num, 0.0f); }
+                    else if (tok == L"auto" || tok == L"content") { basisSet = true; basis = -1; }
+                    else { basisSet = true; basis = resolveLength(tok, containingWidth, 0); }
+                }
+                sv.flexGrow = grow;
+                sv.flexGrowSet = true;
+                sv.flexShrink = shrink;
+                sv.flexBasis = basisSet ? basis : 0;
+            }
         }
     };
 
@@ -1170,22 +1211,21 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
 // column direction are different enough (which axis is "main" swaps
 // entirely) that they're really two algorithms sharing one function.
 //
-// Row direction: an item's width is its explicit CSS `width` if set;
-// otherwise it gets a *share* of whatever width is left after every
-// explicit-width item and every gap is subtracted - 1 share by default,
-// or its own flex-grow value if explicitly set and positive. This isn't
-// spec-accurate (real flexbox sizes an unflexed item by its *content*,
-// via min/max-content sizing this engine has no equivalent of anywhere -
-// text wrapping already needs a width handed to it, it doesn't derive
-// one) but it's the same tradeoff layoutGrid already makes for an
-// untemplated grid ("no template -> one full-width column" there; here,
-// "no width/flex-grow -> an equal share" instead of collapsing to zero),
-// and gives the common display:flex patterns (nav bars, equal-width card
-// rows, button groups) a reasonable result. justify-content only has a
-// visible effect when every item has an explicit width and their sum is
-// still less than the container - any item using a share consumes 100%
-// of the leftover space by construction, leaving none for justify-content
-// to distribute, which matches real flexbox's own behavior in that case.
+// Row direction: see the step-by-step comment at "Row direction." below
+// for flex-basis/grow/shrink and wrapping. In a nowrap row, an item with
+// no width/flex-basis gets a *share* of the leftover width - 1 share by
+// default, or its own flex-grow. This isn't spec-accurate (real flexbox
+// sizes an unflexed item by its *content*, via min/max-content sizing
+// this engine has no equivalent of anywhere - text wrapping already needs
+// a width handed to it, it doesn't derive one) but it's the same tradeoff
+// layoutGrid already makes for an untemplated grid ("no template -> one
+// full-width column" there; here, "no width/flex-grow -> an equal share"
+// instead of collapsing to zero), and gives the common display:flex
+// patterns (nav bars, equal-width card rows, button groups) a reasonable
+// result. A wrapping row can't use that trick (nothing would ever wrap),
+// so there such an item starts at a shrink-to-fit estimate instead.
+// justify-content only has a visible effect on a line with space left
+// over after flex-grow - which matches real flexbox's own behavior.
 //
 // Column direction: items are normal block children stacked vertically -
 // height is whatever content needs, exactly like ordinary block layout
@@ -1243,16 +1283,8 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
             // per column width instead of reusing its first pass.
             ComputedStyle real = computeStyle(items[i], style.fontSize, itemWidth, itemStyles[i].visuallyHidden, style.paint);
 
-            std::vector<LayoutBox> scratch;
-            std::swap(boxes, scratch);
-            int localY = 0;
-            if (items[i]->tag == L"input" || items[i]->tag == L"button" || items[i]->tag == L"select")
-                layoutControl(items[i], 0, localY, itemWidth, real);
-            else if (items[i]->tag == L"img")
-                layoutImage(items[i], 0, localY, itemWidth, real);
-            else
-                layoutBlockChild(items[i], 0, localY, itemWidth, real);
-            std::swap(boxes, scratch);
+            int localY;
+            std::vector<LayoutBox> scratch = layoutItemDetached(items[i], itemWidth, real, localY);
 
             int crossOffset = 0; // cross axis = horizontal, here
             if (itemWidth < containingWidth) {
@@ -1273,93 +1305,180 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
     }
 
     // Row direction.
+    //
+    // 1. Each item gets a hypothetical outer width: its flex-basis if set,
+    //    else its explicit width. An item with neither is sized one of two
+    //    ways. In a nowrap row it starts at 0 and takes a share of the
+    //    leftover space (flex-grow, or 1 if unset) - the engine's original
+    //    behavior, kept because there's no real content-based sizing.
+    //    In a wrapping row that would never wrap anything, so it starts at
+    //    a shrink-to-fit estimate instead (shrinkToFitWidth) and, as in
+    //    real CSS, only grows if flex-grow says so.
+    // 2. Items are broken into lines (only with flex-wrap), each as many
+    //    items as fit - an item wider than the container gets a line of
+    //    its own.
+    // 3. Per line: positive free space goes to items by flex-grow;
+    //    negative free space (overflow) is taken back by flex-shrink
+    //    weighted by each item's basis, the spec's "scaled shrink factor".
+    //    An item never shrinks below its own padding+border. (Real CSS
+    //    also won't shrink below the content's min-content width by
+    //    default; with no min-content sizing here, text just wraps tighter.)
+    // 4. Per line: justify-content and align-items, as before. Lines stack
+    //    top to bottom with row-gap between them (bottom to top for
+    //    wrap-reverse); align-content isn't supported, so lines never
+    //    spread out vertically.
     int colGap = style.columnGap;
-    int contentAvailable = std::max(containingWidth - colGap * std::max(n - 1, 0), 0);
+    bool wraps = style.flexWrap != FlexWrap::NoWrap;
 
-    std::vector<int> itemWidths(n);
-    std::vector<float> shares(n, 0.0f);
-    int fixedTotal = 0;
-    float totalShares = 0;
+    std::vector<int> basis(n), minWidth(n);
+    std::vector<float> grow(n), shrink(n);
     for (int i = 0; i < n; i++) {
-        int w = explicitWidth(itemStyles[i]);
+        const ComputedStyle& s = itemStyles[i];
+        int chrome = s.paddingLeft + s.paddingRight + 2 * s.borderWidth;
+        minWidth[i] = chrome;
+        int w;
+        if (s.flexBasis >= 0) w = s.boxSizing == BoxSizing::BorderBox ? s.flexBasis : s.flexBasis + chrome;
+        else w = explicitWidth(s);
         if (w >= 0) {
-            itemWidths[i] = w;
-            fixedTotal += w;
+            basis[i] = w;
+            grow[i] = s.flexGrow;
+        } else if (wraps) {
+            basis[i] = shrinkToFitWidth(items[i], s, containingWidth);
+            grow[i] = s.flexGrow;
         } else {
-            shares[i] = itemStyles[i].flexGrow > 0 ? itemStyles[i].flexGrow : 1.0f;
-            totalShares += shares[i];
+            basis[i] = 0;
+            grow[i] = s.flexGrowSet ? s.flexGrow : 1.0f;
         }
-    }
-    int remaining = std::max(contentAvailable - fixedTotal, 0);
-    for (int i = 0; i < n; i++) {
-        if (shares[i] > 0) itemWidths[i] = totalShares > 0 ? (int)std::lround(remaining * (shares[i] / totalShares)) : 0;
+        basis[i] = std::max(basis[i], minWidth[i]);
+        shrink[i] = s.flexShrink;
     }
 
-    // Lay out each item at its resolved width to discover its natural
-    // height - not knowable up front the same way layoutGrid can't know a
-    // row's height before placing everything in it.
-    std::vector<std::vector<LayoutBox>> itemBoxes(n);
-    std::vector<int> itemHeights(n);
-    int rowHeight = 0;
-    for (int i = 0; i < n; i++) {
-        ComputedStyle real = computeStyle(items[i], style.fontSize, itemWidths[i], itemStyles[i].visuallyHidden, style.paint); // see the column-direction branch's comment on why
-        std::vector<LayoutBox> scratch;
-        std::swap(boxes, scratch);
-        int localY = 0;
-        if (items[i]->tag == L"input" || items[i]->tag == L"button" || items[i]->tag == L"select")
-            layoutControl(items[i], 0, localY, itemWidths[i], real);
-        else if (items[i]->tag == L"img")
-            layoutImage(items[i], 0, localY, itemWidths[i], real);
-        else
-            layoutBlockChild(items[i], 0, localY, itemWidths[i], real);
-        std::swap(boxes, scratch);
-        itemBoxes[i] = std::move(scratch);
-        itemHeights[i] = localY;
-        rowHeight = std::max(rowHeight, localY);
+    // Break into lines: [start, end) index ranges.
+    std::vector<std::pair<int, int>> lines;
+    for (int i = 0; i < n;) {
+        int start = i, used = basis[i++];
+        while (wraps && i < n && used + colGap + basis[i] <= containingWidth) used += colGap + basis[i++];
+        if (!wraps) i = n;
+        lines.push_back({ start, i });
     }
+    if (style.flexWrap == FlexWrap::WrapReverse) std::reverse(lines.begin(), lines.end());
 
-    int usedWidth = 0;
-    for (int w : itemWidths) usedWidth += w;
-    usedWidth += colGap * std::max(n - 1, 0);
-    int leftover = std::max(containingWidth - usedWidth, 0);
+    std::vector<int> itemWidths(basis);
+    int lineY = y;
+    for (size_t li = 0; li < lines.size(); li++) {
+        auto [a, b] = lines[li];
+        int count = b - a;
+        if (li > 0) lineY += style.rowGap;
 
-    int startX = x;
-    int extraGap = 0;
-    switch (style.justifyContent) {
-        case JustifyContent::FlexStart: break;
-        case JustifyContent::Center: startX += leftover / 2; break;
-        case JustifyContent::FlexEnd: startX += leftover; break;
-        case JustifyContent::SpaceBetween: if (n > 1) extraGap = leftover / (n - 1); break;
-        case JustifyContent::SpaceAround: {
-            int around = n > 0 ? leftover / n : 0;
-            startX += around / 2;
-            extraGap = around;
-            break;
+        int used = colGap * (count - 1);
+        float totalGrow = 0, totalScaledShrink = 0;
+        for (int i = a; i < b; i++) {
+            used += basis[i];
+            totalGrow += grow[i];
+            totalScaledShrink += shrink[i] * basis[i];
         }
-    }
-
-    int cursorX = startX;
-    for (int i = 0; i < n; i++) {
-        int itemY = 0;
-        if (style.alignItems == AlignItems::Center) itemY = (rowHeight - itemHeights[i]) / 2;
-        else if (style.alignItems == AlignItems::FlexEnd) itemY = rowHeight - itemHeights[i];
-        // FlexStart and Stretch both start at the row's top; stretch is
-        // approximated below by extending the item's own background/
-        // border box (if it made one) to the row's height, rather than by
-        // re-flowing its content into the extra space - a box with no
-        // background/border has nothing visible to stretch anyway.
-        if (style.alignItems == AlignItems::Stretch) {
-            for (auto& b : itemBoxes[i]) if (b.el == items[i]) { b.height = rowHeight; break; }
+        int free = containingWidth - used;
+        for (int i = a; i < b; i++) {
+            if (free > 0 && totalGrow > 0)
+                itemWidths[i] = basis[i] + (int)std::lround(free * (grow[i] / totalGrow));
+            else if (free < 0 && totalScaledShrink > 0)
+                itemWidths[i] = std::max(minWidth[i],
+                    basis[i] + (int)std::lround(free * (shrink[i] * basis[i] / totalScaledShrink)));
         }
 
-        for (LayoutBox b : itemBoxes[i]) {
-            b.x += cursorX;
-            b.y += y + itemY;
-            boxes.push_back(std::move(b));
+        // Lay out each item at its resolved width to discover its natural
+        // height - not knowable up front the same way layoutGrid can't know
+        // a row's height before placing everything in it.
+        std::vector<std::vector<LayoutBox>> itemBoxes(count);
+        std::vector<int> itemHeights(count);
+        int lineHeight = 0;
+        for (int i = a; i < b; i++) {
+            ComputedStyle real = computeStyle(items[i], style.fontSize, itemWidths[i], itemStyles[i].visuallyHidden, style.paint); // see the column-direction branch's comment on why
+            // The flexed width replaces the item's own `width` (which only
+            // fed its basis above) - otherwise layoutBlockChild would draw
+            // a grown/shrunk item at its original CSS width.
+            real.width = -1;
+            itemBoxes[i - a] = layoutItemDetached(items[i], itemWidths[i], real, itemHeights[i - a]);
+            lineHeight = std::max(lineHeight, itemHeights[i - a]);
         }
-        cursorX += itemWidths[i] + colGap + extraGap;
+
+        int usedWidth = colGap * (count - 1);
+        for (int i = a; i < b; i++) usedWidth += itemWidths[i];
+        int leftover = std::max(containingWidth - usedWidth, 0);
+
+        int startX = x;
+        int extraGap = 0;
+        switch (style.justifyContent) {
+            case JustifyContent::FlexStart: break;
+            case JustifyContent::Center: startX += leftover / 2; break;
+            case JustifyContent::FlexEnd: startX += leftover; break;
+            case JustifyContent::SpaceBetween: if (count > 1) extraGap = leftover / (count - 1); break;
+            case JustifyContent::SpaceAround: {
+                int around = leftover / count;
+                startX += around / 2;
+                extraGap = around;
+                break;
+            }
+        }
+
+        int cursorX = startX;
+        for (int i = a; i < b; i++) {
+            int k = i - a;
+            int itemY = 0;
+            if (style.alignItems == AlignItems::Center) itemY = (lineHeight - itemHeights[k]) / 2;
+            else if (style.alignItems == AlignItems::FlexEnd) itemY = lineHeight - itemHeights[k];
+            // FlexStart and Stretch both start at the line's top; stretch is
+            // approximated by extending the item's own background/border box
+            // (if it made one) to the line's height, rather than by
+            // re-flowing its content into the extra space - a box with no
+            // background/border has nothing visible to stretch anyway.
+            if (style.alignItems == AlignItems::Stretch) {
+                for (auto& box : itemBoxes[k]) if (box.el == items[i]) { box.height = lineHeight; break; }
+            }
+
+            for (LayoutBox box : itemBoxes[k]) {
+                box.x += cursorX;
+                box.y += lineY + itemY;
+                boxes.push_back(std::move(box));
+            }
+            cursorX += itemWidths[i] + colGap + extraGap;
+        }
+        lineY += lineHeight;
     }
 
-    y += rowHeight;
+    y = lineY;
     ancestorStack.pop_back();
+}
+
+std::vector<LayoutBox> LayoutRoot::layoutItemDetached(Element* item, int width, const ComputedStyle& style, int& height) {
+    std::vector<LayoutBox> scratch;
+    std::swap(boxes, scratch);
+    int localY = 0;
+    if (item->tag == L"input" || item->tag == L"button" || item->tag == L"select")
+        layoutControl(item, 0, localY, width, style);
+    else if (item->tag == L"img")
+        layoutImage(item, 0, localY, width, style);
+    else
+        layoutBlockChild(item, 0, localY, width, style);
+    std::swap(boxes, scratch);
+    height = localY;
+    return scratch;
+}
+
+int LayoutRoot::shrinkToFitWidth(Element* item, const ComputedStyle& style, int available) {
+    int height;
+    std::vector<LayoutBox> trial = layoutItemDetached(item, available, style, height);
+    int right = 0;
+    for (const auto& b : trial) {
+        // Only content has a natural width; a background box just spans
+        // whatever width it was given, so it says nothing about fit.
+        bool content = !b.text.empty() || !b.imageSrc.empty() || b.control != LayoutBox::NoControl;
+        if (!content) continue;
+        // A text box starts at the run's content edge, but layoutInlineRun
+        // wraps at the content width minus a 4px inset on *each* side.
+        int textInset = b.text.empty() || b.control != LayoutBox::NoControl ? 0 : 8;
+        right = std::max(right, b.x + b.width + textInset);
+    }
+    int width = right + style.paddingRight + style.borderWidth + style.marginRight + 1; // +1: rounding in text measurement
+    return std::min(std::max(width, 0), available);
 }
