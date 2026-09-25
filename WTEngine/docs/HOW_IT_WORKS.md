@@ -150,6 +150,7 @@ Page fetching is **backgrounded**: `navigate(url, postBody?)` calls `app.pageLoa
 - **Window title** (`updateWindowTitle`, also called every frame right after `engine.render`): `"<title> - WTEngine"` from `Engine::title()` (the first `<title>` outside any `<svg>`, whitespace-collapsed - `documentTitle` in `JSBinding.cpp`), falling back to `"<url> - WTEngine"` for a page without one. Because it's re-read every frame, a script's `document.title = ...` shows up too; `App::shownTitle` keeps it from calling `glfwSetWindowTitle` unless the text changed.
 - `goHistory(±1)` re-displays a stored entry **from its saved HTML** — no network request, and a POSTed result is not re-sent.
 - **Reload** (`reload()` - the ↻ button, F5, Ctrl+R) is the opposite: it re-fetches the current URL (`NavigationKind::Reload`), so it picks up changes, including edits to a local file. When it arrives, `PageHistory::reloadCurrent` swaps it into the current entry keeping both Back *and* Forward (unlike `replaceCurrent`, used by JS `location.replace()`/`.reload()`, which drops Forward), and the scroll position is kept - whatever it is when the new page arrives, since the old page stays up while it loads. Content still loading below (images) can make the new page shorter at that moment, pulling the position up. Always a GET: a page that came from a form POST is reloaded by URL rather than re-submitting the form, which browsers only do after asking. The built-in start page (no URL) is just re-shown, which still re-runs its scripts.
+- **Stop:** while any navigation is in flight (`PageLoader::loading()` - a reload, a link, the address bar, a form), the Reload button draws as ✕ (`AddressBar` gets the loading state every frame via `setNavEnabled`). That is also the only on-screen sign that a click on Reload registered - a page that comes back unchanged otherwise looks like nothing happened. Clicking ✕, or Esc with no field focused, calls `pageLoader.cancel()`: the current page stays up and the address bar goes back to its URL (unless the user is editing it).
 
 ### Progressive resource loading (`ResourceLoader`)
 A page's own `<script src>` and `<link rel="stylesheet">` fetches are **also backgrounded**, and concurrently rather than serially - fixing the bypass `PageLoader` couldn't cover (above). `Engine::parseAndBuild` and `beginScripts` don't fetch anything themselves: they collect every external stylesheet/script URL in document order and hand the list to a `ResourceLoader` (one per resource kind: `styleLoader_`, `scriptLoader_`).
@@ -167,11 +168,12 @@ The page paints once immediately after `parseAndBuild`/`beginScripts` return - w
 
 | Input | Behaviour |
 |---|---|
-| Left click in the top 40 px | Back/Forward/Reload buttons (`AddressBar::navButtonAt`), or focus/place the caret in the address bar |
+| Left click in the top 40 px | Back/Forward/Reload buttons (`AddressBar::navButtonAt`) - Reload is a Stop ✕ while a page loads - or focus/place the caret in the address bar |
 | Left click on the page | 1. `Engine::onClick` (form controls): if it hit a control it runs that control's JS click listeners, then performs the control's action unless a listener called `preventDefault()`; the click is then finished. 2. Otherwise find a link with `linkAt`. 3. `Engine::dispatchClick` runs JS click listeners. 4. If a listener did **not** call `preventDefault()` and there was a link, navigate |
 | Mouse 4/5, Alt+←/→ | Back / forward |
 | Ctrl+L, F6 | Focus the address bar |
 | F5, Ctrl+R | Reload (works while typing in a field too; ignored on key-repeat) |
+| Esc (nothing focused) | Stop the page load in progress |
 | Keys / chars | Go to the address bar if focused, otherwise to the focused page input |
 | Tab / Shift+Tab | Next/previous text field |
 | Ctrl+V / C / A | Paste / copy / select all (clipboard via GLFW). Copy is blocked for password fields |
