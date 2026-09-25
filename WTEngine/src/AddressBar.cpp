@@ -12,6 +12,7 @@ namespace {
     const wchar_t kArrowLeft[] = { 0x2190, 0 };
     const wchar_t kArrowRight[] = { 0x2192, 0 };
     const wchar_t kReloadArrow[] = { 0x21BB, 0 }; // clockwise open circle arrow
+    const wchar_t kStopCross[] = { 0x2715, 0 };   // multiplication X
 
     const int kNavSize = 28;    // Back / Forward / Reload buttons are kNavSize wide
     const int kNavBackX = 10;
@@ -63,7 +64,10 @@ AddressBar::NavButton AddressBar::navButtonAt(int x, int y) const {
     if (y < kFieldY || y >= kFieldY + kFieldH) return NavButton::None;
     if (canBack_ && x >= kNavBackX && x < kNavBackX + kNavSize) return NavButton::Back;
     if (canForward_ && x >= kNavFwdX && x < kNavFwdX + kNavSize) return NavButton::Forward;
-    if (canReload_ && x >= kNavReloadX && x < kNavReloadX + kNavSize) return NavButton::Reload;
+    if (x >= kNavReloadX && x < kNavReloadX + kNavSize) {
+        if (loading_) return NavButton::Stop;
+        if (canReload_) return NavButton::Reload;
+    }
     return NavButton::None;
 }
 
@@ -92,7 +96,8 @@ void AddressBar::draw(Renderer& r, int windowWidth, double t) {
     };
     navButton(kNavBackX, kArrowLeft, canBack_);
     navButton(kNavFwdX, kArrowRight, canForward_);
-    navButton(kNavReloadX, kReloadArrow, canReload_);
+    if (loading_) navButton(kNavReloadX, kStopCross, true);
+    else navButton(kNavReloadX, kReloadArrow, canReload_);
 
     r.drawRect((float)kFieldX - 1, (float)kFieldY - 1, (float)fieldW + 2, (float)kFieldH + 2,
                focused_ ? kBorderFocus : kBorder);

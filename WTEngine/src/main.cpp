@@ -33,6 +33,7 @@ struct App {
     std::wstring pendingUrl; // set by input callbacks, handled in the main loop
     int pendingHistory = 0;  // -1 = go back, +1 = go forward (also handled in the main loop)
     bool pendingReload = false; // Reload button / F5 / Ctrl+R (also handled in the main loop)
+    bool pendingStop = false;   // Stop button / Esc while loading (also handled in the main loop)
     PageHistory history;
     PageLoader pageLoader; // fetches navigate()'s target in the background; see applyFinishedNavigation
     std::wstring shownTitle; // what the window title bar currently says - see updateWindowTitle
@@ -223,6 +224,7 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
         case AddressBar::NavButton::Back:    app->pendingHistory = -1; return;
         case AddressBar::NavButton::Forward: app->pendingHistory = 1; return;
         case AddressBar::NavButton::Reload:  app->pendingReload = true; return;
+        case AddressBar::NavButton::Stop:    app->pendingStop = true; return;
         case AddressBar::NavButton::None:    break;
         }
         app->engine->blurInput();
@@ -286,7 +288,12 @@ static void onKey(GLFWwindow* window, int key, int, int action, int mods) {
 
     // Keys go to whichever text field has focus: the address bar or a page input
     bool inBar = bar.focused();
-    if (!inBar && !engine.hasFocusedInput()) return;
+    if (!inBar && !engine.hasFocusedInput()) {
+        // Esc with nothing focused stops a page load, like a browser's.
+        // (In a field, Esc keeps its meaning - blur / discard edits - below.)
+        if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS && app->pageLoader.loading()) app->pendingStop = true;
+        return;
+    }
 
     if (key == GLFW_KEY_TAB && !inBar) {
         engine.focusNextInput((mods & GLFW_MOD_SHIFT) != 0);
@@ -397,6 +404,14 @@ int wmain(int argc, wchar_t** argv) {
             goHistory(app, direction);
         }
 
+        if (app.pendingStop) {
+            app.pendingStop = false;
+            app.pageLoader.cancel(); // the current page just stays up, as in a browser
+            // ...so the bar should name that page again, not the abandoned
+            // target - unless the user is mid-edit in it.
+            if (!app.bar.focused()) app.bar.setText(app.currentUrl);
+        }
+
         if (app.pendingReload) {
             app.pendingReload = false;
             reload(app);
@@ -429,7 +444,8 @@ int wmain(int argc, wchar_t** argv) {
         renderer.beginFrame(width, height, 0);
         engine.render(renderer, glfwGetTime());
         updateWindowTitle(app);
-        app.bar.setNavEnabled(app.history.canGoBack(), app.history.canGoForward(), app.history.current() != nullptr);
+        app.bar.setNavEnabled(app.history.canGoBack(), app.history.canGoForward(), app.history.current() != nullptr,
+                              app.pageLoader.loading());
         app.bar.draw(renderer, width, glfwGetTime()); // after the page so it covers overscroll
 
         // I-beam over the address bar and text fields, hand over links and
