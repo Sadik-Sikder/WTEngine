@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cwctype>
 #include <map>
+#include <mutex>
+#include <thread>
 
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
 
@@ -90,8 +92,35 @@ struct TimerStorage {
     }
 };
 
+// ---------------------------------------------------------------------
+// In-flight fetch() calls. The request itself runs on a detached
+// background thread (the same abandon-in-place pattern PageLoader uses),
+// which only ever touches its FetchSlot - never a JSValue, since quickjs
+// isn't thread-safe. pollFetches, on the UI thread, settles the promise
+// once the slot is done. A navigation drops the storage (freeing the
+// promise functions); a still-running thread then finishes into a slot
+// nothing reads anymore.
+struct FetchSlot {
+    std::mutex mutex;
+    bool done = false;
+    HttpResponse response;
+};
+struct PendingFetch {
+    std::shared_ptr<FetchSlot> slot;
+    JSValue resolve, reject;
+};
+struct FetchStorage {
+    std::vector<PendingFetch> pending;
+    JSContext* ctx = nullptr;
+    ~FetchStorage() {
+        if (!ctx) return;
+        for (auto& f : pending) { JS_FreeValue(ctx, f.resolve); JS_FreeValue(ctx, f.reject); }
+    }
+};
+
 DOMBindingState::DOMBindingState()
-    : listeners(std::make_unique<ListenerStorage>()), timers(std::make_unique<TimerStorage>()) {}
+    : listeners(std::make_unique<ListenerStorage>()), timers(std::make_unique<TimerStorage>()),
+      fetches(std::make_unique<FetchStorage>()) {}
 DOMBindingState::~DOMBindingState() = default;
 DOMBindingState::DOMBindingState(DOMBindingState&&) noexcept = default;
 DOMBindingState& DOMBindingState::operator=(DOMBindingState&&) noexcept = default;
@@ -698,6 +727,94 @@ static JSValue js_set_location(JSContext* ctx, JSValueConst /*this_val*/, JSValu
     return JS_UNDEFINED;
 }
 
+// --- value / checked (form controls) ------------------------------------
+// The engine keeps all form state in the DOM - an input's text in its
+// `value` attribute, a checkbox's state as a `checked` attribute, the
+// chosen <option> marked `selected` (see EngineForms.cpp) - so these are
+// plain reads/writes of those attributes. Engine::render notices a JS
+// change to the focused field's value and reloads its editor from it.
+
+static std::vector<Element*> optionsOf(Element* selectEl) {
+    std::vector<Element*> out;
+    for (auto& c : selectEl->children)
+        if (c->type == Node::ELEMENT && static_cast<Element*>(c.get())->tag == L"option")
+            out.push_back(static_cast<Element*>(c.get()));
+    return out;
+}
+
+static std::wstring optionValueOf(Element* opt) {
+    auto it = opt->attrs.find(L"value");
+    if (it != opt->attrs.end()) return it->second;
+    std::wstring text;
+    gatherText(opt, text);
+    return text;
+}
+
+static JSValue js_get_value(JSContext* ctx, JSValueConst this_val) {
+    Element* el = unwrapElement(this_val);
+    if (!el) return JS_UNDEFINED;
+    if (el->tag == L"input" || el->tag == L"button") {
+        auto it = el->attrs.find(L"value");
+        if (it != el->attrs.end()) return jsStr(ctx, it->second);
+        auto type = el->attrs.find(L"type");
+        bool checkable = type != el->attrs.end() && (type->second == L"checkbox" || type->second == L"radio");
+        return jsStr(ctx, checkable ? L"on" : L""); // the HTML default for a checkbox/radio with no value
+    }
+    if (el->tag == L"textarea") {
+        std::wstring text;
+        gatherText(el, text);
+        return jsStr(ctx, text);
+    }
+    if (el->tag == L"option") return jsStr(ctx, optionValueOf(el));
+    if (el->tag == L"select") {
+        auto opts = optionsOf(el);
+        for (Element* o : opts) if (o->attrs.count(L"selected")) return jsStr(ctx, optionValueOf(o));
+        return jsStr(ctx, opts.empty() ? L"" : optionValueOf(opts[0])); // unmarked = first, as EngineForms draws it
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue js_set_value(JSContext* ctx, JSValueConst this_val, JSValueConst val) {
+    Element* el = unwrapElement(this_val);
+    if (!el) return JS_UNDEFINED;
+    const char* s = JS_ToCString(ctx, val);
+    std::wstring v = utf8ToWide(s);
+    JS_FreeCString(ctx, s);
+
+    if (el->tag == L"textarea") {
+        el->children.clear();
+        if (!v.empty()) el->children.push_back(std::make_shared<TextNode>(v));
+    }
+    else if (el->tag == L"select") {
+        // Selects the first option with that value; none matching leaves
+        // nothing marked (the engine then shows the first option).
+        bool found = false;
+        for (Element* o : optionsOf(el)) {
+            if (!found && optionValueOf(o) == v) { o->attrs[L"selected"] = L""; found = true; }
+            else o->attrs.erase(L"selected");
+        }
+    }
+    else {
+        el->attrs[L"value"] = v;
+    }
+    markDirty(ctx);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_get_checked(JSContext* ctx, JSValueConst this_val) {
+    Element* el = unwrapElement(this_val);
+    return JS_NewBool(ctx, el && el->attrs.count(L"checked") > 0);
+}
+
+static JSValue js_set_checked(JSContext* ctx, JSValueConst this_val, JSValueConst val) {
+    if (Element* el = unwrapElement(this_val)) {
+        if (JS_ToBool(ctx, val)) el->attrs[L"checked"] = L"";
+        else el->attrs.erase(L"checked");
+        markDirty(ctx);
+    }
+    return JS_UNDEFINED;
+}
+
 // --- title ----------------------------------------------------------------
 // document.title reads/writes the page's <title>; on any other element,
 // `title` is its title="" attribute (the tooltip text), as in a real DOM.
@@ -776,6 +893,226 @@ static JSValue js_set_title(JSContext* ctx, JSValueConst this_val, JSValueConst 
     return JS_UNDEFINED;
 }
 
+// --- fetch ----------------------------------------------------------------
+// The public fetch() is defined in kBootstrapJS below (option parsing,
+// Headers, the Response object); it calls this native half to actually
+// send the request: __wtFetch(url, method, [name, value, ...], body).
+
+// Resolves a fetch() URL. From an http(s) page, this is the same resolution
+// a link gets. From a page loaded off disk, a relative URL is resolved
+// against the page file's own folder, so a local test page can fetch a
+// sibling file.
+static std::wstring resolveFetchUrl(const std::wstring& pageUrl, const std::wstring& href) {
+    bool hrefIsHttp = href.rfind(L"http://", 0) == 0 || href.rfind(L"https://", 0) == 0;
+    bool pageIsHttp = pageUrl.rfind(L"http://", 0) == 0 || pageUrl.rfind(L"https://", 0) == 0;
+    if (hrefIsHttp || pageIsHttp) return resolveUrl(pageUrl, href);
+    if (href.empty() || href.find(L':') != std::wstring::npos) return L""; // data:, blob:, a drive path, ...
+    size_t slash = pageUrl.find_last_of(L"\\/");
+    std::wstring dir = slash == std::wstring::npos ? L"" : pageUrl.substr(0, slash + 1);
+    std::wstring path = dir + href;
+    for (auto& c : path) if (c == L'/') c = L'\\';
+    return path;
+}
+
+static JSValue js_native_fetch(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state) return JS_EXCEPTION;
+
+    HttpRequest req;
+    req.url = resolveFetchUrl(state->pageUrl, argStr(ctx, argc, argv, 0));
+    req.method = wideToUtf8(argStr(ctx, argc, argv, 1));
+    if (argc > 2 && JS_IsArray(argv[2])) {
+        int64_t len = 0;
+        JS_GetLength(ctx, argv[2], &len);
+        for (int64_t i = 0; i + 1 < len; i += 2) {
+            JSValue name = JS_GetPropertyInt64(ctx, argv[2], i);
+            JSValue value = JS_GetPropertyInt64(ctx, argv[2], i + 1);
+            const char* n = JS_ToCString(ctx, name);
+            const char* v = JS_ToCString(ctx, value);
+            if (n && v) req.headers.emplace_back(n, v);
+            JS_FreeCString(ctx, n);
+            JS_FreeCString(ctx, v);
+            JS_FreeValue(ctx, name);
+            JS_FreeValue(ctx, value);
+        }
+    }
+    req.body = wideToUtf8(argStr(ctx, argc, argv, 3));
+
+    if (req.url.empty())
+        return JS_ThrowTypeError(ctx, "Failed to fetch: unsupported or invalid URL");
+
+    JSValue funcs[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, funcs);
+    if (JS_IsException(promise)) return promise;
+
+    auto slot = std::make_shared<FetchSlot>();
+    state->fetches->pending.push_back({ slot, funcs[0], funcs[1] });
+    std::thread([slot, req = std::move(req)]() {
+        HttpResponse res = fetchHttp(req);
+        std::lock_guard<std::mutex> lock(slot->mutex);
+        slot->response = std::move(res);
+        slot->done = true;
+    }).detach();
+    return promise;
+}
+
+void pollFetches(JSContext* ctx) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state || state->fetches->pending.empty()) return;
+
+    // Take the finished ones out first: settling a promise can run JS that
+    // starts another fetch(), which appends to `pending`.
+    std::vector<PendingFetch> finished;
+    auto& pending = state->fetches->pending;
+    for (auto it = pending.begin(); it != pending.end();) {
+        bool done;
+        { std::lock_guard<std::mutex> lock(it->slot->mutex); done = it->slot->done; }
+        if (done) { finished.push_back(*it); it = pending.erase(it); }
+        else ++it;
+    }
+
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue makeResponse = JS_GetPropertyStr(ctx, global, "__wtResponse");
+    for (auto& f : finished) {
+        HttpResponse& res = f.slot->response; // done: the worker thread no longer touches it
+        JSValue result;
+        JSValue settle;
+        if (res.ok) {
+            JSValue args[4] = {
+                JS_NewInt32(ctx, res.status),
+                jsStr(ctx, res.finalUrl),
+                JS_NewStringLen(ctx, res.body.data(), res.body.size()),
+                JS_NewStringLen(ctx, res.contentType.data(), res.contentType.size()),
+            };
+            result = JS_Call(ctx, makeResponse, JS_UNDEFINED, 4, args);
+            for (JSValue& a : args) JS_FreeValue(ctx, a);
+            settle = f.resolve;
+        } else {
+            // Throw-then-catch is the simplest way to get a real TypeError
+            // instance (instanceof TypeError), as browsers reject with.
+            JS_ThrowTypeError(ctx, "Failed to fetch: %s", wideToUtf8(res.error).c_str());
+            result = JS_GetException(ctx);
+            settle = f.reject;
+        }
+        if (!JS_IsException(result)) {
+            ArmScriptWatchdog(ctx);
+            JSValue r = JS_Call(ctx, settle, JS_UNDEFINED, 1, &result);
+            JS_FreeValue(ctx, r);
+        } else {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        }
+        JS_FreeValue(ctx, result);
+        JS_FreeValue(ctx, f.resolve);
+        JS_FreeValue(ctx, f.reject);
+        runPendingJobs(ctx); // the .then() chain this just unblocked
+    }
+    JS_FreeValue(ctx, makeResponse);
+    JS_FreeValue(ctx, global);
+}
+
+// The parts of the API that are simplest in JS itself: fetch()'s option
+// handling, Headers, the Response object, and element.style (a Proxy over
+// the style="" attribute - so every write goes through setAttribute, which
+// already marks the DOM dirty for a relayout).
+static const char kBootstrapJS[] = R"JS(
+(function () {
+  const g = globalThis;
+
+  class Headers {
+    constructor(init) {
+      this._m = {};
+      if (init instanceof Headers) init = init._m;
+      if (Array.isArray(init)) { for (const [k, v] of init) this.set(k, v); }
+      else if (init) { for (const k of Object.keys(init)) this.set(k, init[k]); }
+    }
+    get(n) { const v = this._m[String(n).toLowerCase()]; return v === undefined ? null : v; }
+    has(n) { return String(n).toLowerCase() in this._m; }
+    set(n, v) { this._m[String(n).toLowerCase()] = String(v); }
+    append(n, v) { const k = String(n).toLowerCase(); this._m[k] = k in this._m ? this._m[k] + ', ' + v : String(v); }
+    delete(n) { delete this._m[String(n).toLowerCase()]; }
+    forEach(cb, self) { for (const k of Object.keys(this._m)) cb.call(self, this._m[k], k, this); }
+  }
+  g.Headers = Headers;
+
+  g.__wtResponse = function (status, url, body, contentType) {
+    let used = false;
+    const take = () => {
+      if (used) return Promise.reject(new TypeError('Body has already been consumed'));
+      used = true;
+      return Promise.resolve(body);
+    };
+    return {
+      ok: status >= 200 && status < 300, status, statusText: '', url,
+      redirected: false, type: 'basic',
+      headers: new Headers(contentType ? { 'content-type': contentType } : {}),
+      get bodyUsed() { return used; },
+      text: () => take(),
+      json: () => take().then(JSON.parse),
+      clone: () => g.__wtResponse(status, url, body, contentType),
+    };
+  };
+
+  g.fetch = function (input, init) {
+    try {
+      init = init || {};
+      const url = String(input && typeof input === 'object' && 'url' in input ? input.url : input);
+      const method = String(init.method || 'GET').toUpperCase();
+      const flat = [];
+      new Headers(init.headers).forEach((v, k) => flat.push(k, v));
+      let body = init.body == null ? '' : init.body;
+      if (typeof body !== 'string') body = String(body);
+      return __wtFetch(url, method, flat, body);
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  };
+
+  const nodeProto = Object.getPrototypeOf(document);
+  const kebab = p => p === 'cssFloat' ? 'float' : p.replace(/[A-Z]/g, m => '-' + m.toLowerCase());
+  const parse = el => {
+    const out = [];
+    for (const d of (el.getAttribute('style') || '').split(';')) {
+      const i = d.indexOf(':');
+      if (i < 0) continue;
+      const k = d.slice(0, i).trim().toLowerCase();
+      if (k) out.push([k, d.slice(i + 1).trim()]);
+    }
+    return out;
+  };
+  const read = (el, name) => { const d = parse(el).find(([k]) => k === name); return d ? d[1] : ''; };
+  const write = (el, name, value) => {
+    const decls = parse(el).filter(([k]) => k !== name);
+    value = value == null ? '' : String(value).trim();
+    if (value !== '') decls.push([name, value]);
+    el.setAttribute('style', decls.map(([k, v]) => k + ': ' + v).join('; '));
+  };
+  Object.defineProperty(nodeProto, 'style', {
+    configurable: true,
+    get() {
+      const el = this;
+      return new Proxy({}, {
+        get(_, p) {
+          if (typeof p !== 'string') return undefined;
+          switch (p) {
+            case 'cssText': return el.getAttribute('style') || '';
+            case 'length': return parse(el).length;
+            case 'getPropertyValue': return n => read(el, String(n).toLowerCase());
+            case 'setProperty': return (n, v) => write(el, String(n).toLowerCase(), v);
+            case 'removeProperty': return n => { const k = String(n).toLowerCase(); const old = read(el, k); write(el, k, ''); return old; };
+          }
+          return read(el, kebab(p));
+        },
+        set(_, p, v) {
+          if (p === 'cssText') el.setAttribute('style', String(v));
+          else if (typeof p === 'string') write(el, kebab(p), v);
+          return true;
+        },
+      });
+    },
+  });
+})();
+)JS";
+
 // ---------------------------------------------------------------------
 
 static const JSCFunctionListEntry js_node_proto_funcs[] = {
@@ -784,6 +1121,8 @@ static const JSCFunctionListEntry js_node_proto_funcs[] = {
     JS_CGETSET_DEF("tagName", js_get_tagName, nullptr),
     JS_CGETSET_MAGIC_DEF("id", js_get_attr_magic, js_set_attr_magic, 0),
     JS_CGETSET_MAGIC_DEF("className", js_get_attr_magic, js_set_attr_magic, 1),
+    JS_CGETSET_DEF("value", js_get_value, js_set_value),
+    JS_CGETSET_DEF("checked", js_get_checked, js_set_checked),
     JS_CGETSET_DEF("title", js_get_title, js_set_title),
     JS_CFUNC_DEF("getAttribute", 1, js_getAttribute),
     JS_CFUNC_DEF("setAttribute", 2, js_setAttribute),
@@ -806,12 +1145,14 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("clearTimeout", 1, js_clearTimer),
     JS_CFUNC_DEF("clearInterval", 1, js_clearTimer),
     JS_CGETSET_DEF("location", js_get_location, js_set_location),
+    JS_CFUNC_DEF("__wtFetch", 4, js_native_fetch), // the native half of fetch() - see kBootstrapJS
 };
 
 void installDOMBindings(JSContext* ctx, Element* documentRoot, DOMBindingState* state) {
     JS_SetContextOpaque(ctx, state);
     state->listeners->ctx = ctx; // so ~ListenerStorage can free stored callbacks
     state->timers->ctx = ctx;    // so ~TimerStorage can free stored callbacks
+    state->fetches->ctx = ctx;   // so ~FetchStorage can free pending promise functions
     state->documentEl = documentRoot;
 
     JSRuntime* rt = JS_GetRuntime(ctx);
@@ -851,4 +1192,18 @@ void installDOMBindings(JSContext* ctx, Element* documentRoot, DOMBindingState* 
     JS_SetPropertyStr(ctx, global, "parent", JS_DupValue(ctx, global));
     JS_SetPropertyStr(ctx, global, "top", JS_DupValue(ctx, global));
     JS_FreeValue(ctx, global);
+
+    // Last, since it builds on `document` and the natives above.
+    ArmScriptWatchdog(ctx);
+    JSValue boot = JS_Eval(ctx, kBootstrapJS, sizeof(kBootstrapJS) - 1, "<wtengine-bootstrap>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(boot)) {
+        JSValue exc = JS_GetException(ctx);
+        const char* msg = JS_ToCString(ctx, exc);
+        OutputDebugStringA("WTEngine bootstrap JS failed: ");
+        OutputDebugStringA(msg ? msg : "?");
+        OutputDebugStringA("\n");
+        JS_FreeCString(ctx, msg);
+        JS_FreeValue(ctx, exc);
+    }
+    JS_FreeValue(ctx, boot);
 }
