@@ -1,6 +1,7 @@
 // Fetcher.h
 #pragma once
 #include <string>
+#include <utility>
 #include <vector>
 
 struct FetchResult {
@@ -13,6 +14,25 @@ struct FetchResult {
 // Loads a page from an http(s):// URL, or from a local file path.
 // With `postBody` (already form-encoded), sends it as an HTTP POST instead.
 FetchResult fetchPage(const std::wstring& url, const std::string* postBody = nullptr);
+
+// A general HTTP request, for JS fetch(): any method, extra headers, and a
+// body. Unlike fetchPage, an HTTP error status (404, 500, ...) is still a
+// completed response - `ok` means only that a response arrived at all.
+struct HttpRequest {
+    std::wstring url;       // absolute http(s) URL, or a local file path (read as a GET)
+    std::string method = "GET";
+    std::vector<std::pair<std::string, std::string>> headers;
+    std::string body;
+};
+struct HttpResponse {
+    bool ok = false;         // false = network error (see `error`); true even for a 404
+    int status = 0;
+    std::string body;        // raw bytes, already decompressed
+    std::string contentType;
+    std::wstring finalUrl;   // after redirects
+    std::wstring error;
+};
+HttpResponse fetchHttp(const HttpRequest& request);
 
 // Fetches raw bytes from an http(s) URL or local file path, with no text
 // decoding — used for binary resources like images. Returns false on failure.

@@ -165,6 +165,7 @@ struct RawResponse {
     int status = 0;
     std::string body;
     std::string location; // Location header, for the redirect loop below
+    std::string contentType; // Content-Type header, for fetchHttp
     std::wstring finalUrl;
     std::wstring error;
 };
@@ -367,6 +368,8 @@ static void writeAndRead(Stream& stream, const http::request<http::string_body>&
     out.body = std::move(res.body());
     auto loc = res.find(http::field::location);
     if (loc != res.end()) out.location.assign(loc->value());
+    auto ct = res.find(http::field::content_type);
+    if (ct != res.end()) out.contentType.assign(ct->value());
     out.ok = true;
 
     auto ce = res.find(http::field::content_encoding);
@@ -472,8 +475,12 @@ static void sendFreshPlain(const std::string& host, const std::string& port, con
 // resolved address) are caught and reported via RawResponse::error,
 // matching how the rest of this file signals failure (a bool/empty-error
 // pattern, not exceptions, at the API boundary fetchPage/fetchBytes expose).
+// Extra request headers beyond the ones sendOneRequest always sets; an
+// entry here overrides a default of the same name (e.g. Content-Type).
+using HeaderList = std::vector<std::pair<std::string, std::string>>;
+
 static RawResponse sendOneRequest(const UrlParts& parts, http::verb method, const std::string& body,
-                                   const char* accept) {
+                                   const char* accept, const HeaderList& extraHeaders = {}) {
     RawResponse out;
     std::string host = wideToUtf8(parts.host);
     std::string port = std::to_string(parts.port);
@@ -486,10 +493,11 @@ static RawResponse sendOneRequest(const UrlParts& parts, http::verb method, cons
     if (accept) req.set(http::field::accept, accept); // "text/html" for a page, unset for an image
     req.set(http::field::accept_encoding, "gzip, deflate"); // decompressBody (writeAndRead) handles both - see its comment
     req.set(http::field::connection, "keep-alive"); // was "close" - see ConnectionPool above
-    if (!body.empty()) {
-        req.set(http::field::content_type, "application/x-www-form-urlencoded");
+    if (!body.empty()) req.set(http::field::content_type, "application/x-www-form-urlencoded");
+    for (const auto& [name, value] : extraHeaders) req.set(name, value);
+    if (!body.empty() || method == http::verb::post || method == http::verb::put || method == http::verb::patch) {
         req.body() = body;
-        req.prepare_payload();
+        req.prepare_payload(); // Content-Length (0 for an empty POST, which some servers require)
     }
 
     try {
@@ -540,16 +548,21 @@ static RawResponse sendOneRequest(const UrlParts& parts, http::verb method, cons
 // after the first hop - matches how real browsers treat 301/302/303; a
 // stricter implementation would preserve the method for 307/308, not
 // done here to keep this simple), returning the final raw response.
-static RawResponse fetchRaw(std::wstring url, const std::string* postBody, const char* accept) {
-    bool isPost = postBody != nullptr;
-    std::string body = isPost ? *postBody : std::string();
+//
+// `method`/`headers` are for fetchHttp (JS fetch()): a 307/308 redirect
+// keeps the method and body there, as the spec requires, and an HTTP error
+// status is still a completed response (`ok` stays true) - it's up to the
+// caller to look at `status`. The page/image path (`errorOnHttpStatus`)
+// keeps the original behavior of treating 4xx/5xx as a failure.
+static RawResponse fetchRaw(std::wstring url, http::verb method, std::string body, const char* accept,
+                            const HeaderList& headers = {}, bool errorOnHttpStatus = true) {
     RawResponse raw;
 
     for (int redirect = 0; redirect < 10; redirect++) {
         UrlParts parts;
         if (!crackUrl(url, parts)) { raw = RawResponse{}; raw.error = L"Bad URL"; return raw; }
 
-        raw = sendOneRequest(parts, isPost ? http::verb::post : http::verb::get, body, accept);
+        raw = sendOneRequest(parts, method, body, accept, headers);
         if (!raw.ok) return raw;
 
         if (raw.status >= 300 && raw.status < 400 && !raw.location.empty()) {
@@ -561,13 +574,15 @@ static RawResponse fetchRaw(std::wstring url, const std::string* postBody, const
                 return raw;
             }
             url = combined;
-            isPost = false;
-            body.clear();
+            if (raw.status != 307 && raw.status != 308) {
+                method = http::verb::get;
+                body.clear();
+            }
             continue;
         }
 
         raw.finalUrl = url;
-        if (raw.status >= 400) {
+        if (errorOnHttpStatus && raw.status >= 400) {
             raw.ok = false;
             raw.error = L"HTTP " + std::to_wstring(raw.status);
         }
@@ -592,12 +607,42 @@ static FetchResult readLocalFile(const std::wstring& path) {
 FetchResult fetchPage(const std::wstring& url, const std::string* postBody) {
     if (!isHttpUrl(url)) return readLocalFile(url); // a POST body makes no sense for a file
 
-    RawResponse raw = fetchRaw(url, postBody, "text/html");
+    RawResponse raw = fetchRaw(url, postBody ? http::verb::post : http::verb::get,
+                               postBody ? *postBody : std::string(), "text/html");
     FetchResult res;
     res.ok = raw.ok;
     res.error = raw.error;
     res.finalUrl = raw.finalUrl;
     if (raw.ok) res.html = utf8ToWide(raw.body);
+    return res;
+}
+
+HttpResponse fetchHttp(const HttpRequest& request) {
+    HttpResponse res;
+    if (!isHttpUrl(request.url)) {
+        // A local file - only reachable from a page that was itself loaded
+        // from disk (see JS fetch()), read the same way as a page.
+        std::ifstream in(request.url, std::ios::binary);
+        if (!in) { res.error = L"Could not open file: " + request.url; return res; }
+        res.body.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        res.ok = true;
+        res.status = 200;
+        res.finalUrl = request.url;
+        return res;
+    }
+
+    std::string methodName = request.method;
+    for (auto& c : methodName) c = (char)std::toupper((unsigned char)c);
+    http::verb verb = http::string_to_verb(methodName);
+    if (verb == http::verb::unknown) { res.error = L"Unsupported method"; return res; }
+
+    RawResponse raw = fetchRaw(request.url, verb, request.body, "*/*", request.headers, false);
+    res.ok = raw.ok;
+    res.status = raw.status;
+    res.body = std::move(raw.body);
+    res.contentType = std::move(raw.contentType);
+    res.finalUrl = raw.finalUrl;
+    res.error = raw.error;
     return res;
 }
 
@@ -639,7 +684,7 @@ bool fetchBytes(const std::wstring& url, std::vector<unsigned char>& outBytes) {
         return true;
     }
 
-    RawResponse raw = fetchRaw(url, nullptr, nullptr);
+    RawResponse raw = fetchRaw(url, http::verb::get, std::string(), nullptr);
     if (!raw.ok) return false;
     outBytes.assign(raw.body.begin(), raw.body.end());
     return true;

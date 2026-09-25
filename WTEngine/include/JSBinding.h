@@ -13,6 +13,8 @@ struct ListenerStorage; // opaque; holds registered addEventListener callbacks -
                         // Engine's own unique_ptr<JSEngine>.
 struct TimerStorage;    // opaque, same treatment as ListenerStorage: holds pending setTimeout/
                         // setInterval callbacks (JSValues), so quickjs.h stays out of Engine.h too.
+struct FetchStorage;    // opaque, same treatment again: in-flight fetch() calls and their promise
+                        // resolve/reject functions.
 
 // Per-page state the DOM bindings need beyond what's reachable from a
 // wrapped node's own opaque pointer:
@@ -38,6 +40,7 @@ struct DOMBindingState {
     bool domDirty = false;
     std::unique_ptr<ListenerStorage> listeners;
     std::unique_ptr<TimerStorage> timers; // pending setTimeout/setInterval callbacks
+    std::unique_ptr<FetchStorage> fetches; // in-flight fetch() calls - see pollFetches
 
     // The element `document` wraps (set by installDOMBindings) - so a
     // property shared by every node, like `title`, can tell `document`
@@ -77,6 +80,12 @@ bool dispatchClick(JSContext* ctx, Element* target);
 // via main.cpp). Called once per frame from Engine::render, the same
 // per-frame polling pattern already used for domDirty/imageGeneration.
 void fireDueTimers(JSContext* ctx, double nowSeconds);
+
+// Settles the promise of every fetch() whose background request has
+// finished since the last call (resolving with a Response, or rejecting
+// with a TypeError on a network error), then runs the resulting promise
+// jobs. Called once per frame from Engine::render, like fireDueTimers.
+void pollFetches(JSContext* ctx);
 
 // The document's title: the text of the first <title> element under
 // `root` (outside any <svg>), with runs of whitespace collapsed to single

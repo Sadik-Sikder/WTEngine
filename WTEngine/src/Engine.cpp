@@ -511,6 +511,9 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     // domDirty, same as any other script), so this runs before that check.
     if (jsEngine) fireDueTimers(jsEngine->context(), timeSeconds);
 
+    // Same for fetch() promises whose request has finished since last frame.
+    if (jsEngine) pollFetches(jsEngine->context());
+
     // A stylesheet/script that was still being fetched in the background
     // may have just landed - apply whatever's newly ready (also sets
     // domDirty on anything that changes; see pollResources).
@@ -521,6 +524,14 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     if (domState.domDirty) {
         domState.domDirty = false;
         hoverSetLive = false; // the mutation may have freed hovered elements
+        // syncValue keeps the focused field's `value` attribute equal to
+        // the editor's text after every edit, so a difference here means a
+        // script set .value - show that instead of the stale editor text.
+        if (focusedEl) {
+            auto it = focusedEl->attrs.find(L"value");
+            std::wstring v = it == focusedEl->attrs.end() ? L"" : it->second;
+            if (v != editor.text()) editor.setText(v);
+        }
         doLayout();
     }
 
