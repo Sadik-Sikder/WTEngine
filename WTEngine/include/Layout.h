@@ -55,6 +55,7 @@ struct LayoutRoot {
     std::wstring currentHref; // href of the enclosing <a>, set during layout
     Element* currentForm = nullptr; // the enclosing <form>, set during layout
     const std::vector<CSS::Rule>* rules = nullptr; // from <style> blocks on the page
+    const CSS::HoverSet* hover = nullptr; // what :hover matches this pass; null = nothing hovered
 
     // Returns the pixel width of `text` at `fontSize`. Used to wrap text; a
     // rough per-character estimate is used when unset.
@@ -317,4 +318,17 @@ private:
     // within one pass (the DOM doesn't mutate mid-layout) but not across
     // passes, since a page's own class="" attributes can change between them.
     CSS::ClassCache classCache;
+
+    // Rules bucketed by what their rightmost compound requires - an id,
+    // else its first class, else its tag, else nothing (universal) - so
+    // computeStyle only tests an element against rules that could match
+    // it, instead of every rule on the page. Each rule sits in exactly one
+    // bucket. Rebuilt at the start of every layout() - cheap next to the
+    // layout itself, and it can't go stale when a stylesheet arrives or
+    // the page changes.
+    struct RuleIndex {
+        std::unordered_map<std::wstring, std::vector<const CSS::Rule*>> byId, byClass, byTag;
+        std::vector<const CSS::Rule*> universal;
+    } ruleIndex;
+    void rebuildRuleIndex();
 };

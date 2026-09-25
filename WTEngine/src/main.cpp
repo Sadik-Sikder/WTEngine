@@ -384,6 +384,10 @@ int wmain(int argc, wchar_t** argv) {
             default: break;
             }
         }
+        // Off the page (over the address bar) hovers nothing.
+        if (cy < AddressBar::kHeight) engine.updateHover(-1, -1);
+        else engine.updateHover(cx, cy);
+
         if (wanted != shownCursor) {
             glfwSetCursor(window, wanted);
             shownCursor = wanted;
