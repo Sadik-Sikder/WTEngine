@@ -87,6 +87,11 @@ void fireDueTimers(JSContext* ctx, double nowSeconds);
 // jobs. Called once per frame from Engine::render, like fireDueTimers.
 void pollFetches(JSContext* ctx);
 
+// Runs one line typed into the developer console against the page: logs it
+// as Input, then its value (formatted like a REPL shows it) as Result, or
+// the error it threw. Marks the DOM dirty, since it may have changed it.
+void evaluateInConsole(JSContext* ctx, const std::wstring& code);
+
 // The document's title: the text of the first <title> element under
 // `root` (outside any <svg>), with runs of whitespace collapsed to single
 // spaces and trimmed, as browsers do. Empty if there's no <title>.

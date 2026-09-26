@@ -6,6 +6,7 @@
 #include "Renderer.h"
 #include "Fetcher.h"
 #include "JSEngine.h"
+#include "DevConsole.h"
 #include <windows.h>
 #include <algorithm>
 #include <chrono>
@@ -235,6 +236,7 @@ void Engine::beginScripts() {
     // destroyed while any value is still alive. So: state, then old realm, then new.
     domState = DOMBindingState{};
     domState.pageUrl = pageBaseUrl; // so location.href/.replace()/.assign() have a base
+    consoleLog().clear(); // a new page starts with an empty console, as in browsers
     jsEngine.reset();
     jsEngine = std::make_unique<JSEngine>(); // fresh realm per page
     scriptTasks_.clear();
@@ -281,25 +283,30 @@ void Engine::advanceScripts() {
     while (scriptCursor_ < scriptTasks_.size()) {
         ScriptTask& task = scriptTasks_[scriptCursor_];
         std::wstring code;
+        std::wstring name; // what error stacks call this script, so the console can say which one threw
         if (task.external) {
             if (!scriptLoader_.ready(task.fetchIndex)) break; // wait here even if a later task is already ready
             const FetchResult& res = scriptLoader_.result(task.fetchIndex);
             scriptCursor_++;
-            if (!res.ok) continue;
+            if (!res.ok) {
+                consoleLog().add(LogLevel::Error, L"network", L"Failed to load script " +
+                                 scriptLoader_.url(task.fetchIndex) + L": " + res.error);
+                continue;
+            }
             code = res.html;
+            name = res.finalUrl;
         }
         else {
             code = task.inlineCode;
             scriptCursor_++;
+            name = L"<inline script " + std::to_wstring(scriptCursor_) + L">";
         }
         if (code.empty()) continue;
 
-        std::wstring result = jsEngine->eval(code);
-        if (result.rfind(L"Error: ", 0) == 0) {
-            std::wstring line = L"[script] " + result + L"\n";
-            wprintf(L"%ls", line.c_str());
-            OutputDebugStringW(line.c_str());
-        }
+        std::string filename; // URLs are ASCII; anything else just degrades the label
+        for (wchar_t c : name) filename.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+        JSEngine::Result result = jsEngine->eval(code, filename.c_str());
+        if (!result.ok) consoleLog().add(LogLevel::Error, L"script", result.text);
         domState.domDirty = true; // conservatively assume the script may have mutated the DOM
     }
 }
@@ -326,7 +333,11 @@ void Engine::pollResources() {
         if (!styleLoader_.ready(task.fetchIndex)) continue;
         task.applied = true;
         const FetchResult& res = styleLoader_.result(task.fetchIndex);
-        if (!res.ok) continue;
+        if (!res.ok) {
+            consoleLog().add(LogLevel::Error, L"network", L"Failed to load stylesheet " +
+                             styleLoader_.url(task.fetchIndex) + L": " + res.error);
+            continue;
+        }
 
         std::vector<CSS::Rule> extra = CSS::parseStylesheet(res.html);
         for (auto& r : extra) r.order += task.orderBase;
@@ -666,4 +677,17 @@ std::wstring Engine::linkAt(int x, int y, Renderer& renderer) const {
 void Engine::setTopInset(int px) {
     topInset = px;
     doLayout(); // re-clamp scroll for the new viewport height
+}
+
+// Called every frame (the console can open/close any time), so it only
+// re-clamps the scroll - no relayout: the page's width doesn't change.
+void Engine::setBottomInset(int px) {
+    if (px == bottomInset) return;
+    bottomInset = px;
+    int maxScroll = std::max(documentHeight - viewHeight(), 0);
+    scrollY = std::clamp(scrollY, 0, maxScroll);
+}
+
+void Engine::consoleEval(const std::wstring& code) {
+    if (jsEngine) evaluateInConsole(jsEngine->context(), code);
 }

@@ -37,7 +37,10 @@ public:
     // Back / Forward / Reload buttons drawn to the left of the field. While
     // a page is loading, Reload turns into Stop (a cross), like browsers -
     // which is also what shows that a click on Reload did something.
-    enum class NavButton { None, Back, Forward, Reload, Stop };
+    enum class NavButton { None, Back, Forward, Reload, Stop, ConsoleBadge };
+    // The page's JS error count, shown as a red badge at the bar's right
+    // end when nonzero; clicking it (NavButton::ConsoleBadge) opens the console.
+    void setErrorCount(int n) { errorCount_ = n; }
     void setNavEnabled(bool canGoBack, bool canGoForward, bool canReload, bool loading) {
         canBack_ = canGoBack; canForward_ = canGoForward; canReload_ = canReload; loading_ = loading;
     }
@@ -57,5 +60,8 @@ private:
     bool canForward_ = false;
     bool canReload_ = false;
     bool loading_ = false; // the Reload button shows Stop instead
+    int errorCount_ = 0;
+    int badgeWidth() const; // 0 when there are no errors
+    int windowWidth_ = 0;   // as of the last draw(), for hit-testing the badge
     float scrollX_ = 0; // horizontal scroll of the text inside the field
 };

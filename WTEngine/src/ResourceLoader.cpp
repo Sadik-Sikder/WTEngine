@@ -5,6 +5,7 @@ void ResourceLoader::start(std::vector<std::wstring> urls) {
     // Dropping the old slots is what abandons the previous batch.
     slots_.clear();
     slots_.reserve(urls.size());
+    urls_ = urls;
 
     for (auto& url : urls) {
         auto slot = std::make_shared<Slot>();
