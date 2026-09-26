@@ -56,7 +56,7 @@ build\Debug\WTEngine.exe [url-or-file]
 
 - With no command-line argument the built-in demo page (`kDefaultPage` in `main.cpp`) is shown.
 - With an argument, it is loaded through `navigate()`. That can be a URL or a local file path.
-- `console.log(...)` from page scripts appears in the console window (stdout) and the debugger's Output window.
+- `console.log(...)` and every uncaught JS error appear in the developer console (F12, §11), and are mirrored to the console window (stdout) and the debugger's Output window.
 
 ### Suggested reading order
 If you're new to the code, read in this order; each step builds on the previous one:
@@ -87,6 +87,7 @@ src/                       include/
   AddressBar.cpp             AddressBar.h
   TextEditor.cpp             TextEditor.h    — caret + selection for one line
   PageLoader.cpp             PageLoader.h    — background page fetch, §5
+  DevConsole.cpp             DevConsole.h    — console log + F12 panel, §11
   ResourceLoader.cpp         ResourceLoader.h — background script/stylesheet fetch, §5
                              PageHistory.h   — back/forward stacks (header only)
 third_party/quickjs-ng/    vendored JS engine, built unmodified
@@ -174,6 +175,7 @@ The page paints once immediately after `parseAndBuild`/`beginScripts` return - w
 | Ctrl+L, F6 | Focus the address bar |
 | F5, Ctrl+R | Reload (works while typing in a field too; ignored on key-repeat) |
 | Esc (nothing focused) | Stop the page load in progress |
+| F12 | Open/close the developer console (§11); opening focuses its input line |
 | Keys / chars | Go to the address bar if focused, otherwise to the focused page input |
 | Tab / Shift+Tab | Next/previous text field |
 | Ctrl+V / C / A | Paste / copy / select all (clipboard via GLFW). Copy is blocked for password fields |
@@ -413,6 +415,28 @@ Fixed with quickjs-ng's `JS_SetInterruptHandler` (`JSEngine.cpp`): installed onc
 
 Verified against three cases (a scratchpad test page + `CloseMainWindow`/stdout capture, since `wprintf` is fully-buffered once redirected and only flushes on normal process exit): a `<script>while(true){}</script>` page recovers and finishes rendering the rest of the DOM instead of hanging (confirmed both via `Process.Responding` staying `True` throughout and via `[script] Error: InternalError: interrupted` in the log); a `setInterval(() => { while(true){} }, 0)` is killed once and then *not* rescheduled (CPU time measured over the following 6s: +0.84s, not the ~6s repeated-kill churn it'd be if the timer kept re-firing); and a genuine `throw new Error(...)` still surfaces as `Error: <message>` unchanged, confirming no regression to the normal error path.
 
+### Developer console (`DevConsole.h`/`.cpp`)
+Everything a page's JS says or throws goes into `consoleLog()` - one process-wide `ConsoleLog`, UI-thread only (all JS runs there), cleared at the start of every page's scripts (`beginScripts`), capped at 1000 entries. Each `LogEntry` has a level (log / warn / error, plus `Input`/`Result` for the console's own input line) and a source; `add()` also mirrors it to stdout and the debugger's Output window as `[source] text`.
+
+**What gets captured** - including errors that used to vanish silently:
+
+| Source | From |
+|---|---|
+| `console` | `console.log/info/debug/warn/error` - arguments formatted by `__wtInspect` (strings as-is; objects/arrays expanded two levels; elements as `<p#id.class>`; errors with their stack) |
+| `script` | An uncaught error in a `<script>`. Scripts are evaluated with a filename - the script's URL, or `<inline script N>` - so the stack names the script and line |
+| `click handler`, `timer` | An exception in an event listener or a `setTimeout`/`setInterval` callback (previously swallowed) |
+| `promise` | A promise rejected with no handler by the end of a microtask checkpoint: `JS_SetHostPromiseRejectionTracker` records each rejection and forgets it if a handler is attached later; `runPendingJobs` reports what's left as `Uncaught (in promise) ...`, as browsers do. This is how a failed `fetch()` without `.catch` shows up |
+| `network` | An external script or stylesheet that failed to download (previously skipped silently) |
+| `input` | Errors from the console's own input line |
+
+A watchdog kill is reported as "Script stopped: it ran longer than 2000 ms...". `describeException` (JSEngine.cpp) formats any thrown value, using the bootstrap's `__wtInspect` when it exists.
+
+**The panel** (`DevConsolePanel`, F12 or the red error badge in the address bar): docked at the bottom, about 40% of the window height. `Engine::setBottomInset` shrinks the page's viewport to fit above it (scroll is re-clamped, no relayout). It shows entries newest-at-bottom with a per-level icon and color, `[source]` tags (omitted for plain console output), long lines and stacks wrapped to the panel width (re-wrapped only when the log or width changes), a header with error/warning counts plus Clear and Close, and mouse-wheel scrolling that follows new output while at the bottom.
+
+**The input line** evaluates JS against the page (`Engine::consoleEval` → `evaluateInConsole`, as a global script named `<console>`), echoing the line and its value formatted like a REPL (strings quoted), then running promise jobs and marking the DOM dirty so any change it made is laid out. Up/Down browse the input history; Ctrl+V/C/A work; Esc returns focus to the page. The address bar, a page field and the console input are mutually exclusive keyboard targets.
+
+**The error badge**: the address bar's right end shows a red "✖ N" whenever the log holds errors (`AddressBar::setErrorCount`, set each frame); clicking it opens the console.
+
 ### What JS can see
 Everything is installed by `installDOMBindings`.
 
@@ -471,7 +495,7 @@ A relative URL is resolved against the page's own URL with `resolveUrl` - same r
 - Listeners and timers hold `JSValue`s in `ListenerStorage` / `TimerStorage` (defined only in `JSBinding.cpp` so `quickjs.h` stays out of `Engine.h`). They are freed when the state is reset.
 
 ### Events and timers
-- **Click:** `dispatchClick` walks from the hit element up through `parent`, calling every registered listener at each level (bubbling). `preventDefault()` suppresses link navigation, and for form controls it cancels the control's action (checkbox toggle, form submit, dropdown open). `stopPropagation` does not exist; exceptions in listeners are swallowed (including a watchdog kill - see above; unlike timers, a hung click listener isn't auto-disabled, since a click doesn't repeat on its own the way an interval does).
+- **Click:** `dispatchClick` walks from the hit element up through `parent`, calling every registered listener at each level (bubbling). `preventDefault()` suppresses link navigation, and for form controls it cancels the control's action (checkbox toggle, form submit, dropdown open). `stopPropagation` does not exist; an exception in a listener is reported to the developer console ("click handler", with its stack) and bubbling continues (a watchdog kill included - see above; unlike timers, a hung click listener isn't auto-disabled, since a click doesn't repeat on its own the way an interval does). Timer callbacks' exceptions are likewise reported ("timer").
 - **Timers:** stored with an absolute due time on the same clock as `render()`'s `timeSeconds` (`glfwGetTime`). `fireDueTimers` runs once per frame, so timer resolution is one frame (~16 ms). Callbacks are looked up by id right before being called, so a timer can safely clear itself or others. New timers scheduled inside a callback wait until the next frame. Intervals resync to "now" instead of catching up on missed ticks. A callback killed by the script watchdog (above) is removed instead of being rescheduled - otherwise a broken `setInterval(fn, 0)` would get killed and immediately re-armed every frame forever, trading the old "window frozen" failure for a new "permanent 100% CPU" one.
 - **Dirty flag:** any mutating binding sets `domDirty`; `Engine::render` re-lays-out at the top of the next frame.
 
@@ -578,7 +602,7 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 - Radio buttons, file inputs, `<textarea>` (content dropped), and multi-line inputs are not supported. A `<select>` shows only direct `<option>` children (no `<optgroup>`).
 
 **JavaScript**
-- Unhandled promise rejections are silent (no rejection tracker), and errors thrown inside `.then` callbacks become rejections, so they are only visible if you add a `.catch`.
+- `window.onerror`/`unhandledrejection` events don't exist - errors reach the developer console (§11), not page code.
 - No `XMLHttpRequest`, `localStorage`, `DOMContentLoaded`/`load` events (`window.onload = fn` is accepted but never fired), computed style (`getComputedStyle`; `element.style` only sees inline declarations), `innerHTML` getter, `removeEventListener`, `stopPropagation`, or events other than `click`. (`location`, `fetch()`, `element.style`/`.value`/`.checked` and `document.title` are supported - §11.)
 - ES modules (`type="module"`) are skipped.
 - Re-parenting an already-attached node (`appendChild` of an existing element) silently does nothing.
