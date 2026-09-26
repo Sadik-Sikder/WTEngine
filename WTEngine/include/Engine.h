@@ -28,6 +28,11 @@ public:
     void onResize(int width, int height);
     void setRenderer(Renderer* r); // used to measure text for wrapping
     void setTopInset(int px);      // reserve space above the page (e.g. for the address bar)
+    void setBottomInset(int px);   // reserve space below it (e.g. for the developer console)
+
+    // Runs a line typed into the developer console against the current
+    // page (see evaluateInConsole); does nothing if the page has no JS realm.
+    void consoleEval(const std::wstring& code);
     void scroll(int delta);
     void render(Renderer& renderer, double timeSeconds = 0);
     int getDocumentHeight() const;
@@ -91,7 +96,8 @@ private:
     int width, height, documentHeight = 0;
     int scrollY = 0;
     int topInset = 0;
-    int viewHeight() const { return height - topInset; }
+    int bottomInset = 0;
+    int viewHeight() const { return height - topInset - bottomInset; }
 
     std::shared_ptr<Document> document;
     LayoutRoot layoutRoot;

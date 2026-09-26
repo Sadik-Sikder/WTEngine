@@ -28,6 +28,9 @@ public:
     // Only valid once ready(index) is true.
     const FetchResult& result(size_t index) const;
 
+    // The URL fetch `index` was started with (e.g. for an error message).
+    const std::wstring& url(size_t index) const { return urls_[index]; }
+
 private:
     struct Slot {
         mutable std::mutex mutex;
@@ -39,4 +42,5 @@ private:
     // holds weak_ptrs (see start()). Only ever touched from the thread that
     // calls start()/ready()/result() (Engine, i.e. the UI thread).
     std::vector<std::shared_ptr<Slot>> slots_;
+    std::vector<std::wstring> urls_; // parallel to slots_
 };

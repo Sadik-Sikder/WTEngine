@@ -33,6 +33,7 @@ namespace {
     const Color kSelection{ 0.68f, 0.82f, 1.0f, 1.0f };
     const Color kInk{ 0, 0, 0, 1 };
     const Color kPlaceholder{ 0.55f, 0.55f, 0.58f, 1.0f };
+    const Color kErrorBadge{ 0.82f, 0.12f, 0.15f, 1.0f };
 }
 
 void AddressBar::setText(const std::wstring& text) {
@@ -60,8 +61,14 @@ void AddressBar::onClick(int x, Renderer& renderer, double now) {
     else ed_.placeCaretAt(localX, renderer, kFontSize);
 }
 
+int AddressBar::badgeWidth() const {
+    return errorCount_ > 0 ? 54 : 0;
+}
+
 AddressBar::NavButton AddressBar::navButtonAt(int x, int y) const {
     if (y < kFieldY || y >= kFieldY + kFieldH) return NavButton::None;
+    if (int bw = badgeWidth(); bw && x >= windowWidth_ - kBarMargin - bw && x < windowWidth_ - kBarMargin)
+        return NavButton::ConsoleBadge;
     if (canBack_ && x >= kNavBackX && x < kNavBackX + kNavSize) return NavButton::Back;
     if (canForward_ && x >= kNavFwdX && x < kNavFwdX + kNavSize) return NavButton::Forward;
     if (x >= kNavReloadX && x < kNavReloadX + kNavSize) {
@@ -72,7 +79,9 @@ AddressBar::NavButton AddressBar::navButtonAt(int x, int y) const {
 }
 
 void AddressBar::draw(Renderer& r, int windowWidth, double t) {
-    const int fieldW = std::max(windowWidth - kFieldX - kBarMargin, 50);
+    windowWidth_ = windowWidth;
+    const int badgeW = badgeWidth();
+    const int fieldW = std::max(windowWidth - kFieldX - kBarMargin - (badgeW ? badgeW + 6 : 0), 50);
     const int viewW = fieldW - 2 * kTextPad; // visible text area
     const std::wstring& text = ed_.text();
 
@@ -128,6 +137,16 @@ void AddressBar::draw(Renderer& r, int windowWidth, double t) {
     }
 
     r.clearClip();
+
+    // JS error badge: a red "✖ N" at the right end, which opens the console.
+    if (badgeW) {
+        const float bx = (float)(windowWidth - kBarMargin - badgeW);
+        r.drawRect(bx, (float)kFieldY, (float)badgeW, (float)kFieldH, kErrorBadge);
+        const wchar_t cross[] = { 0x2716, 0 };
+        std::wstring label = std::wstring(cross) + L" " + (errorCount_ > 99 ? L"99+" : std::to_wstring(errorCount_));
+        float lw = r.measureText(label, 14, true);
+        r.drawText(bx + (badgeW - lw) / 2, (float)kFieldY + 5, label, 14, kField, true);
+    }
 }
 
 std::wstring AddressBar::normalizeInput(const std::wstring& input) {

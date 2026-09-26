@@ -5,6 +5,7 @@
 #pragma comment(lib, "winmm.lib")
 #include <string>
 #include "AddressBar.h"
+#include "DevConsole.h"
 #include "Engine.h"
 #include "Fetcher.h"
 #include "JSEngine.h"
@@ -37,6 +38,7 @@ struct App {
     PageHistory history;
     PageLoader pageLoader; // fetches navigate()'s target in the background; see applyFinishedNavigation
     std::wstring shownTitle; // what the window title bar currently says - see updateWindowTitle
+    DevConsolePanel console; // F12 - see DevConsole.h
 };
 
 static std::string toUtf8(const std::wstring& w) {
@@ -225,9 +227,11 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
         case AddressBar::NavButton::Forward: app->pendingHistory = 1; return;
         case AddressBar::NavButton::Reload:  app->pendingReload = true; return;
         case AddressBar::NavButton::Stop:    app->pendingStop = true; return;
+        case AddressBar::NavButton::ConsoleBadge: app->console.show(); return;
         case AddressBar::NavButton::None:    break;
         }
         app->engine->blurInput();
+        app->console.blur();
         app->bar.onClick(x, *app->renderer, glfwGetTime());
         return;
     }
@@ -237,6 +241,16 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
         app->bar.blur();
         app->bar.setText(app->currentUrl);
     }
+
+    // Click on the developer console: its buttons, or its input line
+    int fbW, fbH;
+    glfwGetFramebufferSize(window, &fbW, &fbH);
+    if (app->console.contains(y, fbH)) {
+        app->engine->blurInput();
+        app->console.onClick(x, y, fbW, fbH, *app->renderer, glfwGetTime());
+        return;
+    }
+    app->console.blur(); // a click on the page
 
     // Form controls first (focus a field, toggle a checkbox, press a button).
     // onClick runs their JS click listeners itself, so a control hit ends here.
@@ -257,6 +271,7 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
 static void onChar(GLFWwindow* window, unsigned int codepoint) {
     App* app = static_cast<App*>(glfwGetWindowUserPointer(window));
     if (app->bar.focused()) app->bar.onChar(codepoint);
+    else if (app->console.focused()) app->console.onChar(codepoint);
     else app->engine->onChar(codepoint);
 }
 
@@ -282,7 +297,43 @@ static void onKey(GLFWwindow* window, int key, int, int action, int mods) {
     // Ctrl+L / F6 jump to the address bar from anywhere
     if ((ctrl && key == GLFW_KEY_L) || key == GLFW_KEY_F6) {
         engine.blurInput();
+        app->console.blur();
         bar.focus();
+        return;
+    }
+
+    // F12: open/close the developer console. Opening it also focuses its
+    // input line, ready to type.
+    DevConsolePanel& console = app->console;
+    if (key == GLFW_KEY_F12) {
+        if (action != GLFW_PRESS) return;
+        console.toggle();
+        if (console.open()) {
+            if (bar.focused()) { bar.blur(); bar.setText(app->currentUrl); }
+            engine.blurInput();
+            int fbW, fbH;
+            glfwGetFramebufferSize(window, &fbW, &fbH);
+            console.onClick(0, fbH - 1, fbW, fbH, *app->renderer, glfwGetTime()); // same as clicking its input line
+        }
+        return;
+    }
+
+    // Keys for the console's input line, while it has focus
+    if (console.focused()) {
+        if (ctrl && key == GLFW_KEY_V) {
+            if (const char* clip = glfwGetClipboardString(window)) console.insert(fromUtf8(clip));
+        }
+        else if (ctrl && key == GLFW_KEY_C) {
+            std::wstring selection = console.selectedText();
+            if (!selection.empty()) glfwSetClipboardString(window, toUtf8(selection).c_str());
+        }
+        else if (ctrl && key == GLFW_KEY_A) {
+            console.selectAll();
+        }
+        else {
+            std::wstring code = console.onKey(key);
+            if (!code.empty()) engine.consoleEval(code);
+        }
         return;
     }
 
@@ -341,7 +392,11 @@ static void onKey(GLFWwindow* window, int key, int, int action, int mods) {
 
 static void onScroll(GLFWwindow* window, double, double yoffset) {
     App* app = static_cast<App*>(glfwGetWindowUserPointer(window));
-    app->engine->scroll(static_cast<int>(-yoffset * 40));
+    int x, y, fbW, fbH;
+    cursorInFramebuffer(window, x, y);
+    glfwGetFramebufferSize(window, &fbW, &fbH);
+    if (app->console.contains(y, fbH)) app->console.onScroll(yoffset); // wheel over the console scrolls its log
+    else app->engine->scroll(static_cast<int>(-yoffset * 40));
 }
 
 // The loop otherwise redraws as fast as it possibly can, spinning a CPU core
@@ -441,20 +496,27 @@ int wmain(int argc, wchar_t** argv) {
         glClear(GL_COLOR_BUFFER_BIT);
 
         engine.onResize(width, height);
+        engine.setBottomInset(app.console.height(height)); // the page scrolls within what the console leaves
         renderer.beginFrame(width, height, 0);
         engine.render(renderer, glfwGetTime());
         updateWindowTitle(app);
         app.bar.setNavEnabled(app.history.canGoBack(), app.history.canGoForward(), app.history.current() != nullptr,
                               app.pageLoader.loading());
+        app.bar.setErrorCount(consoleLog().errorCount());
         app.bar.draw(renderer, width, glfwGetTime()); // after the page so it covers overscroll
+        app.console.draw(renderer, width, height, glfwGetTime()); // likewise covers the page's bottom
 
         // I-beam over the address bar and text fields, hand over links and
         // buttons, arrow elsewhere
         int cx, cy;
         cursorInFramebuffer(window, cx, cy);
         GLFWcursor* wanted = nullptr;
+        bool overConsole = app.console.contains(cy, height);
         if (cy < AddressBar::kHeight) {
             wanted = app.bar.navButtonAt(cx, cy) != AddressBar::NavButton::None ? handCursor : ibeamCursor;
+        }
+        else if (overConsole) {
+            wanted = cy >= height - 28 ? ibeamCursor : nullptr; // I-beam on its input line
         }
         else {
             switch (engine.cursorAt(cx, cy, renderer)) {
@@ -463,8 +525,8 @@ int wmain(int argc, wchar_t** argv) {
             default: break;
             }
         }
-        // Off the page (over the address bar) hovers nothing.
-        if (cy < AddressBar::kHeight) engine.updateHover(-1, -1);
+        // Off the page (over the address bar or the console) hovers nothing.
+        if (cy < AddressBar::kHeight || overConsole) engine.updateHover(-1, -1);
         else engine.updateHover(cx, cy);
 
         if (wanted != shownCursor) {

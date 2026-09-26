@@ -9,14 +9,6 @@
 // Windows would flag the window "Not Responding".
 constexpr std::chrono::milliseconds kScriptTimeout{ 2000 };
 
-// Deadline the watchdog interrupt handler checks against. Lives at a
-// stable address for the JSRuntime's whole lifetime (a JSEngine member),
-// and is reachable from anywhere holding just a JSContext* via
-// JS_GetRuntimeOpaque - see JSEngine.cpp.
-struct JSWatchdogState {
-    std::chrono::steady_clock::time_point deadline;
-};
-
 // Resets the watchdog deadline to now() + kScriptTimeout. Every real entry
 // point into JS (JSEngine::eval, runPendingJobs, and JSBinding.cpp's
 // fireDueTimers/dispatchClick) must call this immediately before its
@@ -37,10 +29,13 @@ public:
     JSEngine(const JSEngine&) = delete;
     JSEngine& operator=(const JSEngine&) = delete;
 
-    // Evaluates `code` as a standalone global script and returns its
-    // result coerced to a string, or "Error: <message>" if it threw (this
-    // includes "Error: interrupted" if the watchdog killed it).
-    std::wstring eval(const std::wstring& code);
+    // Evaluates `code` as a standalone global script. `filename` is what
+    // error stacks name as its location (a script's URL, "<inline script
+    // 2>", ...). On success, `text` is the result coerced to a string; if
+    // it threw, `ok` is false and `text` describes the error (see
+    // describeException) - the caller decides whether to log it.
+    struct Result { bool ok; std::wstring text; };
+    Result eval(const std::wstring& code, const char* filename = "<eval>");
 
     // Exposes the underlying context so external code (DOM bindings) can
     // install itself into it. JSEngine itself stays DOM-agnostic - it
@@ -50,15 +45,30 @@ public:
 private:
     struct JSRuntime* rt = nullptr;
     struct JSContext* ctx = nullptr;
-    JSWatchdogState watchdog_;
+    // The watchdog deadline and not-yet-handled promise rejections, reachable
+    // from anywhere holding just a JSContext* via JS_GetRuntimeOpaque.
+    // Defined in JSEngine.cpp, since it holds JSValues.
+    struct RuntimeState* state_ = nullptr;
 };
 
 // Runs every queued promise job (.then/.catch callbacks, async/await
 // continuations) until the queue is empty, like a browser's microtask
 // checkpoint. quickjs never runs these on its own, so call this after
 // anything that can run JS: a script's eval, a timer callback, an event
-// listener. A job that throws is logged and the rest still run.
+// listener. Then reports to the console any promise rejected during all
+// that which still has no handler ("Uncaught (in promise) ..."), as
+// browsers do at the same point.
 void runPendingJobs(struct JSContext* ctx);
+
+// A readable description of a thrown value for the console: an Error's
+// "Name: message" plus its stack (which names the script and line), or any
+// other thrown value formatted like console.log would. A watchdog kill is
+// spelled out as such.
+std::wstring describeException(struct JSContext* ctx, struct JSValue exc);
+
+// Logs a caught exception to the console as an error from `source`
+// ("click handler", "timer", ...) and frees it.
+void reportException(struct JSContext* ctx, struct JSValue exc, const wchar_t* source);
 
 // Phase 0 acceptance check: evaluates a trivial expression and reports the
 // result via stdout and OutputDebugStringW. Superseded once a later phase

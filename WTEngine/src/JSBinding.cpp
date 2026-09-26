@@ -5,6 +5,7 @@
 #include "quickjs.h"
 #include "DOM.h"
 #include "CSS.h"
+#include "DevConsole.h"
 #include "HTMLParser.h"
 #include "Fetcher.h"
 #include <windows.h>
@@ -540,7 +541,7 @@ bool dispatchClick(JSContext* ctx, Element* target) {
         for (JSValue fn : fns) {
             ArmScriptWatchdog(ctx);
             JSValue result = JS_Call(ctx, fn, JS_UNDEFINED, 1, &eventObj);
-            if (JS_IsException(result)) JS_FreeValue(ctx, JS_GetException(ctx)); // swallow; keep bubbling
+            if (JS_IsException(result)) reportException(ctx, JS_GetException(ctx), L"click handler"); // then keep bubbling
             JS_FreeValue(ctx, result);
             runPendingJobs(ctx); // this listener's promise callbacks, like a microtask checkpoint
         }
@@ -620,7 +621,7 @@ void fireDueTimers(JSContext* ctx, double nowSeconds) {
         if (JS_IsException(result)) {
             JSValue exc = JS_GetException(ctx);
             killedByWatchdog = JS_IsUncatchableError(exc); // vs. an ordinary script throw
-            JS_FreeValue(ctx, exc); // swallow; keep firing the rest
+            reportException(ctx, exc, L"timer"); // then keep firing the rest
         }
         JS_FreeValue(ctx, result);
         JS_FreeValue(ctx, fn);
@@ -999,7 +1000,7 @@ void pollFetches(JSContext* ctx) {
             JSValue r = JS_Call(ctx, settle, JS_UNDEFINED, 1, &result);
             JS_FreeValue(ctx, r);
         } else {
-            JS_FreeValue(ctx, JS_GetException(ctx));
+            reportException(ctx, JS_GetException(ctx), L"fetch"); // building the Response failed
         }
         JS_FreeValue(ctx, result);
         JS_FreeValue(ctx, f.resolve);
@@ -1008,6 +1009,46 @@ void pollFetches(JSContext* ctx) {
     }
     JS_FreeValue(ctx, makeResponse);
     JS_FreeValue(ctx, global);
+}
+
+// --- The developer console --------------------------------------------
+// __wtConsole(level, text) is the native half of console.log/warn/error
+// (the bootstrap below formats the arguments; level 0 log, 1 warn, 2 error).
+
+static JSValue js_native_console(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    int32_t level = 0;
+    if (argc > 0) JS_ToInt32(ctx, &level, argv[0]);
+    consoleLog().add(level == 2 ? LogLevel::Error : level == 1 ? LogLevel::Warn : LogLevel::Log,
+                     L"console", argStr(ctx, argc, argv, 1));
+    return JS_UNDEFINED;
+}
+
+void evaluateInConsole(JSContext* ctx, const std::wstring& code) {
+    consoleLog().add(LogLevel::Input, L"input", code);
+
+    std::string src = wideToUtf8(code);
+    ArmScriptWatchdog(ctx);
+    JSValue result = JS_Eval(ctx, src.c_str(), src.size(), "<console>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(result)) {
+        reportException(ctx, JS_GetException(ctx), L"input");
+    } else {
+        // Formatted as a REPL shows values: strings quoted, objects expanded.
+        JSValue global = JS_GetGlobalObject(ctx);
+        JSValue inspect = JS_GetPropertyStr(ctx, global, "__wtInspect");
+        JSValue text = JS_Call(ctx, inspect, JS_UNDEFINED, 1, &result);
+        if (JS_IsException(text)) reportException(ctx, JS_GetException(ctx), L"input");
+        else {
+            const char* s = JS_ToCString(ctx, text);
+            consoleLog().add(LogLevel::Result, L"input", utf8ToWide(s));
+            JS_FreeCString(ctx, s);
+        }
+        JS_FreeValue(ctx, text);
+        JS_FreeValue(ctx, inspect);
+        JS_FreeValue(ctx, global);
+    }
+    JS_FreeValue(ctx, result);
+    runPendingJobs(ctx);
+    markDirty(ctx); // the line may well have changed the page
 }
 
 // The parts of the API that are simplest in JS itself: fetch()'s option
@@ -1068,6 +1109,58 @@ static const char kBootstrapJS[] = R"JS(
   };
 
   const nodeProto = Object.getPrototypeOf(document);
+
+  // Formats any value for the developer console, roughly as browsers do:
+  // strings quoted, elements as <tag#id.class>, arrays/objects expanded a
+  // couple of levels deep, errors as "Name: message" plus their stack
+  // (which names the script and line).
+  const inspect = (v, depth, seen) => {
+    if (v === null) return 'null';
+    switch (typeof v) {
+      case 'undefined': return 'undefined';
+      case 'string': return JSON.stringify(v);
+      case 'bigint': return v + 'n';
+      case 'symbol': return v.toString();
+      case 'function': return 'ƒ ' + (v.name || 'anonymous') + '()';
+      case 'number': case 'boolean': return String(v);
+    }
+    if (v instanceof Error) {
+      const head = (v.name || 'Error') + ': ' + v.message;
+      const stack = typeof v.stack === 'string' ? v.stack.replace(/\s+$/, '') : '';
+      return stack ? head + '\n' + stack : head;
+    }
+    if (Object.getPrototypeOf(v) === nodeProto) {
+      const tag = v.tagName;
+      if (!tag) return '#text ' + JSON.stringify(v.textContent);
+      const id = v.id ? '#' + v.id : '';
+      const cls = v.className ? '.' + v.className.trim().split(/\s+/).join('.') : '';
+      return '<' + tag.toLowerCase() + id + cls + '>';
+    }
+    if (seen.includes(v)) return '[Circular]';
+    if (depth >= 3) return Array.isArray(v) ? '[…]' : '{…}';
+    seen = seen.concat([v]);
+    try {
+      if (Array.isArray(v)) {
+        const items = v.slice(0, 50).map(x => inspect(x, depth + 1, seen));
+        if (v.length > 50) items.push('… ' + (v.length - 50) + ' more');
+        return '[' + items.join(', ') + ']';
+      }
+      if (v instanceof Promise) return 'Promise {…}';
+      const keys = Object.keys(v);
+      const items = keys.slice(0, 30).map(k => (/^[A-Za-z_$][\w$]*$/.test(k) ? k : JSON.stringify(k)) + ': ' + inspect(v[k], depth + 1, seen));
+      if (keys.length > 30) items.push('…');
+      const name = v.constructor && v.constructor !== Object && v.constructor.name ? v.constructor.name + ' ' : '';
+      return name + '{' + items.join(', ') + '}';
+    } catch (e) {
+      return String(v);
+    }
+  };
+  g.__wtInspect = v => inspect(v, 0, []);
+
+  // console.*: plain strings print as-is, anything else via inspect.
+  const fmt = args => args.map(a => typeof a === 'string' ? a : inspect(a, 0, [])).join(' ');
+  for (const [name, level] of [['log', 0], ['info', 0], ['debug', 0], ['warn', 1], ['error', 2]])
+    console[name] = (...args) => __wtConsole(level, fmt(args));
   const kebab = p => p === 'cssFloat' ? 'float' : p.replace(/[A-Z]/g, m => '-' + m.toLowerCase());
   const parse = el => {
     const out = [];
@@ -1146,6 +1239,7 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("clearInterval", 1, js_clearTimer),
     JS_CGETSET_DEF("location", js_get_location, js_set_location),
     JS_CFUNC_DEF("__wtFetch", 4, js_native_fetch), // the native half of fetch() - see kBootstrapJS
+    JS_CFUNC_DEF("__wtConsole", 2, js_native_console), // the native half of console.* - see kBootstrapJS
 };
 
 void installDOMBindings(JSContext* ctx, Element* documentRoot, DOMBindingState* state) {
@@ -1196,14 +1290,6 @@ void installDOMBindings(JSContext* ctx, Element* documentRoot, DOMBindingState* 
     // Last, since it builds on `document` and the natives above.
     ArmScriptWatchdog(ctx);
     JSValue boot = JS_Eval(ctx, kBootstrapJS, sizeof(kBootstrapJS) - 1, "<wtengine-bootstrap>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(boot)) {
-        JSValue exc = JS_GetException(ctx);
-        const char* msg = JS_ToCString(ctx, exc);
-        OutputDebugStringA("WTEngine bootstrap JS failed: ");
-        OutputDebugStringA(msg ? msg : "?");
-        OutputDebugStringA("\n");
-        JS_FreeCString(ctx, msg);
-        JS_FreeValue(ctx, exc);
-    }
+    if (JS_IsException(boot)) reportException(ctx, JS_GetException(ctx), L"engine bootstrap"); // a WTEngine bug, not the page's
     JS_FreeValue(ctx, boot);
 }
