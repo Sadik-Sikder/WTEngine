@@ -88,6 +88,7 @@ src/                       include/
   TextEditor.cpp             TextEditor.h    — caret + selection for one line
   PageLoader.cpp             PageLoader.h    — background page fetch, §5
   DevConsole.cpp             DevConsole.h    — console log + F12 panel, §11
+  FindBar.cpp                FindBar.h       — the Ctrl+F find bar, §10
   ResourceLoader.cpp         ResourceLoader.h — background script/stylesheet fetch, §5
                              PageHistory.h   — back/forward stacks (header only)
 third_party/quickjs-ng/    vendored JS engine, built unmodified
@@ -181,7 +182,10 @@ The page paints once immediately after `parseAndBuild`/`beginScripts` return - w
 | Ctrl+V / C / A | Paste / copy / select all (clipboard via GLFW). Copy is blocked for password fields |
 | Enter | Address bar: `normalizeInput` then navigate. Page field: submit its form |
 | Esc | Blur, and restore the address bar text |
-| Scroll wheel | `Engine::scroll(-yoffset * 40)` |
+| Scroll wheel | `Engine::scroll(-yoffset * 40)`; over the console, scrolls its log; with Ctrl held, zooms |
+| ↑ ↓, PageUp/PageDown, Space / Shift+Space, Home/End (nothing focused) | Scroll a line (40 px) / a screenful minus a line / to the top or bottom (`Engine::scrollLines`/`scrollPages`/`scrollToEdge`) |
+| Ctrl+= / Ctrl+− / Ctrl+0, Ctrl+wheel | Zoom in / out / reset, through Chrome's steps (25%–500%); works while typing too. The address bar shows "125%" when not at 100%; clicking it resets |
+| Ctrl+F; F3 / Shift+F3, Ctrl+G | Find in page; next / previous match (Enter / Shift+Enter in the find field too; Esc closes) |
 
 `AddressBar::normalizeInput` leaves anything containing `://` alone, treats drive-letter paths, UNC paths and existing files as local, and otherwise prepends `https://`.
 
@@ -384,13 +388,23 @@ Clears any open dropdown, runs `layoutRoot.layout()`, recomputes `documentHeight
 5. `drawOpenSelect` overlay.
 
 ### Coordinates
-There are two spaces. **Document space** is what layout produces (`b.x`, `b.y`). **Window space** is what mouse events use. Convert with `docY = y − topInset + scrollY`. X needs no conversion.
+There are two spaces. **Page (document) space** is what layout produces (`b.x`, `b.y`), in page pixels. **Window space** is what mouse events use. Every hit test converts through one function, `Engine::toPage`: `pageX = x / zoom`, `pageY = (y − topInset) / zoom + scrollY` (false above the page). Drawing goes the other way through the renderer's page transform (§14): `render()` draws boxes at `b.y − scrollY` and `Renderer::setPageTransform(topInset, zoom)` moves and scales that into place, so drawing code never adds `topInset` itself. Browser UI - the address bar, scrollbar, find bar and console - is drawn in window space, unzoomed.
 
 ### Hit-testing
 All hit-tests scan `boxes` in **reverse** (last painted = topmost):
 - `linkAt` — words with an `href`, tested against the actual text width.
 - `controlAt` — form controls, by bounding box.
 - `dispatchClick` — any box with an `el`, by bounding box.
+- All of them take window coordinates and convert with `toPage` (see Coordinates), so they work at any zoom.
+
+### Scrolling, zoom and find
+- **Keyboard scrolling** (nothing focused): arrows a line (40 px), PageUp/PageDown/Space a screenful minus one line of overlap, Home/End the very top/bottom.
+- **Scrollbar**: an overlay along the page's right edge (12 px, window space; no layout space reserved), drawn only when the page is taller than the viewport. The thumb's size and position come from `viewHeight/documentHeight` and `scrollY/maxScroll` (`scrollbarGeometry`, min 30 px). Dragging keeps the grab point under the mouse (`beginScrollbarDrag`/`dragScrollbar`, followed each frame by `main.cpp` until mouse-up); a click on the track pages towards it. It darkens on hover, and the page under it gets no hover or cursor.
+- **Zoom** (`setZoom`, 0.25–5): layout runs at `width / zoom`, so text reflows, and `viewHeight()` is in page pixels. Text is measured for layout at the size it'll be drawn (`measurePageText`: rasterized at `round(size × zoom)`, divided back) - otherwise zoomed words come out slightly wider than plain scaling and crowd into each other's spaces.
+- **Find in page** (`findText`/`findNext`/`clearFind`; the UI is `FindBar`): the visible text boxes are joined with single spaces into one lower-cased stream, with a map back to each character's box, so matches are case-insensitive and can span words and lines (a whitespace run in the query matches one space). Each match is a list of per-box character ranges; `render()` draws them behind the text - yellow, the current one orange. A new search starts at the first match at or below the top of the view (wrapping), and the current match is scrolled a third of the way down if it isn't visible. `doLayout()` re-runs the search against the new boxes, so it survives relayouts - including a new page's - keeping the current index without scrolling. Capped at 1000 matches.
+- All of them take window coordinates and convert with `toPage` (see Coordinates), so they work at any zoom.
+
+
 
 ## 11. JavaScript (`JSEngine.cpp`, `JSBinding.cpp`)
 
@@ -530,7 +544,7 @@ HTTP(S) I/O goes through **Boost.Beast/Asio + OpenSSL** (from vcpkg, `x64-window
 | `fetchPageAsync(url, postBody?, options, onDone)` | Text, for pages (`FetchPriority::Page`, `Accept: text/html`) and scripts/stylesheets (`Blocking`, `Accept: */*`). `GET`, or `POST` with a form body; anything non-http is read as a local file path. Status ≥ 400 → error. Follows up to 10 redirects (`followRedirect`: as GET after a 301/302/303; a 307/308 keeps the method and body). Decodes UTF-8 (BOM stripped). Reports the final URL after redirects |
 | `fetchHttpAsync(HttpRequest, onDone)` | For JS `fetch()` (§11), at `FetchPriority::Fetch`. Any method, extra headers (overriding the defaults), a body. Delivers status, raw body bytes (decompressed), `Content-Type` and the final URL. An HTTP error status is still a completed response (`ok` = a response arrived). A non-http URL is read as a local file (status 200) |
 | `fetchBytesAsync(url, options, onDone)` | Raw bytes, for images (`FetchPriority::Image`): http(s), local file, or `data:…;base64,…` URI |
-| `resolveUrl(base, href)` | Makes an absolute URL via `InternetCombineUrl`. Returns `""` for fragments (`#…`), non-http schemes (`javascript:`, `mailto:`, …), and relative links from a local file |
+| `resolveUrl(base, href)` | Makes an absolute URL via `InternetCombineUrl`. Returns `""` for fragments (`#…`) and non-http schemes (`javascript:`, `mailto:`, …). **From a local page** (a Windows path), resolves against the page file's folder (`resolveLocal`): relative (`sub/a.html`, `../img/x.png`), root-relative (`/x` → the drive or share root), absolute paths and `file:` URLs; `%20`-style escapes are decoded (as UTF-8), `..` never climbs above the root, and a `?query`/`#fragment` is dropped (a file has nowhere to send them). So links, images, stylesheets, scripts and `fetch()` all work on a multi-file site opened from disk. A web page can't link to local files |
 | `urlEncodeForm(text)` | UTF-8 percent-encoding, space → `+` |
 | `withQuery(url, query)` | Replaces the query string and fragment |
 
@@ -554,6 +568,7 @@ All network I/O - pages (`PageLoader`, §5), scripts and stylesheets (`ResourceL
 `Renderer` is an abstract interface (`drawRect`, `drawText`, `measureText`, `drawImage`, `preloadImage`, `imageGeneration`, `setClip`, `clearClip`); `OpenGLRenderer` is the only implementation. `parseColor`/`tryParseColor` (declared in `Renderer.h`, defined in `Engine.cpp`) turn any CSS color from §8 into a `Color`; `parseColor` falls back to light gray, `tryParseColor` returns false so callers can ignore invalid values. `drawText`/`measureText` take an optional `bold` flag.
 
 - **Projection:** `glOrtho(0, w, h, 0)` — top-left origin, y down. `scrollY` is not passed to the renderer; `Engine` subtracts it before drawing.
+- **Page transform** (`setPageTransform(offsetY, scale)` / `resetTransform`, reset by `beginFrame`): a modelview translate+scale for the page area - below the address bar, at the zoom. `drawText` rasterizes at `round(size × scale)` and draws the quad at `1/scale` that size, snapped to whole screen pixels, so zoomed text is sharp; `setClip` applies the transform by hand (scissor rects ignore the modelview matrix). Textures use `GL_CLAMP_TO_EDGE`, or scaled words/images would show a faint line where linear filtering wraps one edge into the other.
 - **Rects:** immediate-mode `GL_QUADS`.
 - **Text:** rendered once with GDI (white on black into a DIB, Segoe UI, anti-aliased), converted so brightness becomes alpha, and uploaded as an RGBA texture. The colour is applied at draw time via `glColor4f`, so one texture serves any colour. Cached in `textCache` keyed by `text@size` (plus a `b` suffix for bold). **The cache never evicts.**
 - **`measureText`:** GDI `GetTextExtentPoint32W` with a cached `HFONT` per size, so measuring doesn't create textures.
