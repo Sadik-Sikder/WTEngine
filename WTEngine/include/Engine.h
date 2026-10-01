@@ -3,6 +3,7 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include <algorithm>
 #include "DOM.h"
 #include "JSBinding.h"
 #include "Layout.h"
@@ -34,6 +35,25 @@ public:
     // page (see evaluateInConsole); does nothing if the page has no JS realm.
     void consoleEval(const std::wstring& code);
     void scroll(int delta);
+
+    // Keyboard scrolling: a "line" (arrow keys), a screenful (PageUp/PageDown/
+    // Space - a little less than the viewport, so some context stays
+    // visible, as browsers do), or the very top/bottom (Home/End).
+    void scrollLines(int lines);
+    void scrollPages(int pages);
+    void scrollToEdge(bool bottom);
+
+    // The overlay scrollbar along the page's right edge, in window
+    // coordinates. Drawn by render() only when the page is taller than the
+    // viewport. Drag the thumb (begin/drag/end), or click the track to move
+    // a screenful towards the click.
+    enum class ScrollbarPart { None, Thumb, Track };
+    ScrollbarPart scrollbarAt(int x, int y) const;
+    void beginScrollbarDrag(int y);
+    void dragScrollbar(int y);
+    void endScrollbarDrag() { draggingScrollbar_ = false; }
+    bool draggingScrollbar() const { return draggingScrollbar_; }
+    void pageTowards(int y);
     void render(Renderer& renderer, double timeSeconds = 0);
     int getDocumentHeight() const;
     int getScrollY() const { return scrollY; }
@@ -98,6 +118,16 @@ private:
     int topInset = 0;
     int bottomInset = 0;
     int viewHeight() const { return height - topInset - bottomInset; }
+
+    // Scrollbar state (see scrollbarAt).
+    bool draggingScrollbar_ = false;
+    float dragGrabOffset_ = 0;      // where on the thumb the drag started, so it doesn't jump
+    bool scrollbarHovered_ = false; // set by updateHover; the thumb darkens
+    // The track and thumb, in window coordinates; false when the page fits
+    // and there's no scrollbar.
+    bool scrollbarGeometry(float& trackTop, float& trackH, float& thumbTop, float& thumbH) const;
+    int maxScroll() const { return std::max(documentHeight - viewHeight(), 0); }
+    void drawScrollbar(Renderer& renderer);
 
     std::shared_ptr<Document> document;
     LayoutRoot layoutRoot;

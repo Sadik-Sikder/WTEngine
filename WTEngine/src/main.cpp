@@ -209,8 +209,12 @@ static void cursorInFramebuffer(GLFWwindow* window, int& x, int& y) {
 }
 
 static void onMouseButton(GLFWwindow* window, int button, int action, int) {
-    if (action != GLFW_PRESS) return;
     App* app = static_cast<App*>(glfwGetWindowUserPointer(window));
+    if (action == GLFW_RELEASE && button == GLFW_MOUSE_BUTTON_LEFT) {
+        app->engine->endScrollbarDrag();
+        return;
+    }
+    if (action != GLFW_PRESS) return;
 
     // Mouse side buttons: back / forward
     if (button == GLFW_MOUSE_BUTTON_4) { app->pendingHistory = -1; return; }
@@ -251,6 +255,14 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
         return;
     }
     app->console.blur(); // a click on the page
+
+    // The scrollbar, overlaid on the page's right edge: drag the thumb, or
+    // click the track to move a screenful towards the click.
+    switch (app->engine->scrollbarAt(x, y)) {
+    case Engine::ScrollbarPart::Thumb: app->engine->beginScrollbarDrag(y); return;
+    case Engine::ScrollbarPart::Track: app->engine->pageTowards(y); return;
+    case Engine::ScrollbarPart::None:  break;
+    }
 
     // Form controls first (focus a field, toggle a checkbox, press a button).
     // onClick runs their JS click listeners itself, so a control hit ends here.
@@ -340,9 +352,23 @@ static void onKey(GLFWwindow* window, int key, int, int action, int mods) {
     // Keys go to whichever text field has focus: the address bar or a page input
     bool inBar = bar.focused();
     if (!inBar && !engine.hasFocusedInput()) {
-        // Esc with nothing focused stops a page load, like a browser's.
-        // (In a field, Esc keeps its meaning - blur / discard edits - below.)
-        if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS && app->pageLoader.loading()) app->pendingStop = true;
+        // Nothing has keyboard focus, so keys act on the page itself.
+        bool shift = (mods & GLFW_MOD_SHIFT) != 0;
+        switch (key) {
+        case GLFW_KEY_DOWN:      engine.scrollLines(1); break;
+        case GLFW_KEY_UP:        engine.scrollLines(-1); break;
+        case GLFW_KEY_PAGE_DOWN: engine.scrollPages(1); break;
+        case GLFW_KEY_PAGE_UP:   engine.scrollPages(-1); break;
+        case GLFW_KEY_SPACE:     engine.scrollPages(shift ? -1 : 1); break; // as in browsers
+        case GLFW_KEY_HOME:      engine.scrollToEdge(false); break;
+        case GLFW_KEY_END:       engine.scrollToEdge(true); break;
+        case GLFW_KEY_ESCAPE:
+            // Esc stops a page load, like a browser's. (In a field, Esc
+            // keeps its meaning - blur / discard edits - below.)
+            if (action == GLFW_PRESS && app->pageLoader.loading()) app->pendingStop = true;
+            break;
+        default: break;
+        }
         return;
     }
 
@@ -512,11 +538,15 @@ int wmain(int argc, wchar_t** argv) {
         cursorInFramebuffer(window, cx, cy);
         GLFWcursor* wanted = nullptr;
         bool overConsole = app.console.contains(cy, height);
+        if (engine.draggingScrollbar()) engine.dragScrollbar(cy); // follows the mouse until the button is released
         if (cy < AddressBar::kHeight) {
             wanted = app.bar.navButtonAt(cx, cy) != AddressBar::NavButton::None ? handCursor : ibeamCursor;
         }
         else if (overConsole) {
             wanted = cy >= height - 28 ? ibeamCursor : nullptr; // I-beam on its input line
+        }
+        else if (engine.draggingScrollbar() || engine.scrollbarAt(cx, cy) != Engine::ScrollbarPart::None) {
+            wanted = nullptr; // plain arrow over the scrollbar, not whatever page content is beneath it
         }
         else {
             switch (engine.cursorAt(cx, cy, renderer)) {

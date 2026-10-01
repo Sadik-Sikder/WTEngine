@@ -610,6 +610,7 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     }
 
     drawOpenSelect(renderer); // on top of the page, same treatment main.cpp gives AddressBar
+    drawScrollbar(renderer); // window coordinates: browser UI, not zoomed
 }
 
 std::wstring Engine::title() const {
@@ -622,6 +623,9 @@ std::wstring Engine::title() const {
 static constexpr double kHoverRelayoutBudgetMs = 50;
 
 void Engine::updateHover(int x, int y) {
+    scrollbarHovered_ = scrollbarAt(x, y) != ScrollbarPart::None;
+    if (scrollbarHovered_) { x = -1; y = -1; } // the page under the scrollbar isn't hovered
+
     // A pending DOM mutation means layoutRoot.boxes may point at freed
     // elements; render() will relayout first, and the next call catches up.
     if (!document || domState.domDirty) return;
@@ -686,6 +690,73 @@ void Engine::setBottomInset(int px) {
     bottomInset = px;
     int maxScroll = std::max(documentHeight - viewHeight(), 0);
     scrollY = std::clamp(scrollY, 0, maxScroll);
+}
+
+// --- Keyboard scrolling and the scrollbar ------------------------------
+
+static constexpr int kLineScroll = 40;        // px per arrow-key press (same as one wheel notch)
+static constexpr int kScrollbarWidth = 12;
+static constexpr float kMinThumb = 30;
+
+void Engine::scrollLines(int lines) { scroll(lines * kLineScroll); }
+
+void Engine::scrollPages(int pages) {
+    int page = std::max(viewHeight() - kLineScroll, kLineScroll); // keep a line of overlap for context
+    scroll(pages * page);
+}
+
+void Engine::scrollToEdge(bool bottom) {
+    scrollY = bottom ? maxScroll() : 0;
+}
+
+bool Engine::scrollbarGeometry(float& trackTop, float& trackH, float& thumbTop, float& thumbH) const {
+    if (documentHeight <= viewHeight() || viewHeight() <= 0) return false;
+    trackTop = (float)topInset;
+    trackH = (float)(height - topInset - bottomInset);
+    thumbH = std::max(trackH * viewHeight() / documentHeight, kMinThumb);
+    thumbTop = trackTop + (trackH - thumbH) * scrollY / std::max(maxScroll(), 1);
+    return true;
+}
+
+Engine::ScrollbarPart Engine::scrollbarAt(int x, int y) const {
+    float trackTop, trackH, thumbTop, thumbH;
+    if (!scrollbarGeometry(trackTop, trackH, thumbTop, thumbH)) return ScrollbarPart::None;
+    if (x < width - kScrollbarWidth || y < trackTop || y >= trackTop + trackH) return ScrollbarPart::None;
+    return (y >= thumbTop && y < thumbTop + thumbH) ? ScrollbarPart::Thumb : ScrollbarPart::Track;
+}
+
+void Engine::beginScrollbarDrag(int y) {
+    float trackTop, trackH, thumbTop, thumbH;
+    if (!scrollbarGeometry(trackTop, trackH, thumbTop, thumbH)) return;
+    draggingScrollbar_ = true;
+    dragGrabOffset_ = y - thumbTop;
+}
+
+void Engine::dragScrollbar(int y) {
+    float trackTop, trackH, thumbTop, thumbH;
+    if (!draggingScrollbar_ || !scrollbarGeometry(trackTop, trackH, thumbTop, thumbH)) return;
+    float range = trackH - thumbH;
+    float t = range > 0 ? std::clamp((y - dragGrabOffset_ - trackTop) / range, 0.0f, 1.0f) : 0.0f;
+    scrollY = (int)std::lround(t * maxScroll());
+}
+
+void Engine::pageTowards(int y) {
+    float trackTop, trackH, thumbTop, thumbH;
+    if (!scrollbarGeometry(trackTop, trackH, thumbTop, thumbH)) return;
+    scrollPages(y < thumbTop ? -1 : 1);
+}
+
+// An overlay bar, drawn over the page's right edge in window coordinates,
+// as modern browsers do on touch-friendly platforms; no layout space is
+// reserved for it.
+void Engine::drawScrollbar(Renderer& renderer) {
+    float trackTop, trackH, thumbTop, thumbH;
+    if (!scrollbarGeometry(trackTop, trackH, thumbTop, thumbH)) return;
+    const float x = (float)(width - kScrollbarWidth);
+    renderer.drawRect(x, trackTop, (float)kScrollbarWidth, trackH, Color{ 0.93f, 0.93f, 0.94f, 0.85f });
+    const bool active = draggingScrollbar_ || scrollbarHovered_;
+    const float shade = active ? 0.45f : 0.65f;
+    renderer.drawRect(x + 2, thumbTop + 2, (float)kScrollbarWidth - 4, thumbH - 4, Color{ shade, shade, shade + 0.02f, 1.0f });
 }
 
 void Engine::consoleEval(const std::wstring& code) {
