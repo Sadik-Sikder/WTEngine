@@ -45,6 +45,7 @@ add_executable(WTEngine
     src/OpenGLRenderer.cpp
     src/PageLoader.cpp
     src/DevConsole.cpp
+    src/FindBar.cpp
     src/ResourceLoader.cpp
 )
 

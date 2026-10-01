@@ -38,6 +38,17 @@ public:
     void setZoom(float zoom);
     float zoom() const { return zoom_; }
 
+    // --- Find in page (Ctrl+F) ----------------------------------------
+    // Searches the page's visible text, case-insensitively and across word
+    // and line boundaries, highlighting every match; the current one is
+    // highlighted differently and scrolled into view. The search is kept
+    // up to date as the page relayouts (until clearFind).
+    void findText(const std::wstring& query); // a new search, starting at the first match in view
+    void findNext(bool backwards);
+    void clearFind();
+    int findMatchCount() const { return (int)findMatches_.size(); }
+    int findCurrentIndex() const { return findCurrent_; } // -1 when there are no matches
+
     // Runs a line typed into the developer console against the current
     // page (see evaluateInConsole); does nothing if the page has no JS realm.
     void consoleEval(const std::wstring& code);
@@ -125,6 +136,20 @@ private:
     int topInset = 0;
     int bottomInset = 0;
     float zoom_ = 1.0f;
+
+    // Find in page. A match can span several text boxes (layout makes one
+    // box per word), so it's a list of character ranges, one per box.
+    struct FindSpan { size_t box; size_t start, end; }; // [start, end) within boxes[box].text
+    struct FindMatch { std::vector<FindSpan> spans; };
+    std::wstring findQuery_;
+    std::vector<FindMatch> findMatches_;
+    int findCurrent_ = -1;
+    // Per layout box, the spans to highlight in it (and whether each is part
+    // of the current match) - rebuilt along with findMatches_.
+    std::vector<std::vector<std::pair<FindSpan, bool>>> findHighlights_;
+    void runFind();                // recomputes findMatches_ against the current layout
+    void rebuildFindHighlights();
+    void scrollToFindMatch();
     // A text's width in page pixels as it will actually be drawn: at the
     // zoomed size the renderer rasterizes it at (see drawText), scaled back
     // by the zoom. Layout wraps with this, so words don't crowd together

@@ -8,6 +8,7 @@
 #include <cmath>
 #include "AddressBar.h"
 #include "DevConsole.h"
+#include "FindBar.h"
 #include "Engine.h"
 #include "Fetcher.h"
 #include "JSEngine.h"
@@ -41,6 +42,7 @@ struct App {
     PageLoader pageLoader; // fetches navigate()'s target in the background; see applyFinishedNavigation
     std::wstring shownTitle; // what the window title bar currently says - see updateWindowTitle
     DevConsolePanel console; // F12 - see DevConsole.h
+    FindBar find;            // Ctrl+F - see FindBar.h
 };
 
 static std::string toUtf8(const std::wstring& w) {
@@ -197,6 +199,17 @@ static void submitForm(App& app, const FormSubmission& form) {
     else navigate(app, withQuery(target, form.body));
 }
 
+// Carries out what a key or click in the find bar asked for.
+static void applyFindAction(App& app, FindBar::Action action) {
+    switch (action) {
+    case FindBar::Action::Edited:   app.engine->findText(app.find.query()); break; // search as you type
+    case FindBar::Action::Next:     app.engine->findNext(false); break;
+    case FindBar::Action::Previous: app.engine->findNext(true); break;
+    case FindBar::Action::Close:    app.engine->clearFind(); break;
+    case FindBar::Action::None:     break;
+    }
+}
+
 // Page zoom steps - the same ones Chrome uses.
 static const float kZoomLevels[] = { 0.25f, 0.33f, 0.5f, 0.67f, 0.75f, 0.8f, 0.9f, 1.0f,
                                      1.1f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f, 3.0f, 4.0f, 5.0f };
@@ -254,6 +267,7 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
         }
         app->engine->blurInput();
         app->console.blur();
+        app->find.blur();
         app->bar.onClick(x, *app->renderer, glfwGetTime());
         return;
     }
@@ -264,9 +278,18 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
         app->bar.setText(app->currentUrl);
     }
 
-    // Click on the developer console: its buttons, or its input line
+    // Click on the find bar: its buttons, or its search field
     int fbW, fbH;
     glfwGetFramebufferSize(window, &fbW, &fbH);
+    if (app->find.contains(x, y, fbW)) {
+        app->engine->blurInput();
+        app->console.blur();
+        applyFindAction(*app, app->find.onClick(x, y, fbW, *app->renderer, glfwGetTime()));
+        return;
+    }
+    app->find.blur(); // stays open, with its highlights, until closed
+
+    // Click on the developer console: its buttons, or its input line
     if (app->console.contains(y, fbH)) {
         app->engine->blurInput();
         app->console.onClick(x, y, fbW, fbH, *app->renderer, glfwGetTime());
@@ -301,6 +324,7 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
 static void onChar(GLFWwindow* window, unsigned int codepoint) {
     App* app = static_cast<App*>(glfwGetWindowUserPointer(window));
     if (app->bar.focused()) app->bar.onChar(codepoint);
+    else if (app->find.focused()) applyFindAction(*app, app->find.onChar(codepoint));
     else if (app->console.focused()) app->console.onChar(codepoint);
     else app->engine->onChar(codepoint);
 }
@@ -336,7 +360,44 @@ static void onKey(GLFWwindow* window, int key, int, int action, int mods) {
     if ((ctrl && key == GLFW_KEY_L) || key == GLFW_KEY_F6) {
         engine.blurInput();
         app->console.blur();
+        app->find.blur();
         bar.focus();
+        return;
+    }
+
+    // Ctrl+F: open (or return to) the find bar, its text selected so typing
+    // replaces it; an existing query is searched again on this page.
+    FindBar& find = app->find;
+    if (ctrl && key == GLFW_KEY_F) {
+        if (bar.focused()) { bar.blur(); bar.setText(app->currentUrl); }
+        engine.blurInput();
+        app->console.blur();
+        find.openAndFocus();
+        if (!find.query().empty()) engine.findText(find.query());
+        return;
+    }
+
+    // F3 / Shift+F3, Ctrl+G / Ctrl+Shift+G: next / previous match, from anywhere
+    if (key == GLFW_KEY_F3 || (ctrl && key == GLFW_KEY_G)) {
+        if (find.open()) applyFindAction(*app, (mods & GLFW_MOD_SHIFT) ? FindBar::Action::Previous : FindBar::Action::Next);
+        return;
+    }
+
+    // Keys for the find bar's field, while it has focus
+    if (find.focused()) {
+        if (ctrl && key == GLFW_KEY_V) {
+            if (const char* clip = glfwGetClipboardString(window)) applyFindAction(*app, find.insert(fromUtf8(clip)));
+        }
+        else if (ctrl && key == GLFW_KEY_C) {
+            std::wstring selection = find.selectedText();
+            if (!selection.empty()) glfwSetClipboardString(window, toUtf8(selection).c_str());
+        }
+        else if (ctrl && key == GLFW_KEY_A) {
+            find.selectAll();
+        }
+        else {
+            applyFindAction(*app, find.onKey(key, (mods & GLFW_MOD_SHIFT) != 0));
+        }
         return;
     }
 
@@ -349,6 +410,7 @@ static void onKey(GLFWwindow* window, int key, int, int action, int mods) {
         if (console.open()) {
             if (bar.focused()) { bar.blur(); bar.setText(app->currentUrl); }
             engine.blurInput();
+            find.blur();
             int fbW, fbH;
             glfwGetFramebufferSize(window, &fbW, &fbH);
             console.onClick(0, fbH - 1, fbW, fbH, *app->renderer, glfwGetTime()); // same as clicking its input line
@@ -561,6 +623,7 @@ int wmain(int argc, wchar_t** argv) {
         app.bar.setZoomPercent((int)std::lround(engine.zoom() * 100));
         app.bar.draw(renderer, width, glfwGetTime()); // after the page so it covers overscroll
         app.console.draw(renderer, width, height, glfwGetTime()); // likewise covers the page's bottom
+        app.find.draw(renderer, width, engine.findCurrentIndex(), engine.findMatchCount(), glfwGetTime());
 
         // I-beam over the address bar and text fields, hand over links and
         // buttons, arrow elsewhere
@@ -568,9 +631,13 @@ int wmain(int argc, wchar_t** argv) {
         cursorInFramebuffer(window, cx, cy);
         GLFWcursor* wanted = nullptr;
         bool overConsole = app.console.contains(cy, height);
+        bool overFind = app.find.contains(cx, cy, width);
         if (engine.draggingScrollbar()) engine.dragScrollbar(cy); // follows the mouse until the button is released
         if (cy < AddressBar::kHeight) {
             wanted = app.bar.navButtonAt(cx, cy) != AddressBar::NavButton::None ? handCursor : ibeamCursor;
+        }
+        else if (overFind) {
+            wanted = nullptr; // its own small UI; the page beneath doesn't get hover
         }
         else if (overConsole) {
             wanted = cy >= height - 28 ? ibeamCursor : nullptr; // I-beam on its input line
@@ -585,8 +652,8 @@ int wmain(int argc, wchar_t** argv) {
             default: break;
             }
         }
-        // Off the page (over the address bar or the console) hovers nothing.
-        if (cy < AddressBar::kHeight || overConsole) engine.updateHover(-1, -1);
+        // Off the page (over the address bar, the find bar or the console) hovers nothing.
+        if (cy < AddressBar::kHeight || overConsole || overFind) engine.updateHover(-1, -1);
         else engine.updateHover(cx, cy);
 
         if (wanted != shownCursor) {

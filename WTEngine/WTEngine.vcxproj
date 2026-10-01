@@ -151,6 +151,7 @@
     <ClCompile Include="src\OpenGLRenderer.cpp" />
     <ClCompile Include="src\PageLoader.cpp" />
     <ClCompile Include="src\DevConsole.cpp" />
+    <ClCompile Include="src\FindBar.cpp" />
     <ClCompile Include="src\ResourceLoader.cpp" />
   </ItemGroup>
   <!-- The vendored quickjs-ng engine, compiled straight into this project. Mirrors the
@@ -186,6 +187,7 @@
     <ClInclude Include="include\OpenGLRenderer.h" />
     <ClInclude Include="include\PageLoader.h" />
     <ClInclude Include="include\DevConsole.h" />
+    <ClInclude Include="include\FindBar.h" />
     <ClInclude Include="include\Renderer.h" />
     <ClInclude Include="include\ResourceLoader.h" />
   </ItemGroup>

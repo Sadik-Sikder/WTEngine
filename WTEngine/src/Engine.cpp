@@ -490,6 +490,10 @@ void Engine::doLayout() {
 
     if (scrollY > maxScroll) scrollY = maxScroll;
     if (scrollY < 0) scrollY = 0;
+
+    // Find matches point into the boxes just replaced - redo the search
+    // against the new layout (keeping the current match, but not scrolling).
+    if (!findQuery_.empty()) runFind();
 }
 
 int Engine::getDocumentHeight() const {
@@ -598,6 +602,19 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
             std::wstring src = resolveImageSrc(pageBaseUrl, b.imageSrc);
             if (!src.empty()) renderer.drawImage(b.x, screenY, b.width, b.height, src);
             continue;
+        }
+
+        // Find-in-page highlights, behind the text: yellow for every match,
+        // orange for the current one, as in browsers.
+        size_t boxIndex = &b - layoutRoot.boxes.data();
+        if (boxIndex < findHighlights_.size()) {
+            float fs = b.fontSize > 0 ? (float)b.fontSize : 14;
+            for (const auto& [span, current] : findHighlights_[boxIndex]) {
+                float x0 = measurePageText(renderer, b.text.substr(0, span.start), fs, b.bold);
+                float x1 = measurePageText(renderer, b.text.substr(0, span.end), fs, b.bold);
+                renderer.drawRect(b.x + 4 + x0, (float)screenY + 2, x1 - x0, fs + 6,
+                                  current ? Color{ 1.0f, 0.60f, 0.15f, 1 } : Color{ 1.0f, 0.93f, 0.35f, 1 });
+            }
         }
 
         // Draw text. An empty color means black; links arrive already
@@ -771,6 +788,102 @@ void Engine::setZoom(float zoom) {
     zoom_ = zoom;
     layoutRoot.viewportWidth = (int)(width / zoom_);
     doLayout(); // reflows at the new width, and re-clamps the scroll
+}
+
+// --- Find in page ------------------------------------------------------
+
+static constexpr size_t kMaxFindMatches = 1000; // a one-letter search on a huge page stays cheap
+
+static std::wstring lowered(std::wstring s) {
+    for (auto& c : s) c = (wchar_t)towlower(c);
+    return s;
+}
+
+// Searches the page's visible text in paint order (= document order for
+// flowing text). Layout makes one box per word, so the boxes' words are
+// joined with single spaces into one stream - which also lets a search
+// for "two words" match across boxes and lines - with a map from each
+// stream character back to its box and position.
+void Engine::runFind() {
+    findMatches_.clear();
+    std::wstring query;
+    for (wchar_t c : lowered(findQuery_)) { // runs of whitespace in the query match a single space
+        if (iswspace(c)) { if (!query.empty() && query.back() != L' ') query.push_back(L' '); }
+        else query.push_back(c);
+    }
+    while (!query.empty() && query.back() == L' ') query.pop_back();
+
+    if (!query.empty()) {
+        std::wstring stream;
+        struct Origin { size_t box, pos; };
+        std::vector<Origin> origin;
+        const auto& boxes = layoutRoot.boxes;
+        for (size_t i = 0; i < boxes.size(); i++) {
+            const LayoutBox& b = boxes[i];
+            if (b.text.empty() || b.control != LayoutBox::NoControl || b.visuallyHidden || !b.imageSrc.empty()) continue;
+            if (!stream.empty()) { stream.push_back(L' '); origin.push_back({ SIZE_MAX, 0 }); }
+            std::wstring word = lowered(b.text);
+            for (size_t k = 0; k < word.size(); k++) { stream.push_back(word[k]); origin.push_back({ i, k }); }
+        }
+        for (size_t pos = stream.find(query); pos != std::wstring::npos && findMatches_.size() < kMaxFindMatches;
+             pos = stream.find(query, pos + query.size())) {
+            FindMatch m;
+            for (size_t k = pos; k < pos + query.size(); k++) {
+                const Origin& o = origin[k];
+                if (o.box == SIZE_MAX) continue; // the joining space between two boxes
+                if (!m.spans.empty() && m.spans.back().box == o.box) m.spans.back().end = o.pos + 1;
+                else m.spans.push_back({ o.box, o.pos, o.pos + 1 });
+            }
+            if (!m.spans.empty()) findMatches_.push_back(std::move(m));
+        }
+    }
+    if (findMatches_.empty()) findCurrent_ = -1;
+    else findCurrent_ = std::clamp(findCurrent_, 0, (int)findMatches_.size() - 1);
+    rebuildFindHighlights();
+}
+
+void Engine::rebuildFindHighlights() {
+    findHighlights_.assign(layoutRoot.boxes.size(), {});
+    for (size_t m = 0; m < findMatches_.size(); m++)
+        for (const FindSpan& s : findMatches_[m].spans)
+            findHighlights_[s.box].push_back({ s, (int)m == findCurrent_ });
+}
+
+void Engine::scrollToFindMatch() {
+    if (findCurrent_ < 0) return;
+    const FindMatch& m = findMatches_[findCurrent_];
+    const LayoutBox& first = layoutRoot.boxes[m.spans.front().box];
+    const LayoutBox& last = layoutRoot.boxes[m.spans.back().box];
+    if (first.y >= scrollY && last.y + last.height <= scrollY + viewHeight()) return; // already in view
+    scroll((first.y - viewHeight() / 3) - scrollY); // a third of the way down, like focusing a field
+}
+
+void Engine::findText(const std::wstring& query) {
+    findQuery_ = query;
+    findCurrent_ = 0;
+    runFind();
+    // Start from the first match at or below the top of the view, as
+    // browsers do, rather than jumping back to the top of the page.
+    for (size_t i = 0; i < findMatches_.size(); i++) {
+        if (layoutRoot.boxes[findMatches_[i].spans.front().box].y >= scrollY) { findCurrent_ = (int)i; break; }
+    }
+    rebuildFindHighlights();
+    scrollToFindMatch();
+}
+
+void Engine::findNext(bool backwards) {
+    if (findMatches_.empty()) return;
+    int n = (int)findMatches_.size();
+    findCurrent_ = (findCurrent_ + (backwards ? n - 1 : 1)) % n; // wraps around, as browsers do
+    rebuildFindHighlights();
+    scrollToFindMatch();
+}
+
+void Engine::clearFind() {
+    findQuery_.clear();
+    findMatches_.clear();
+    findCurrent_ = -1;
+    findHighlights_.clear();
 }
 
 float Engine::measurePageText(Renderer& r, const std::wstring& text, float fontSize, bool bold) const {
