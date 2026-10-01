@@ -133,11 +133,21 @@ Each iteration (capped at ~60 fps with `Sleep`):
 
 1. **Apply pending actions** set by input callbacks: history back/forward (`pendingHistory`), navigation (`pendingUrl`), and a queued form submission (`engine.takeSubmission`). Callbacks never navigate directly; they set a flag and the loop does it. That keeps fetching out of the callback stack.
 2. `applyFinishedNavigation` — shows a background page fetch's result the moment it's ready (below).
-3. Clear, set the viewport, `engine.onResize()`.
-4. `renderer.beginFrame()` then `engine.render()` — draws the page.
-5. `bar.draw()` — drawn **after** the page so it covers content scrolled under it.
-6. Choose the cursor (I-beam over text fields/address bar, hand over links/buttons/nav buttons).
-7. Swap buffers, poll events, sleep the remainder of the 16.6 ms budget.
+3. `drawFrame(app)`, steps 4–8:
+4. Clear, set the viewport, `engine.onResize()`.
+5. `renderer.beginFrame()` then `engine.render()` — draws the page.
+6. `bar.draw()`, the console and the find bar — drawn **after** the page so they cover content scrolled under them.
+7. Choose the cursor (I-beam over text fields/address bar, hand over links/buttons/nav buttons).
+8. Swap buffers.
+9. Poll events, sleep the remainder of the 16.6 ms budget.
+
+**Live resizing.** While the user drags a window edge, Windows runs its own modal sizing loop *inside* `glfwPollEvents()`, so the main loop above doesn't run again until the mouse is released - the window used to show stale, stretched content for the whole drag. `drawFrame` is therefore also called from GLFW's window-refresh callback (`onWindowRefresh`), which Windows triggers on each size change during that loop; `App::drawing` guards against a refresh delivered from inside a frame. `Engine::onResize` keeps those frames cheap: a height-only change just re-clamps the scroll (layout depends only on width), and a width change relayouts immediately only if the last layout took ≤ 30 ms. Otherwise the relayout is deferred (`relayoutPending_`, checked at the top of `render()`):
+- **always by one frame**, so the window first repaints at its new size with the old layout instead of sitting unpainted (or showing Windows' stretched snapshot) while the relayout runs - most visible on maximize, snap and restore;
+- **while the user is dragging an edge, until the size holds still for 150 ms** (or the drag ends), so the drag stays smooth. GLFW doesn't report drags, so `main.cpp` wraps GLFW's window procedure (`sizingWindowProc`) to catch `WM_ENTERSIZEMOVE`/`WM_EXITSIZEMOVE` and tells the engine (`Engine::setLiveResize`). A maximize isn't a drag, so it doesn't wait.
+
+Measured on Wikipedia's Tiger article, Release build, on battery: after a maximize, the window paints at full size ~110 ms in (most of that is Windows' maximize animation), and the reflowed layout is up ~530 ms in.
+
+**Build type matters a lot here.** Measured on Wikipedia's Tiger article (on battery): a full layout is ~4.6 s in a Debug build but ~0.36 s in Release - the Debug STL's checked iterators dominate. Judge resize smoothness (or any layout-heavy behavior) with a Release build; in Debug, the one deferred relayout after a resize still freezes the window for seconds on a page that size.
 
 ### Navigation (`PageLoader`)
 Page fetching is **backgrounded**: `navigate(url, postBody?)` calls `app.pageLoader.start(url, postBody, replace)`, which hands the request to Fetcher's network thread (`fetchPageAsync`, §13) and returns immediately - so the frame loop, and the window's message pump with it, keeps running while a fetch is in flight, however long it takes. (It originally ran on a detached thread per navigation; see §13's "The network thread" for why everything now shares one.) `applyFinishedNavigation` polls `pageLoader.poll(...)` once per frame; the moment a result is ready, it shows the page (`visitPage`) or a generated red error page, exactly as if the fetch had been synchronous.
