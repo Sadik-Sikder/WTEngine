@@ -31,6 +31,13 @@ public:
     void setTopInset(int px);      // reserve space above the page (e.g. for the address bar)
     void setBottomInset(int px);   // reserve space below it (e.g. for the developer console)
 
+    // Page zoom (1 = 100%). The page is laid out as if the window were
+    // 1/zoom as wide - so text reflows, as in a browser - then drawn scaled
+    // up by zoom. Scroll positions and layout are in page pixels; window
+    // coordinates from the mouse are converted (toPage).
+    void setZoom(float zoom);
+    float zoom() const { return zoom_; }
+
     // Runs a line typed into the developer console against the current
     // page (see evaluateInConsole); does nothing if the page has no JS realm.
     void consoleEval(const std::wstring& code);
@@ -117,7 +124,15 @@ private:
     int scrollY = 0;
     int topInset = 0;
     int bottomInset = 0;
-    int viewHeight() const { return height - topInset - bottomInset; }
+    float zoom_ = 1.0f;
+    // A text's width in page pixels as it will actually be drawn: at the
+    // zoomed size the renderer rasterizes it at (see drawText), scaled back
+    // by the zoom. Layout wraps with this, so words don't crowd together
+    // when the zoomed glyphs come out a little wider than plain scaling.
+    float measurePageText(Renderer& r, const std::wstring& text, float fontSize, bool bold) const;
+    // Window point -> page point (layout coordinates, scroll included).
+    // False above the page (over the address bar).
+    bool toPage(int x, int y, int& pageX, int& pageY) const;
 
     // Scrollbar state (see scrollbarAt).
     bool draggingScrollbar_ = false;
@@ -128,6 +143,8 @@ private:
     bool scrollbarGeometry(float& trackTop, float& trackH, float& thumbTop, float& thumbH) const;
     int maxScroll() const { return std::max(documentHeight - viewHeight(), 0); }
     void drawScrollbar(Renderer& renderer);
+    // The visible part of the page, in page pixels (so zoom shrinks it).
+    int viewHeight() const { return (int)((height - topInset - bottomInset) / zoom_); }
 
     std::shared_ptr<Document> document;
     LayoutRoot layoutRoot;

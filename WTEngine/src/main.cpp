@@ -4,6 +4,8 @@
 #include <timeapi.h>
 #pragma comment(lib, "winmm.lib")
 #include <string>
+#include <algorithm>
+#include <cmath>
 #include "AddressBar.h"
 #include "DevConsole.h"
 #include "Engine.h"
@@ -195,6 +197,21 @@ static void submitForm(App& app, const FormSubmission& form) {
     else navigate(app, withQuery(target, form.body));
 }
 
+// Page zoom steps - the same ones Chrome uses.
+static const float kZoomLevels[] = { 0.25f, 0.33f, 0.5f, 0.67f, 0.75f, 0.8f, 0.9f, 1.0f,
+                                     1.1f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f, 3.0f, 4.0f, 5.0f };
+
+// One zoom step in (+1) or out (-1) from the current level.
+static void stepZoom(App& app, int direction) {
+    const int count = (int)(sizeof(kZoomLevels) / sizeof(kZoomLevels[0]));
+    float current = app.engine->zoom();
+    int nearest = 0;
+    for (int i = 1; i < count; i++)
+        if (std::fabs(kZoomLevels[i] - current) < std::fabs(kZoomLevels[nearest] - current)) nearest = i;
+    int next = std::clamp(nearest + direction, 0, count - 1);
+    app.engine->setZoom(kZoomLevels[next]);
+}
+
 // Cursor position in framebuffer pixels (matches the engine's coordinate space).
 static void cursorInFramebuffer(GLFWwindow* window, int& x, int& y) {
     double cx, cy;
@@ -232,6 +249,7 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
         case AddressBar::NavButton::Reload:  app->pendingReload = true; return;
         case AddressBar::NavButton::Stop:    app->pendingStop = true; return;
         case AddressBar::NavButton::ConsoleBadge: app->console.show(); return;
+        case AddressBar::NavButton::ZoomReset: app->engine->setZoom(1.0f); return;
         case AddressBar::NavButton::None:    break;
         }
         app->engine->blurInput();
@@ -304,6 +322,14 @@ static void onKey(GLFWwindow* window, int key, int, int action, int mods) {
     if (key == GLFW_KEY_F5 || (ctrl && key == GLFW_KEY_R)) {
         if (action == GLFW_PRESS) app->pendingReload = true; // not on key-repeat: holding F5 shouldn't reload 30 times a second
         return;
+    }
+
+    // Ctrl+= / Ctrl+- / Ctrl+0 (and the numpad's + - 0): zoom in / out /
+    // reset. Like F5, works even while typing in a field.
+    if (ctrl) {
+        if (key == GLFW_KEY_EQUAL || key == GLFW_KEY_KP_ADD) { stepZoom(*app, 1); return; }
+        if (key == GLFW_KEY_MINUS || key == GLFW_KEY_KP_SUBTRACT) { stepZoom(*app, -1); return; }
+        if (key == GLFW_KEY_0 || key == GLFW_KEY_KP_0) { engine.setZoom(1.0f); return; }
     }
 
     // Ctrl+L / F6 jump to the address bar from anywhere
@@ -421,7 +447,10 @@ static void onScroll(GLFWwindow* window, double, double yoffset) {
     int x, y, fbW, fbH;
     cursorInFramebuffer(window, x, y);
     glfwGetFramebufferSize(window, &fbW, &fbH);
+    bool ctrl = glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+                glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
     if (app->console.contains(y, fbH)) app->console.onScroll(yoffset); // wheel over the console scrolls its log
+    else if (ctrl) stepZoom(*app, yoffset > 0 ? 1 : -1);               // Ctrl+wheel zooms, as in browsers
     else app->engine->scroll(static_cast<int>(-yoffset * 40));
 }
 
@@ -529,6 +558,7 @@ int wmain(int argc, wchar_t** argv) {
         app.bar.setNavEnabled(app.history.canGoBack(), app.history.canGoForward(), app.history.current() != nullptr,
                               app.pageLoader.loading());
         app.bar.setErrorCount(consoleLog().errorCount());
+        app.bar.setZoomPercent((int)std::lround(engine.zoom() * 100));
         app.bar.draw(renderer, width, glfwGetTime()); // after the page so it covers overscroll
         app.console.draw(renderer, width, height, glfwGetTime()); // likewise covers the page's bottom
 

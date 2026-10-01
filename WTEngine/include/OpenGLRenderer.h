@@ -64,10 +64,14 @@ public:
     int imageGeneration() const override { return imageGen; }
     void setClip(float x, float y, float w, float h) override;
     void clearClip() override;
+    void setPageTransform(float offsetY, float scale) override;
+    void resetTransform() override;
 
 private:
     std::map<std::wstring, TextTexture> textCache;
     int frameHeight = 0; // framebuffer height, for flipping scissor coordinates
+    float transformOffsetY = 0; // see setPageTransform
+    float transformScale = 1;
     HDC measureDC = nullptr;
     std::map<std::pair<int, bool>, HFONT> measureFonts; // (font size, bold) -> font, for measureText
     bool comInitialized = false; // whether we own COM's lifetime (needed for WIC image decoding)

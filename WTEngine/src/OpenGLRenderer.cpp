@@ -1,4 +1,8 @@
 #include "OpenGLRenderer.h"
+
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE 0x812F // OpenGL 1.2; Windows' gl.h only declares 1.1
+#endif
 #include "Fetcher.h"
 #include <vector>
 #include <algorithm>
@@ -170,6 +174,11 @@ const TextTexture& OpenGLRenderer::getOrCreateTextTexture(const std::wstring& te
     glBindTexture(GL_TEXTURE_2D, tex.id);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // Clamp, not the default repeat: when a texture is drawn scaled (page
+    // zoom), linear filtering would otherwise blend its left edge into its
+    // right one, leaving a faint line at the edge of words and images.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, texW, texH, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
 
     auto result = textCache.emplace(key, tex);
@@ -188,6 +197,8 @@ void OpenGLRenderer::beginFrame(int width, int height, float scrollY) {
     glLoadIdentity();
     glOrtho(0, width, height, 0, -1, 1); 
     glMatrixMode(GL_MODELVIEW);
+    transformOffsetY = 0; // a new frame starts untransformed
+    transformScale = 1;
     glLoadIdentity();
 }
 
@@ -209,7 +220,21 @@ void OpenGLRenderer::drawText(float x, float y, const std::wstring& text,
     float fontSize, Color color, bool bold) {
     if (text.empty()) return;
 
-    const TextTexture& tex = getOrCreateTextTexture(text, fontSize, bold);
+    // Under a zoom (setPageTransform), rasterize at the size the text will
+    // actually appear on screen and draw the quad that much smaller in page
+    // coordinates - the transform scales it back up 1:1 - so zoomed text
+    // is sharp instead of a stretched texture.
+    float pixelSize = std::round(fontSize * transformScale);
+    const TextTexture& tex = getOrCreateTextTexture(text, std::max(pixelSize, 1.0f), bold);
+    float w = tex.width / transformScale;
+    float h = tex.height / transformScale;
+    if (transformScale != 1.0f) {
+        // Snap the quad's corner to a whole screen pixel, so each texel
+        // lands exactly on one pixel - a fractional position would make
+        // linear filtering smear the glyphs.
+        x = std::round(x * transformScale) / transformScale;
+        y = (std::round(transformOffsetY + y * transformScale) - transformOffsetY) / transformScale;
+    }
 
     glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, tex.id);
@@ -217,9 +242,9 @@ void OpenGLRenderer::drawText(float x, float y, const std::wstring& text,
 
     glBegin(GL_QUADS);
     glTexCoord2f(0.0f, 0.0f); glVertex2f(x, y);
-    glTexCoord2f(1.0f, 0.0f); glVertex2f(x + tex.width, y);
-    glTexCoord2f(1.0f, 1.0f); glVertex2f(x + tex.width, y + tex.height);
-    glTexCoord2f(0.0f, 1.0f); glVertex2f(x, y + tex.height);
+    glTexCoord2f(1.0f, 0.0f); glVertex2f(x + w, y);
+    glTexCoord2f(1.0f, 1.0f); glVertex2f(x + w, y + h);
+    glTexCoord2f(0.0f, 1.0f); glVertex2f(x, y + h);
     glEnd();
 
     glDisable(GL_TEXTURE_2D);
@@ -306,6 +331,11 @@ void OpenGLRenderer::drainPendingImageUploads() {
             glBindTexture(GL_TEXTURE_2D, tex.id);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            // Clamp, not the default repeat: when a texture is drawn scaled (page
+            // zoom), linear filtering would otherwise blend its left edge into its
+            // right one, leaving a faint line at the edge of words and images.
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, u.width, u.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, u.rgba.data());
             tex.width = u.width;
             tex.height = u.height;
@@ -373,8 +403,28 @@ float OpenGLRenderer::measureText(const std::wstring& text, float fontSize, bool
     return static_cast<float>(sz.cx);
 }
 
+void OpenGLRenderer::setPageTransform(float offsetY, float scale) {
+    transformOffsetY = offsetY;
+    transformScale = scale;
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glTranslatef(0, offsetY, 0);
+    glScalef(scale, scale, 1);
+}
+
+void OpenGLRenderer::resetTransform() {
+    transformOffsetY = 0;
+    transformScale = 1;
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+}
+
 // glScissor's origin is the bottom-left corner, our coordinates are top-left.
+// glScissor also ignores the modelview matrix, so the page transform is
+// applied here by hand.
 void OpenGLRenderer::setClip(float x, float y, float w, float h) {
+    x *= transformScale; w *= transformScale; h *= transformScale;
+    y = transformOffsetY + y * transformScale;
     int left = (int)std::floor(x);
     int top = (int)std::floor(y);
     int right = (int)std::ceil(x + w);

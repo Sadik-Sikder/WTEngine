@@ -37,7 +37,11 @@ public:
     // Back / Forward / Reload buttons drawn to the left of the field. While
     // a page is loading, Reload turns into Stop (a cross), like browsers -
     // which is also what shows that a click on Reload did something.
-    enum class NavButton { None, Back, Forward, Reload, Stop, ConsoleBadge };
+    enum class NavButton { None, Back, Forward, Reload, Stop, ConsoleBadge, ZoomReset };
+    // The page zoom in percent; when it isn't 100, a "125%" pill shows at
+    // the bar's right end (left of the error badge), and clicking it
+    // (NavButton::ZoomReset) goes back to 100%, as in browsers.
+    void setZoomPercent(int percent) { zoomPercent_ = percent; }
     // The page's JS error count, shown as a red badge at the bar's right
     // end when nonzero; clicking it (NavButton::ConsoleBadge) opens the console.
     void setErrorCount(int n) { errorCount_ = n; }
@@ -63,5 +67,7 @@ private:
     int errorCount_ = 0;
     int badgeWidth() const; // 0 when there are no errors
     int windowWidth_ = 0;   // as of the last draw(), for hit-testing the badge
+    int zoomPercent_ = 100;
+    int zoomPillWidth() const { return zoomPercent_ != 100 ? 52 : 0; }
     float scrollX_ = 0; // horizontal scroll of the text inside the field
 };

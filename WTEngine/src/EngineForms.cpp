@@ -147,13 +147,13 @@ namespace {
 }
 
 const LayoutBox* Engine::controlAt(int x, int y) const {
-    if (y < topInset) return nullptr;
-    int docY = y - topInset + scrollY;
+    int docX, docY;
+    if (!toPage(x, y, docX, docY)) return nullptr;
 
     for (auto it = layoutRoot.boxes.rbegin(); it != layoutRoot.boxes.rend(); ++it) {
         const auto& b = *it;
         if (b.control == LayoutBox::NoControl) continue;
-        if (x >= b.x && x < b.x + b.width && docY >= b.y && docY < b.y + b.height) return &b;
+        if (docX >= b.x && docX < b.x + b.width && docY >= b.y && docY < b.y + b.height) return &b;
     }
     return nullptr;
 }
@@ -187,14 +187,14 @@ bool Engine::onClick(int x, int y, double now, Renderer& renderer) {
         // it hit one of the dropdown's rows, otherwise just dismisses it
         // (clicking outside a native <select> popup doesn't also activate
         // whatever's underneath).
-        if (y >= topInset) {
-            int docY = y - topInset + scrollY;
+        int docX, docY;
+        if (toPage(x, y, docX, docY)) {
             int rowHeight = std::max(24, openSelectBox.fontSize + 10);
             int rowY = openSelectBox.y + openSelectBox.height;
             std::vector<Element*> opts = selectOptions(openSelect);
             for (size_t i = 0; i < opts.size(); i++) {
                 int top = rowY + (int)i * rowHeight;
-                if (x >= openSelectBox.x && x < openSelectBox.x + openSelectBox.width &&
+                if (docX >= openSelectBox.x && docX < openSelectBox.x + openSelectBox.width &&
                     docY >= top && docY < top + rowHeight) {
                     chooseOption(openSelect, opts[i]);
                     break;
@@ -231,7 +231,9 @@ bool Engine::onClick(int x, int y, double now, Renderer& renderer) {
         bool isDouble = editor.registerClick(x, now);
         if (focusedEl != b->el) focusInput(*b);
         float fs = b->fontSize > 0 ? (float)b->fontSize : kDefaultFont;
-        float localX = x - (b->x + kInputPad) + inputScrollX;
+        int docX, docY;
+        toPage(x, y, docX, docY); // on the page: controlAt already found this box there
+        float localX = docX - (b->x + kInputPad) + inputScrollX;
         if (isDouble) editor.selectWordAt(localX, renderer, fs);
         else editor.placeCaretAt(localX, renderer, fs);
         break;
@@ -263,12 +265,12 @@ bool Engine::onClick(int x, int y, double now, Renderer& renderer) {
 // a click listener's target usually covers its whole box (e.g. a <div
 // onclick>), not just the visible text inside it.
 Element* Engine::elementAt(int x, int y) const {
-    if (y < topInset) return nullptr;
-    int docY = y - topInset + scrollY;
+    int docX, docY;
+    if (!toPage(x, y, docX, docY)) return nullptr;
     for (auto it = layoutRoot.boxes.rbegin(); it != layoutRoot.boxes.rend(); ++it) {
         const auto& b = *it;
         if (!b.el) continue;
-        if (x >= b.x && x < b.x + b.width && docY >= b.y && docY < b.y + b.height) return b.el;
+        if (docX >= b.x && docX < b.x + b.width && docY >= b.y && docY < b.y + b.height) return b.el;
     }
     return nullptr;
 }
@@ -449,7 +451,7 @@ void Engine::drawOpenSelect(Renderer& r) {
 
     const LayoutBox& b = openSelectBox;
     const float fx = (float)b.x;
-    const float fy = (float)(b.y - scrollY + topInset + b.height);
+    const float fy = (float)(b.y - scrollY + b.height); // page coordinates: drawn under render()'s page transform
     const float fw = (float)b.width;
     const float kFont = b.fontSize > 0 ? (float)b.fontSize : kDefaultFont;
     const float rowHeight = (float)std::max(24, b.fontSize + 10);

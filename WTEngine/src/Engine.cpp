@@ -167,7 +167,7 @@ Engine::Engine(int w, int h)
     layoutRoot.viewportWidth = width;
     layoutRoot.hover = &hoverSet;
     layoutRoot.measureText = [this](const std::wstring& text, int fontSize, bool bold) {
-        return measurer ? measurer->measureText(text, (float)fontSize, bold)
+        return measurer ? measurePageText(*measurer, text, (float)fontSize, bold)
                         : text.size() * fontSize * 0.55f;
     };
     layoutRoot.loadImage = [this](const std::wstring& src, int& w, int& h) {
@@ -457,7 +457,7 @@ void Engine::onResize(int w, int h) {
     width = w;
     height = h;
 
-    layoutRoot.viewportWidth = width;
+    layoutRoot.viewportWidth = (int)(width / zoom_); // layout sees the window as 1/zoom as wide
     doLayout();
 }
 
@@ -546,12 +546,17 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
         doLayout();
     }
 
+    // The page is drawn in page coordinates: the transform moves it below
+    // the address bar and applies the zoom (see Renderer::setPageTransform).
+    renderer.setPageTransform((float)topInset, zoom_);
+    const int visibleHeight = viewHeight();
+
     for (const auto& b : layoutRoot.boxes) {
 
-        int screenY = b.y - scrollY + topInset;
+        int screenY = b.y - scrollY; // relative to the top of the page area
 
         // Cull boxes outside viewport
-        if (screenY + b.height < topInset || screenY > height)
+        if (screenY + b.height < 0 || screenY > visibleHeight)
             continue;
 
         // opacity:0 / visibility:hidden (own or inherited): still occupies
@@ -610,6 +615,7 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     }
 
     drawOpenSelect(renderer); // on top of the page, same treatment main.cpp gives AddressBar
+    renderer.resetTransform();
     drawScrollbar(renderer); // window coordinates: browser UI, not zoomed
 }
 
@@ -659,8 +665,8 @@ void Engine::updateHover(int x, int y) {
 }
 
 std::wstring Engine::linkAt(int x, int y, Renderer& renderer) const {
-    if (y < topInset) return L"";
-    int docY = y - topInset + scrollY;
+    int docX, docY;
+    if (!toPage(x, y, docX, docY)) return L"";
 
     // Later boxes paint on top, so check them first.
     for (auto it = layoutRoot.boxes.rbegin(); it != layoutRoot.boxes.rend(); ++it) {
@@ -670,9 +676,9 @@ std::wstring Engine::linkAt(int x, int y, Renderer& renderer) const {
         // Text is drawn at (x + 4, y + 4) and is only as wide as its glyphs,
         // so hit-test that area rather than the whole row.
         float fontSize = b.fontSize > 0 ? b.fontSize : 14;
-        int textW = static_cast<int>(renderer.measureText(b.text, fontSize, b.bold));
+        int textW = static_cast<int>(measurePageText(renderer, b.text, fontSize, b.bold));
         int left = b.x + 4, top = b.y + 4;
-        if (x >= left && x < left + textW && docY >= top && docY < top + b.height)
+        if (docX >= left && docX < left + textW && docY >= top && docY < top + b.height)
             return b.href;
     }
     return L"";
@@ -757,6 +763,27 @@ void Engine::drawScrollbar(Renderer& renderer) {
     const bool active = draggingScrollbar_ || scrollbarHovered_;
     const float shade = active ? 0.45f : 0.65f;
     renderer.drawRect(x + 2, thumbTop + 2, (float)kScrollbarWidth - 4, thumbH - 4, Color{ shade, shade, shade + 0.02f, 1.0f });
+}
+
+void Engine::setZoom(float zoom) {
+    zoom = std::clamp(zoom, 0.25f, 5.0f);
+    if (zoom == zoom_) return;
+    zoom_ = zoom;
+    layoutRoot.viewportWidth = (int)(width / zoom_);
+    doLayout(); // reflows at the new width, and re-clamps the scroll
+}
+
+float Engine::measurePageText(Renderer& r, const std::wstring& text, float fontSize, bool bold) const {
+    if (zoom_ == 1.0f) return r.measureText(text, fontSize, bold);
+    float pixelSize = std::max(std::round(fontSize * zoom_), 1.0f); // the size OpenGLRenderer::drawText rasterizes at
+    return r.measureText(text, pixelSize, bold) / zoom_;
+}
+
+bool Engine::toPage(int x, int y, int& pageX, int& pageY) const {
+    if (y < topInset) return false;
+    pageX = (int)std::floor(x / zoom_);
+    pageY = (int)std::floor((y - topInset) / zoom_) + scrollY;
+    return true;
 }
 
 void Engine::consoleEval(const std::wstring& code) {

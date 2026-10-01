@@ -67,8 +67,12 @@ int AddressBar::badgeWidth() const {
 
 AddressBar::NavButton AddressBar::navButtonAt(int x, int y) const {
     if (y < kFieldY || y >= kFieldY + kFieldH) return NavButton::None;
-    if (int bw = badgeWidth(); bw && x >= windowWidth_ - kBarMargin - bw && x < windowWidth_ - kBarMargin)
+    int bw = badgeWidth();
+    if (bw && x >= windowWidth_ - kBarMargin - bw && x < windowWidth_ - kBarMargin)
         return NavButton::ConsoleBadge;
+    int zoomRight = windowWidth_ - kBarMargin - (bw ? bw + 6 : 0);
+    if (int zw = zoomPillWidth(); zw && x >= zoomRight - zw && x < zoomRight)
+        return NavButton::ZoomReset;
     if (canBack_ && x >= kNavBackX && x < kNavBackX + kNavSize) return NavButton::Back;
     if (canForward_ && x >= kNavFwdX && x < kNavFwdX + kNavSize) return NavButton::Forward;
     if (x >= kNavReloadX && x < kNavReloadX + kNavSize) {
@@ -81,7 +85,8 @@ AddressBar::NavButton AddressBar::navButtonAt(int x, int y) const {
 void AddressBar::draw(Renderer& r, int windowWidth, double t) {
     windowWidth_ = windowWidth;
     const int badgeW = badgeWidth();
-    const int fieldW = std::max(windowWidth - kFieldX - kBarMargin - (badgeW ? badgeW + 6 : 0), 50);
+    const int zoomW = zoomPillWidth();
+    const int fieldW = std::max(windowWidth - kFieldX - kBarMargin - (badgeW ? badgeW + 6 : 0) - (zoomW ? zoomW + 6 : 0), 50);
     const int viewW = fieldW - 2 * kTextPad; // visible text area
     const std::wstring& text = ed_.text();
 
@@ -137,6 +142,16 @@ void AddressBar::draw(Renderer& r, int windowWidth, double t) {
     }
 
     r.clearClip();
+
+    // Zoom pill: "125%", just left of the error badge; clicking resets to 100%.
+    if (zoomW) {
+        const float zx = (float)(windowWidth - kBarMargin - (badgeW ? badgeW + 6 : 0) - zoomW);
+        r.drawRect(zx - 1, (float)kFieldY - 1, (float)zoomW + 2, (float)kFieldH + 2, kBorder);
+        r.drawRect(zx, (float)kFieldY, (float)zoomW, (float)kFieldH, kField);
+        std::wstring label = std::to_wstring(zoomPercent_) + L"%";
+        float lw = r.measureText(label, 13);
+        r.drawText(zx + (zoomW - lw) / 2, (float)kFieldY + 6, label, 13, kInk);
+    }
 
     // JS error badge: a red "✖ N" at the right end, which opens the console.
     if (badgeW) {

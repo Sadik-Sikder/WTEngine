@@ -46,7 +46,16 @@ public:
     // can pick up the real size once it's known.
     virtual int imageGeneration() const = 0;
 
-    // Restrict drawing to a rectangle (window coordinates, y down) until clearClip().
+    // Restrict drawing to a rectangle (in the current coordinate space - see
+    // setPageTransform - y down) until clearClip().
     virtual void setClip(float x, float y, float w, float h) = 0;
     virtual void clearClip() = 0;
+
+    // Page zoom. Until resetTransform(), everything drawn is scaled by
+    // `scale` and moved down by `offsetY` window pixels (the space above
+    // the page): callers draw in page coordinates. Text is rasterized at
+    // the scaled size rather than stretched, so zoomed text stays sharp.
+    // beginFrame() also resets it.
+    virtual void setPageTransform(float offsetY, float scale) = 0;
+    virtual void resetTransform() = 0;
 };
