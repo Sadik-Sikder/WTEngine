@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 #include "DOM.h"
 #include "JSBinding.h"
 #include "Layout.h"
@@ -27,6 +28,11 @@ public:
 
     void loadHTML(const std::wstring& html, const std::wstring& baseUrl = L"");
     void onResize(int width, int height);
+    // Whether the user is currently dragging a window edge (Windows'
+    // WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE). During a drag, an expensive
+    // relayout waits for the drag to pause; when it ends, it happens right
+    // away. See onResize.
+    void setLiveResize(bool live);
     void setRenderer(Renderer* r); // used to measure text for wrapping
     void setTopInset(int px);      // reserve space above the page (e.g. for the address bar)
     void setBottomInset(int px);   // reserve space below it (e.g. for the developer console)
@@ -136,6 +142,12 @@ private:
     int topInset = 0;
     int bottomInset = 0;
     float zoom_ = 1.0f;
+
+    // A relayout for a new window width, deferred (see onResize).
+    bool relayoutPending_ = false;
+    bool resizePainted_ = false; // a frame has shown the new size since then
+    bool liveResize_ = false;    // the user is dragging a window edge (setLiveResize)
+    std::chrono::steady_clock::time_point lastResize_;
 
     // Find in page. A match can span several text boxes (layout makes one
     // box per word), so it's a list of character ranges, one per box.

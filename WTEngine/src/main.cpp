@@ -1,6 +1,8 @@
 #define NOMINMAX
 #include <GLFW/glfw3.h>
 #include <windows.h>
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h> // glfwGetWin32Window, for sizingWindowProc
 #include <timeapi.h>
 #pragma comment(lib, "winmm.lib")
 #include <string>
@@ -43,6 +45,10 @@ struct App {
     std::wstring shownTitle; // what the window title bar currently says - see updateWindowTitle
     DevConsolePanel console; // F12 - see DevConsole.h
     FindBar find;            // Ctrl+F - see FindBar.h
+    GLFWcursor* handCursor = nullptr;  // standard cursors, created in wmain
+    GLFWcursor* ibeamCursor = nullptr;
+    GLFWcursor* shownCursor = nullptr; // what's set now; nullptr = default arrow
+    bool drawing = false;              // inside drawFrame - see there
 };
 
 static std::string toUtf8(const std::wstring& w) {
@@ -516,6 +522,103 @@ static void onScroll(GLFWwindow* window, double, double yoffset) {
     else app->engine->scroll(static_cast<int>(-yoffset * 40));
 }
 
+// Draws one frame: the page, then the browser UI over it, then the cursor
+// shape, then presents it. Called once per main-loop iteration - and also
+// from the window-refresh callback (onWindowRefresh), because while the
+// user drags a window edge, Windows runs its own modal sizing loop inside
+// glfwPollEvents() and the main loop doesn't get to run until the mouse is
+// released. Without that, the window would show stale, stretched content
+// for the whole drag.
+static void drawFrame(App& app) {
+    if (app.drawing) return; // a refresh delivered from inside this same frame
+    app.drawing = true;
+    GLFWwindow* window = app.window;
+    Engine& engine = *app.engine;
+    OpenGLRenderer& renderer = *app.renderer;
+    GLFWcursor* handCursor = app.handCursor;
+    GLFWcursor* ibeamCursor = app.ibeamCursor;
+    GLFWcursor*& shownCursor = app.shownCursor;
+
+    int width, height;
+    glfwGetFramebufferSize(window, &width, &height);
+    glViewport(0, 0, width, height);
+
+    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    engine.onResize(width, height);
+    engine.setBottomInset(app.console.height(height)); // the page scrolls within what the console leaves
+    renderer.beginFrame(width, height, 0);
+    engine.render(renderer, glfwGetTime());
+    updateWindowTitle(app);
+    app.bar.setNavEnabled(app.history.canGoBack(), app.history.canGoForward(), app.history.current() != nullptr,
+                          app.pageLoader.loading());
+    app.bar.setErrorCount(consoleLog().errorCount());
+    app.bar.setZoomPercent((int)std::lround(engine.zoom() * 100));
+    app.bar.draw(renderer, width, glfwGetTime()); // after the page so it covers overscroll
+    app.console.draw(renderer, width, height, glfwGetTime()); // likewise covers the page's bottom
+    app.find.draw(renderer, width, engine.findCurrentIndex(), engine.findMatchCount(), glfwGetTime());
+
+    // I-beam over the address bar and text fields, hand over links and
+    // buttons, arrow elsewhere
+    int cx, cy;
+    cursorInFramebuffer(window, cx, cy);
+    GLFWcursor* wanted = nullptr;
+    bool overConsole = app.console.contains(cy, height);
+    bool overFind = app.find.contains(cx, cy, width);
+    if (engine.draggingScrollbar()) engine.dragScrollbar(cy); // follows the mouse until the button is released
+    if (cy < AddressBar::kHeight) {
+        wanted = app.bar.navButtonAt(cx, cy) != AddressBar::NavButton::None ? handCursor : ibeamCursor;
+    }
+    else if (overFind) {
+        wanted = nullptr; // its own small UI; the page beneath doesn't get hover
+    }
+    else if (overConsole) {
+        wanted = cy >= height - 28 ? ibeamCursor : nullptr; // I-beam on its input line
+    }
+    else if (engine.draggingScrollbar() || engine.scrollbarAt(cx, cy) != Engine::ScrollbarPart::None) {
+        wanted = nullptr; // plain arrow over the scrollbar, not whatever page content is beneath it
+    }
+    else {
+        switch (engine.cursorAt(cx, cy, renderer)) {
+        case Engine::Cursor::IBeam: wanted = ibeamCursor; break;
+        case Engine::Cursor::Hand:  wanted = handCursor;  break;
+        default: break;
+        }
+    }
+    // Off the page (over the address bar, the find bar or the console) hovers nothing.
+    if (cy < AddressBar::kHeight || overConsole || overFind) engine.updateHover(-1, -1);
+    else engine.updateHover(cx, cy);
+
+    if (wanted != shownCursor) {
+        glfwSetCursor(window, wanted);
+        shownCursor = wanted;
+    }
+
+    glfwSwapBuffers(window);
+    app.drawing = false;
+}
+
+static void onWindowRefresh(GLFWwindow* window) {
+    drawFrame(*static_cast<App*>(glfwGetWindowUserPointer(window)));
+}
+
+// GLFW doesn't report when the user starts or stops dragging a window edge,
+// but Engine::onResize wants to know (a drag defers expensive relayouts
+// until it pauses; a maximize or snap shouldn't wait). So GLFW's window
+// procedure is wrapped to catch Windows' WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE;
+// every message still goes on to GLFW unchanged.
+static WNDPROC g_glfwWindowProc = nullptr;
+static Engine* g_sizingEngine = nullptr;
+
+static LRESULT CALLBACK sizingWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_sizingEngine) {
+        if (msg == WM_ENTERSIZEMOVE) g_sizingEngine->setLiveResize(true);
+        else if (msg == WM_EXITSIZEMOVE) g_sizingEngine->setLiveResize(false);
+    }
+    return CallWindowProcW(g_glfwWindowProc, hwnd, msg, wp, lp);
+}
+
 // The loop otherwise redraws as fast as it possibly can, spinning a CPU core
 // for no reason while sitting idle (and relying on whatever vsync default the
 // driver happens to pick). Capping it here makes the rate explicit and
@@ -544,6 +647,11 @@ int wmain(int argc, wchar_t** argv) {
 
     engine.setRenderer(&renderer);
 
+    // See sizingWindowProc.
+    HWND hwnd = glfwGetWin32Window(window);
+    g_sizingEngine = &engine;
+    g_glfwWindowProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(sizingWindowProc)));
+
     App app;
     app.window = window;
     app.engine = &engine;
@@ -553,12 +661,12 @@ int wmain(int argc, wchar_t** argv) {
     glfwSetScrollCallback(window, onScroll);
     glfwSetCharCallback(window, onChar);
     glfwSetKeyCallback(window, onKey);
+    glfwSetWindowRefreshCallback(window, onWindowRefresh); // keeps drawing during a live resize - see drawFrame
 
     engine.setTopInset(AddressBar::kHeight); // page starts below the address bar
 
-    GLFWcursor* handCursor = glfwCreateStandardCursor(GLFW_HAND_CURSOR);
-    GLFWcursor* ibeamCursor = glfwCreateStandardCursor(GLFW_IBEAM_CURSOR);
-    GLFWcursor* shownCursor = nullptr; // nullptr = default arrow
+    app.handCursor = glfwCreateStandardCursor(GLFW_HAND_CURSOR);
+    app.ibeamCursor = glfwCreateStandardCursor(GLFW_IBEAM_CURSOR);
 
     // A command-line URL starts loading in the background (see navigate());
     // the window opens blank and applyFinishedNavigation shows it once
@@ -605,63 +713,7 @@ int wmain(int argc, wchar_t** argv) {
 
         applyFinishedNavigation(app); // shows a navigate()-started fetch's result once it's ready
 
-        int width, height;
-        glfwGetFramebufferSize(window, &width, &height);
-        glViewport(0, 0, width, height);
-
-        glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-
-        engine.onResize(width, height);
-        engine.setBottomInset(app.console.height(height)); // the page scrolls within what the console leaves
-        renderer.beginFrame(width, height, 0);
-        engine.render(renderer, glfwGetTime());
-        updateWindowTitle(app);
-        app.bar.setNavEnabled(app.history.canGoBack(), app.history.canGoForward(), app.history.current() != nullptr,
-                              app.pageLoader.loading());
-        app.bar.setErrorCount(consoleLog().errorCount());
-        app.bar.setZoomPercent((int)std::lround(engine.zoom() * 100));
-        app.bar.draw(renderer, width, glfwGetTime()); // after the page so it covers overscroll
-        app.console.draw(renderer, width, height, glfwGetTime()); // likewise covers the page's bottom
-        app.find.draw(renderer, width, engine.findCurrentIndex(), engine.findMatchCount(), glfwGetTime());
-
-        // I-beam over the address bar and text fields, hand over links and
-        // buttons, arrow elsewhere
-        int cx, cy;
-        cursorInFramebuffer(window, cx, cy);
-        GLFWcursor* wanted = nullptr;
-        bool overConsole = app.console.contains(cy, height);
-        bool overFind = app.find.contains(cx, cy, width);
-        if (engine.draggingScrollbar()) engine.dragScrollbar(cy); // follows the mouse until the button is released
-        if (cy < AddressBar::kHeight) {
-            wanted = app.bar.navButtonAt(cx, cy) != AddressBar::NavButton::None ? handCursor : ibeamCursor;
-        }
-        else if (overFind) {
-            wanted = nullptr; // its own small UI; the page beneath doesn't get hover
-        }
-        else if (overConsole) {
-            wanted = cy >= height - 28 ? ibeamCursor : nullptr; // I-beam on its input line
-        }
-        else if (engine.draggingScrollbar() || engine.scrollbarAt(cx, cy) != Engine::ScrollbarPart::None) {
-            wanted = nullptr; // plain arrow over the scrollbar, not whatever page content is beneath it
-        }
-        else {
-            switch (engine.cursorAt(cx, cy, renderer)) {
-            case Engine::Cursor::IBeam: wanted = ibeamCursor; break;
-            case Engine::Cursor::Hand:  wanted = handCursor;  break;
-            default: break;
-            }
-        }
-        // Off the page (over the address bar, the find bar or the console) hovers nothing.
-        if (cy < AddressBar::kHeight || overConsole || overFind) engine.updateHover(-1, -1);
-        else engine.updateHover(cx, cy);
-
-        if (wanted != shownCursor) {
-            glfwSetCursor(window, wanted);
-            shownCursor = wanted;
-        }
-
-        glfwSwapBuffers(window);
+        drawFrame(app);
         glfwPollEvents();
 
         // Sleep off whatever's left of the 1/60s budget, so the loop settles
@@ -670,8 +722,10 @@ int wmain(int argc, wchar_t** argv) {
         if (remaining > 0) Sleep(static_cast<DWORD>(remaining * 1000.0));
     }
 
-    glfwDestroyCursor(handCursor);
-    glfwDestroyCursor(ibeamCursor);
+    glfwDestroyCursor(app.handCursor);
+    glfwDestroyCursor(app.ibeamCursor);
+    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_glfwWindowProc)); // GLFW's own, before it destroys the window
+    g_sizingEngine = nullptr;
     glfwTerminate();
     timeEndPeriod(1);
     return 0;

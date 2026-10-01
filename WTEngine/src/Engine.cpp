@@ -452,16 +452,50 @@ void Engine::parseAndBuild(const std::wstring& html) {
     }
 }
 
+// Called every frame, so it tries hard not to relayout more than needed:
+// - Only the width affects layout. A height change just re-clamps the
+//   scroll position.
+// - A width change relayouts at once when layout is cheap (≤ 30 ms), so
+//   small pages reflow live.
+// - When it isn't (a big page - Wikipedia takes ~0.4 s in Release, seconds
+//   in Debug), the relayout is deferred (see the top of render()):
+//   * always by at least one frame, so the window first repaints at its
+//     new size - with the old layout - instead of sitting unpainted while
+//     the relayout runs (most visible on maximize, snap and restore);
+//   * and while the user is still dragging a window edge (liveResize_),
+//     until the size has held still for kResizeSettleMs, or the drag ends,
+//     so the drag itself stays smooth.
+static constexpr double kLiveResizeLayoutBudgetMs = 30;
+static constexpr int kResizeSettleMs = 150;
+
 void Engine::onResize(int w, int h) {
-    if (w == width && h == height) return; // nothing to re-wrap
+    if (w == width && h == height) return;
+    bool widthChanged = w != width;
     width = w;
     height = h;
+    if (!widthChanged) {
+        scrollY = std::clamp(scrollY, 0, maxScroll());
+        return;
+    }
 
     layoutRoot.viewportWidth = (int)(width / zoom_); // layout sees the window as 1/zoom as wide
-    doLayout();
+    if (lastLayoutMs <= kLiveResizeLayoutBudgetMs) {
+        doLayout();
+    } else {
+        relayoutPending_ = true;
+        resizePainted_ = false;
+        lastResize_ = std::chrono::steady_clock::now();
+    }
+}
+
+void Engine::setLiveResize(bool live) {
+    liveResize_ = live;
+    // The drag just ended: any deferred relayout no longer needs to wait
+    // for the size to settle (render() still lets one frame paint first).
 }
 
 void Engine::doLayout() {
+    relayoutPending_ = false; // whatever triggered this, it lays out at the current width
     if (!document || !document->body)
         return;
 
@@ -548,6 +582,16 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
             if (v != editor.text()) editor.setText(v);
         }
         doLayout();
+    }
+
+    // A width change deferred by onResize (see there): relayout once a frame
+    // has shown the window at its new size, and - during an edge drag -
+    // once the size has held still for a moment.
+    if (relayoutPending_) {
+        bool settled = !liveResize_ ||
+            std::chrono::steady_clock::now() - lastResize_ >= std::chrono::milliseconds(kResizeSettleMs);
+        if (resizePainted_ && settled) doLayout(); // clears relayoutPending_
+        resizePainted_ = true; // this frame paints the new size with the old layout
     }
 
     // The page is drawn in page coordinates: the transform moves it below
