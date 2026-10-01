@@ -795,8 +795,103 @@ void fetchHttpAsync(HttpRequest request, std::function<void(HttpResponse)> onDon
     NetworkThread::instance().spawn(runHttp(std::move(request), std::move(onDone)));
 }
 
+// --- Local files -------------------------------------------------------
+// A page loaded from disk has a plain Windows path as its URL (what the
+// address bar and command line accept). Relative links, images, scripts
+// and stylesheets on it resolve against the page file's folder, so a
+// multi-page site in a folder works straight from disk.
+
+static bool isLocalPath(const std::wstring& s) {
+    bool drive = s.size() >= 3 && iswalpha(s[0]) && s[1] == L':' && (s[2] == L'\\' || s[2] == L'/');
+    bool unc = s.rfind(L"\\\\", 0) == 0;
+    return drive || unc;
+}
+
+static bool isFileUrl(const std::wstring& s) {
+    return s.size() >= 5 && _wcsnicmp(s.c_str(), L"file:", 5) == 0;
+}
+
+// "%20" -> " " etc. (a link to "my%20page.html" means the file "my page.html").
+// Decoded as UTF-8 bytes, so "%C3%A9" becomes "é".
+static std::wstring percentDecode(const std::wstring& s) {
+    if (s.find(L'%') == std::wstring::npos) return s;
+    std::string bytes;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == L'%' && i + 2 < s.size() && iswxdigit(s[i + 1]) && iswxdigit(s[i + 2])) {
+            bytes.push_back((char)std::stoi(std::wstring(s, i + 1, 2), nullptr, 16));
+            i += 2;
+        } else {
+            bytes += wideToUtf8(std::wstring(1, s[i]));
+        }
+    }
+    return utf8ToWide(bytes);
+}
+
+// Collapses "." and ".." segments and normalizes separators to '\', keeping
+// the drive ("C:") or UNC ("\\server\share") root; ".." never climbs above it.
+static std::wstring normalizeLocalPath(std::wstring path) {
+    for (auto& c : path) if (c == L'/') c = L'\\';
+    std::wstring root;
+    size_t pos;
+    if (path.rfind(L"\\\\", 0) == 0) { // \\server\share
+        size_t server = path.find(L'\\', 2);
+        size_t share = server == std::wstring::npos ? std::wstring::npos : path.find(L'\\', server + 1);
+        root = path.substr(0, share);
+        pos = share == std::wstring::npos ? path.size() : share;
+    } else {
+        root = path.substr(0, 2); // "C:"
+        pos = 2;
+    }
+    std::vector<std::wstring> parts;
+    std::wstring seg;
+    for (size_t i = pos; i <= path.size(); i++) {
+        if (i == path.size() || path[i] == L'\\') {
+            if (seg == L"..") { if (!parts.empty()) parts.pop_back(); }
+            else if (!seg.empty() && seg != L".") parts.push_back(seg);
+            seg.clear();
+        } else {
+            seg.push_back(path[i]);
+        }
+    }
+    std::wstring out = root;
+    for (const auto& p : parts) out += L"\\" + p;
+    if (parts.empty()) out += L"\\";
+    return out;
+}
+
+// Resolves `href` (relative, root-relative, an absolute path, or a file:
+// URL) against the local page path `base`.
+static std::wstring resolveLocal(const std::wstring& base, std::wstring href) {
+    if (isFileUrl(href)) {
+        href = href.substr(5);
+        while (href.rfind(L"/", 0) == 0) href.erase(0, 1);     // file:///C:/x -> C:/x
+        if (!isLocalPath(href)) href = L"\\\\" + href;          // file://server/share/x -> \\server\share\x
+    }
+    // A file on disk has no query or fragment to give them to.
+    href = href.substr(0, href.find_first_of(L"?#"));
+    href = percentDecode(href);
+    if (href.empty()) return base; // "?x" alone: the page itself
+
+    if (isLocalPath(href)) return normalizeLocalPath(href);
+
+    std::wstring root = normalizeLocalPath(base);
+    if (href[0] == L'/' || href[0] == L'\\') { // root-relative: the base's drive or share
+        size_t rootEnd = root.rfind(L"\\\\", 0) == 0 ? root.find(L'\\', root.find(L'\\', 2) + 1) : 2;
+        return normalizeLocalPath(root.substr(0, rootEnd) + href);
+    }
+    size_t slash = root.find_last_of(L'\\');
+    return normalizeLocalPath(root.substr(0, slash + 1) + href);
+}
+
 std::wstring resolveUrl(const std::wstring& baseUrl, const std::wstring& href) {
     if (href.empty() || href[0] == L'#') return L"";
+
+    // From a page loaded from disk, an absolute path or file: URL is a
+    // link to another local file. (Checked before the scheme filter below,
+    // which would otherwise read "C:" as a scheme. From a web page, local
+    // links stay blocked, as in browsers.)
+    bool localBase = isLocalPath(baseUrl);
+    if (localBase && (isLocalPath(href) || isFileUrl(href))) return resolveLocal(baseUrl, href);
 
     // Skip non-navigable schemes (javascript:, mailto:, tel:, data:, ...)
     size_t colon = href.find(L':');
@@ -810,7 +905,8 @@ std::wstring resolveUrl(const std::wstring& baseUrl, const std::wstring& href) {
     }
 
     if (isHttpUrl(href)) return href;
-    if (!isHttpUrl(baseUrl)) return L""; // relative link inside a local file
+    if (localBase) return resolveLocal(baseUrl, href); // relative link inside a local file
+    if (!isHttpUrl(baseUrl)) return L"";
 
     wchar_t out[4096];
     DWORD size = 4096;

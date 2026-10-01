@@ -899,20 +899,11 @@ static JSValue js_set_title(JSContext* ctx, JSValueConst this_val, JSValueConst 
 // Headers, the Response object); it calls this native half to actually
 // send the request: __wtFetch(url, method, [name, value, ...], body).
 
-// Resolves a fetch() URL. From an http(s) page, this is the same resolution
-// a link gets. From a page loaded off disk, a relative URL is resolved
-// against the page file's own folder, so a local test page can fetch a
-// sibling file.
+// Resolves a fetch() URL the same way a link is resolved - including, on a
+// page loaded off disk, against the page file's own folder, so a local test
+// page can fetch a sibling file.
 static std::wstring resolveFetchUrl(const std::wstring& pageUrl, const std::wstring& href) {
-    bool hrefIsHttp = href.rfind(L"http://", 0) == 0 || href.rfind(L"https://", 0) == 0;
-    bool pageIsHttp = pageUrl.rfind(L"http://", 0) == 0 || pageUrl.rfind(L"https://", 0) == 0;
-    if (hrefIsHttp || pageIsHttp) return resolveUrl(pageUrl, href);
-    if (href.empty() || href.find(L':') != std::wstring::npos) return L""; // data:, blob:, a drive path, ...
-    size_t slash = pageUrl.find_last_of(L"\\/");
-    std::wstring dir = slash == std::wstring::npos ? L"" : pageUrl.substr(0, slash + 1);
-    std::wstring path = dir + href;
-    for (auto& c : path) if (c == L'/') c = L'\\';
-    return path;
+    return resolveUrl(pageUrl, href);
 }
 
 static JSValue js_native_fetch(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
