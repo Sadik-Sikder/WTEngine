@@ -16,11 +16,13 @@
 
 // A text string rasterized once (via GDI) and uploaded as an alpha-only
 // OpenGL texture, cached so repeated draws of the same string/size don't
-// re-rasterize every frame.
+// re-rasterize every frame. `lastUsedFrame` drives eviction (see
+// evictStaleTextTextures).
 struct TextTexture {
     GLuint id = 0;
     int width = 0;
     int height = 0;
+    unsigned long long lastUsedFrame = 0;
 };
 
 enum class ImageLoadState { Loading, Ready, Failed };
@@ -69,6 +71,12 @@ public:
 
 private:
     std::map<std::wstring, TextTexture> textCache;
+    size_t textCacheBytes = 0;          // total RGBA bytes of every texture in textCache
+    unsigned long long frameNumber = 0; // bumped by beginFrame; stamps TextTexture::lastUsedFrame
+    // Past this many bytes of text textures, beginFrame evicts the least
+    // recently drawn ones - without a bound, every string ever drawn (at
+    // every zoom level, on every page visited) stays in GPU memory.
+    static constexpr size_t kTextCacheBudget = 64 * 1024 * 1024;
     int frameHeight = 0; // framebuffer height, for flipping scissor coordinates
     float transformOffsetY = 0; // see setPageTransform
     float transformScale = 1;
@@ -76,6 +84,7 @@ private:
     std::map<std::pair<int, bool>, HFONT> measureFonts; // (font size, bold) -> font, for measureText
     bool comInitialized = false; // whether we own COM's lifetime (needed for WIC image decoding)
     const TextTexture& getOrCreateTextTexture(const std::wstring& text, float fontSize, bool bold);
+    void evictStaleTextTextures();
 
     // --- Background image loading -------------------------------------
     // Three stages, each on the thread suited to it:

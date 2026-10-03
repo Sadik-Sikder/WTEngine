@@ -122,11 +122,10 @@ The key design choice: **layout produces a flat, absolute-positioned list of box
 
 ### Startup — `wmain`
 1. `timeBeginPeriod(1)` so the frame-cap `Sleep` is accurate.
-2. `runJSEngineSmokeTest()` prints `1 + 2 = 3` to stdout/debugger (leftover Phase-0 check).
-3. Create a 900×600 GLFW window, enable alpha blending.
-4. Create `Engine`, `OpenGLRenderer`; call `engine.setRenderer()` (so layout can measure text) and `engine.setTopInset(AddressBar::kHeight)` (the page starts 40 px down).
-5. Register the GLFW callbacks. They all reach the `App` struct through `glfwGetWindowUserPointer`.
-6. Load the command-line URL, or the default page.
+2. Create a 900×600 GLFW window, enable alpha blending.
+3. Create `Engine`, `OpenGLRenderer`; call `engine.setRenderer()` (so layout can measure text) and `engine.setTopInset(AddressBar::kHeight)` (the page starts 40 px down).
+4. Register the GLFW callbacks. They all reach the `App` struct through `glfwGetWindowUserPointer`.
+5. Load the command-line URL, or the default page.
 
 ### The frame loop
 Each iteration (capped at ~60 fps with `Sleep`):
@@ -580,7 +579,7 @@ All network I/O - pages (`PageLoader`, §5), scripts and stylesheets (`ResourceL
 - **Projection:** `glOrtho(0, w, h, 0)` — top-left origin, y down. `scrollY` is not passed to the renderer; `Engine` subtracts it before drawing.
 - **Page transform** (`setPageTransform(offsetY, scale)` / `resetTransform`, reset by `beginFrame`): a modelview translate+scale for the page area - below the address bar, at the zoom. `drawText` rasterizes at `round(size × scale)` and draws the quad at `1/scale` that size, snapped to whole screen pixels, so zoomed text is sharp; `setClip` applies the transform by hand (scissor rects ignore the modelview matrix). Textures use `GL_CLAMP_TO_EDGE`, or scaled words/images would show a faint line where linear filtering wraps one edge into the other.
 - **Rects:** immediate-mode `GL_QUADS`.
-- **Text:** rendered once with GDI (white on black into a DIB, Segoe UI, anti-aliased), converted so brightness becomes alpha, and uploaded as an RGBA texture. The colour is applied at draw time via `glColor4f`, so one texture serves any colour. Cached in `textCache` keyed by `text@size` (plus a `b` suffix for bold). **The cache never evicts.**
+- **Text:** rendered once with GDI (white on black into a DIB, Segoe UI, anti-aliased), converted so brightness becomes alpha, and uploaded as an RGBA texture. The colour is applied at draw time via `glColor4f`, so one texture serves any colour. Cached in `textCache` keyed by `text@size` (plus a `b` suffix for bold). Each entry records the frame it was last drawn in; once the cache's textures pass `kTextCacheBudget` (64 MB), `beginFrame` deletes the least recently drawn ones until it's back to ¾ of that. Text drawn in the previous frame is never evicted.
 - **`measureText`:** GDI `GetTextExtentPoint32W` with a cached `HFONT` per size, so measuring doesn't create textures.
 - **Clipping:** `glScissor`, with y flipped to OpenGL's bottom-left origin.
 
@@ -639,12 +638,10 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 - **`LayoutRoot::layout()` was the next dominant freeze cause after fetching was fixed - largely fixed itself now.** Diagnostic timing against a real page (Wikipedia's Tiger article, ~1.3MB of HTML, ~20,000 laid-out boxes) showed `doLayout()` taking 5.2s with 135 CSS rules, then 14.4s on the next call with 623 rules applied - both entirely on the UI thread, since layout has to finish before there's anything to paint. Root cause: `CSS::matches` is checked per element against every rule with no selector index (by tag/class/id) - expected to cost roughly elements × rules - but the actual dominant cost turned out to be `classesOf()` (in `CSS.cpp`, used by any class selector) re-splitting the same element's `class=""` attribute string into a fresh `std::vector` from scratch on *every single call*, rather than once per element. Fixed by caching each element's parsed class list for the duration of one layout pass (`CSS::ClassCache`, threaded through `matches`/`compoundMatches` as an optional parameter so `querySelector`'s one-off matching - JSBinding.cpp - is unaffected; `LayoutRoot::classCache`, cleared at the top of every `layout()` since it's only valid within one pass - the DOM doesn't mutate mid-layout). Measured result on the same page: 5.2s → 1.1s and 14.4s → 2.2s, roughly a 5-6x speedup, with no change in visual output (verified against a page exercising every selector form: multi-class AND, tag+class compounds, id, and descendant combinators). A rule index (§8) since cut the brute-force elements × rules matching down to the rules that could match each element: with the wider selector support parsing 1456 rules on that page, layout went from 5.1 s unindexed to 1.7 s (Debug build).
 - **Confirmed real bug, now fixed:** JS ran synchronously on the UI thread with no timeout - a `<script>`, timer callback, or click listener stuck in an infinite loop froze the whole window indefinitely, the same freeze class as the fetch/layout issues above but caused by page JS instead. Fixed with a `JS_SetInterruptHandler`-based watchdog (§11's "Script execution watchdog") that kills anything running past 2s with an uncatchable error; verified against a genuine infinite-loop script, a self-rescheduling infinite `setInterval`, a legitimate ~500ms computation (not falsely killed), and a normal thrown error (unaffected).
 - Layout is a full re-layout on every change; no incremental layout.
-- The text-texture cache grows without bound.
 - Dropdown lists are not clipped to the window and don't scroll.
 
 **Project**
 - The source file list lives in two places (`WTEngine.vcxproj` and `CMakeLists.txt`); keep them in sync (§2).
-- `runJSEngineSmokeTest()` still runs at every startup.
 - The window is titled "WTEngine" until the first page sets it.
 - Build artefacts (`x64/`, `build/`, `.vs/`, `*.obj`) are present in the working tree; check `.gitignore` before committing.
 

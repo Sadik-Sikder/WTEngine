@@ -113,7 +113,10 @@ OpenGLRenderer::~OpenGLRenderer() {
 const TextTexture& OpenGLRenderer::getOrCreateTextTexture(const std::wstring& text, float fontSize, bool bold) {
     std::wstring key = text + L"@" + std::to_wstring((int)fontSize) + (bold ? L"b" : L"");
     auto it = textCache.find(key);
-    if (it != textCache.end()) return it->second;
+    if (it != textCache.end()) {
+        it->second.lastUsedFrame = frameNumber;
+        return it->second;
+    }
 
     HDC screenDC = GetDC(nullptr);
     HDC memDC = CreateCompatibleDC(screenDC);
@@ -170,6 +173,7 @@ const TextTexture& OpenGLRenderer::getOrCreateTextTexture(const std::wstring& te
     TextTexture tex;
     tex.width = texW;
     tex.height = texH;
+    tex.lastUsedFrame = frameNumber;
     glGenTextures(1, &tex.id);
     glBindTexture(GL_TEXTURE_2D, tex.id);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -181,12 +185,41 @@ const TextTexture& OpenGLRenderer::getOrCreateTextTexture(const std::wstring& te
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, texW, texH, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
 
+    textCacheBytes += rgba.size();
     auto result = textCache.emplace(key, tex);
     return result.first->second;
 }
 
+// Once the text cache is over budget, deletes the least recently drawn
+// textures until it's down to 3/4 of the budget - the slack means the sort
+// runs once per burst of new text, not every frame. Only called at the
+// start of a frame, so no reference getOrCreateTextTexture handed out is
+// still in use, and anything drawn last frame (i.e. on screen now) is kept
+// even if that alone exceeds the budget.
+void OpenGLRenderer::evictStaleTextTextures() {
+    if (textCacheBytes <= kTextCacheBudget) return;
+
+    std::vector<std::map<std::wstring, TextTexture>::iterator> stale;
+    for (auto it = textCache.begin(); it != textCache.end(); ++it) {
+        if (it->second.lastUsedFrame < frameNumber) stale.push_back(it);
+    }
+    std::sort(stale.begin(), stale.end(), [](const auto& a, const auto& b) {
+        return a->second.lastUsedFrame < b->second.lastUsedFrame;
+    });
+
+    const size_t target = kTextCacheBudget / 4 * 3;
+    for (auto it : stale) {
+        if (textCacheBytes <= target) break;
+        textCacheBytes -= static_cast<size_t>(it->second.width) * it->second.height * 4;
+        glDeleteTextures(1, &it->second.id);
+        textCache.erase(it);
+    }
+}
+
 void OpenGLRenderer::beginFrame(int width, int height, float scrollY) {
     drainPendingImageUploads();
+    evictStaleTextTextures(); // before bumping frameNumber, so last frame's text counts as in use
+    frameNumber++;
 
     frameHeight = height;
     glViewport(0, 0, width, height);

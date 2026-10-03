@@ -195,10 +195,3 @@ JSEngine::Result JSEngine::eval(const std::wstring& code, const char* filename) 
     runPendingJobs(ctx); // promise callbacks the script queued run right after it, before the next script
     return out;
 }
-
-void runJSEngineSmokeTest() {
-    JSEngine js;
-    std::wstring line = L"[JSEngine smoke test] 1 + 2 = " + js.eval(L"1 + 2").text + L"\n";
-    wprintf(L"%ls", line.c_str());
-    OutputDebugStringW(line.c_str());
-}

@@ -631,8 +631,6 @@ int wmain(int argc, wchar_t** argv) {
     // the frame cap actually lands near its target instead of running slow.
     timeBeginPeriod(1);
 
-    runJSEngineSmokeTest(); // Phase 0 check: quickjs-ng is vendored and runs correctly
-
     if (!glfwInit()) { timeEndPeriod(1); return -1; }
 
     GLFWwindow* window = glfwCreateWindow(900, 600, "WTEngine", nullptr, nullptr);

@@ -18,10 +18,8 @@ constexpr std::chrono::milliseconds kScriptTimeout{ 2000 };
 // page load.
 void ArmScriptWatchdog(struct JSContext* ctx);
 
-// Thin wrapper around a quickjs-ng runtime + context. This is the
-// foundation later phases (per-page script execution, DOM binding, events,
-// timers) build on; for now it only proves the engine is vendored and runs
-// correctly, via eval() and runJSEngineSmokeTest() below.
+// Thin wrapper around a quickjs-ng runtime + context: the foundation that
+// per-page script execution, DOM binding, events and timers build on.
 class JSEngine {
 public:
     JSEngine();
@@ -69,8 +67,3 @@ std::wstring describeException(struct JSContext* ctx, struct JSValue exc);
 // Logs a caught exception to the console as an error from `source`
 // ("click handler", "timer", ...) and frees it.
 void reportException(struct JSContext* ctx, struct JSValue exc, const wchar_t* source);
-
-// Phase 0 acceptance check: evaluates a trivial expression and reports the
-// result via stdout and OutputDebugStringW. Superseded once a later phase
-// adds real per-page script execution.
-void runJSEngineSmokeTest();
