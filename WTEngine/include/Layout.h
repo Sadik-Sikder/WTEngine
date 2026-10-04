@@ -359,13 +359,13 @@ private:
         std::vector<std::vector<std::wstring>> gridTemplateAreas;
         int rowGap = 0, columnGap = 0; // from `gap`/`row-gap`/`column-gap` - shared by grid and flex, same properties either way
         // Only meaningful on a grid item (read from the item's own style by
-        // its container's layoutGrid). 1-based CSS grid line numbers, as
-        // authored; 0 means unset. An item needs *both* its column and row
-        // set to be explicitly placed - one set without the other is
-        // treated as fully automatic instead of partially placed (see
-        // layoutGrid's comment on why).
-        int gridColumnStart = 0, gridColumnEnd = 0;
-        int gridRowStart = 0, gridRowEnd = 0;
+        // its container's layoutGrid). Start/end are CSS grid line numbers
+        // as authored: 0 means auto, a negative one counts back from the
+        // explicit grid's last line (-1 = the last line). *Span is the
+        // `span N` from either side (0 = none). Either axis can be set
+        // without the other - layoutGrid auto-places the unset one.
+        int gridColumnStart = 0, gridColumnEnd = 0, gridColumnSpan = 0;
+        int gridRowStart = 0, gridRowEnd = 0, gridRowSpan = 0;
         // Only meaningful on a grid item. The area name from `grid-area:
         // <name>` - empty means unset. Only the named-area form is
         // supported, not grid-area's alternate 4-value line-based syntax
@@ -421,12 +421,15 @@ private:
     // becomes 1fr, so the track *count* an author wrote is always honored
     // even where the sizing isn't).
     std::vector<GridTrack> parseGridTemplateTracks(const std::wstring& v, int containingWidth);
-    // Parses a grid-column/grid-row shorthand value - "2" (start, span 1),
-    // "2 / 4" (start/end line numbers), or "2 / span 3" (start + span) -
-    // into 1-based start/end line numbers. Returns false (leaving start/
-    // end untouched) for anything else: named lines, negative/from-the-end
-    // indices, and a bare "span N" with no start aren't supported.
-    bool parseGridLinePlacement(const std::wstring& v, int& start, int& end);
+    // Parses one side of a grid-column/grid-row - "auto", a line number
+    // "N" (negative counts from the end), or "span N" - into `line`
+    // (0 = auto) or `span` (0 = none). Named lines aren't supported.
+    bool parseGridLine(const std::wstring& v, int& line, int& span);
+    // Parses a grid-column/grid-row shorthand - "2", "span 3", "1 / -1",
+    // "2 / span 3", "span 2 / 5", with or without spaces around the '/' -
+    // into start/end lines and a span (see parseGridLine). Returns false
+    // (leaving the outputs untouched) for anything else.
+    bool parseGridLinePlacement(const std::wstring& v, int& start, int& end, int& span);
     // Parses a grid-template-areas value - one or more quoted strings, each
     // one grid row, each whitespace-separated token in it one column's area
     // name ("." means no area). Returns an empty grid (not a partial one)
@@ -467,18 +470,17 @@ private:
     //    grid-template-areas, is placed at that name's bounding box (every
     //    cell the name appears in - real CSS requires those cells to form
     //    a rectangle; this doesn't specially validate that, it just takes
-    //    the bounding box regardless). Otherwise, an item with *both*
-    //    grid-column and grid-row set is placed into those exact cells
-    //    (clamped to the template's column count - a line beyond it
-    //    doesn't create an implicit column). One axis set without the
-    //    other, or a grid-area naming nothing in the template, is treated
-    //    as fully automatic, not partially placed - a deliberate
-    //    simplification, not an oversight.
-    // 3. Every other item auto-places row-major (grid-auto-flow: row, the
-    //    CSS default), walking past any cell an explicit item already
-    //    claimed. This is simpler than real CSS's own auto-placement
-    //    (which packs more tightly around explicit items) and can leave a
-    //    gap a "dense" packing algorithm would have filled instead.
+    //    the bounding box regardless). Otherwise its grid-column/grid-row
+    //    resolve per axis to a cell range (lines, negative lines from the
+    //    end, span N), or stay auto with just a span size. Columns clamp
+    //    to the template's count - a line beyond it doesn't create an
+    //    implicit column.
+    // 3. CSS's sparse row-flow auto-placement: fully definite items
+    //    first, then definite-row items in the first columns that fit,
+    //    then the rest in source order behind a forward-only cursor (a
+    //    span that doesn't fit in the rest of a row wraps). No "dense"
+    //    packing, and a full definite row overlaps rather than growing
+    //    implicit columns.
     // 4. Row heights: an explicit grid-template-rows track wins if set
     //    (fr tracks excepted - see its ComputedStyle comment); otherwise a
     //    row is as tall as the tallest single-row item placed in it. An

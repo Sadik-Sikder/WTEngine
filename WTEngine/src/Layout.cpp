@@ -1143,17 +1143,27 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         }
         else if (k == L"grid-area") sv.gridArea = trimmed(v); // on an item: the area name to place into - see its ComputedStyle comment
         else if (k == L"grid-column") {
-            int s, e;
-            if (parseGridLinePlacement(v, s, e)) { sv.gridColumnStart = s; sv.gridColumnEnd = e; }
+            int s, e, n;
+            if (parseGridLinePlacement(v, s, e, n)) { sv.gridColumnStart = s; sv.gridColumnEnd = e; sv.gridColumnSpan = n; }
         }
-        else if (k == L"grid-column-start") { try { sv.gridColumnStart = std::stoi(v); } catch (...) {} }
-        else if (k == L"grid-column-end") { try { sv.gridColumnEnd = std::stoi(v); } catch (...) {} }
+        else if (k == L"grid-column-start" || k == L"grid-column-end") {
+            int line, n;
+            if (parseGridLine(v, line, n)) {
+                (k == L"grid-column-start" ? sv.gridColumnStart : sv.gridColumnEnd) = line;
+                if (n) sv.gridColumnSpan = n;
+            }
+        }
         else if (k == L"grid-row") {
-            int s, e;
-            if (parseGridLinePlacement(v, s, e)) { sv.gridRowStart = s; sv.gridRowEnd = e; }
+            int s, e, n;
+            if (parseGridLinePlacement(v, s, e, n)) { sv.gridRowStart = s; sv.gridRowEnd = e; sv.gridRowSpan = n; }
         }
-        else if (k == L"grid-row-start") { try { sv.gridRowStart = std::stoi(v); } catch (...) {} }
-        else if (k == L"grid-row-end") { try { sv.gridRowEnd = std::stoi(v); } catch (...) {} }
+        else if (k == L"grid-row-start" || k == L"grid-row-end") {
+            int line, n;
+            if (parseGridLine(v, line, n)) {
+                (k == L"grid-row-start" ? sv.gridRowStart : sv.gridRowEnd) = line;
+                if (n) sv.gridRowSpan = n;
+            }
+        }
         else if (k == L"row-gap") sv.rowGap = resolveLength(v, containingWidth, 0);
         else if (k == L"column-gap") sv.columnGap = resolveLength(v, containingWidth, 0);
         else if (k == L"gap" || k == L"grid-gap") {
@@ -1427,33 +1437,41 @@ std::vector<LayoutRoot::GridTrack> LayoutRoot::parseGridTemplateTracks(const std
     return tracks;
 }
 
-// See the declaration in Layout.h for the grammar/scope. `start`/`end` are
-// 1-based CSS grid line numbers, matching how they're authored.
-bool LayoutRoot::parseGridLinePlacement(const std::wstring& v, int& start, int& end) {
+// See the declaration in Layout.h for the grammar/scope. One side of a
+// grid-column/grid-row: "auto", a line number "N" (negative counts back
+// from the explicit grid's last line, so -1 is the last line), or
+// "span N". Sets `line` (0 = auto) or `span` (0 = none) accordingly.
+bool LayoutRoot::parseGridLine(const std::wstring& v, int& line, int& span) {
     std::wistringstream ss(v);
-    std::wstring a, slash, b;
+    std::wstring a, b;
     if (!(ss >> a)) return false;
-    int startVal;
-    try { startVal = std::stoi(a); } catch (...) { return false; }
-    if (startVal <= 0) return false; // line numbers are 1-based; 0/negative isn't supported
-
-    if (!(ss >> slash)) { start = startVal; end = startVal + 1; return true; } // bare "N": span 1
-    if (slash != L"/") return false;
-    if (!(ss >> b)) return false;
-
-    if (b == L"span") {
-        std::wstring n;
-        if (!(ss >> n)) return false;
-        int spanVal;
-        try { spanVal = std::stoi(n); } catch (...) { return false; }
-        if (spanVal <= 0) return false;
-        start = startVal; end = startVal + spanVal;
+    if (a == L"auto") { line = 0; span = 0; return !(ss >> b); }
+    if (a == L"span") {
+        if (!(ss >> b)) return false;
+        int n;
+        try { n = std::stoi(b); } catch (...) { return false; }
+        if (n <= 0) return false;
+        line = 0; span = n;
         return true;
     }
-    int endVal;
-    try { endVal = std::stoi(b); } catch (...) { return false; }
-    if (endVal <= startVal) return false; // an empty/reversed range isn't supported
-    start = startVal; end = endVal;
+    int n;
+    try { n = std::stoi(a); } catch (...) { return false; }
+    if (n == 0) return false; // line 0 doesn't exist in CSS
+    line = n; span = 0;
+    return true;
+}
+
+// See the declaration in Layout.h. Splits on '/' (minified CSS often has
+// no spaces around it, e.g. "1/-1") and parses each side with
+// parseGridLine; a missing end side is auto. Only one span is kept - if
+// both sides give one, CSS ignores the end's.
+bool LayoutRoot::parseGridLinePlacement(const std::wstring& v, int& start, int& end, int& span) {
+    size_t slash = v.find(L'/');
+    int sLine = 0, sSpan = 0, eLine = 0, eSpan = 0;
+    if (!parseGridLine(v.substr(0, slash), sLine, sSpan)) return false;
+    if (slash != std::wstring::npos && !parseGridLine(v.substr(slash + 1), eLine, eSpan)) return false;
+    start = sLine; end = eLine;
+    span = sSpan ? sSpan : eSpan;
     return true;
 }
 
@@ -2198,8 +2216,8 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
     // One grid item: its element, its computed style (against containingWidth
     // - re-resolved against its real span width once that's known, below,
     // the same reason layoutFlex re-resolves per item), and its placement -
-    // set here if the item is explicitly positioned (both axes), left as -1
-    // (auto) otherwise for the placement pass further down to fill in.
+    // set here from grid-area, or from grid-column/grid-row once the
+    // column count is known; -1 (auto) for the placement pass to fill in.
     struct ItemPlacement {
         Element* el;
         ComputedStyle style;
@@ -2225,8 +2243,7 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
         p.style = cs;
         // grid-area wins if it names a cell that actually exists in the
         // template; otherwise (no grid-template-areas, or a name that
-        // doesn't appear in it) fall through to line-based placement.
-        bool placedByArea = false;
+        // doesn't appear in it) fall through to line-based placement below.
         if (!cs.gridArea.empty()) {
             int minRow = -1, maxRow = -1, minCol = -1, maxCol = -1;
             for (int r = 0; r < (int)style.gridTemplateAreas.size(); r++) {
@@ -2240,17 +2257,7 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
             if (minRow >= 0) { // the name was found - real CSS requires its cells to form a rectangle; this just takes their bounding box regardless
                 p.colStart = minCol; p.colEnd = maxCol + 1;
                 p.rowStart = minRow; p.rowEnd = maxRow + 1;
-                placedByArea = true;
             }
-        }
-        // Both axes must be explicit for this item to be explicitly placed
-        // - see the ComputedStyle/layoutGrid comments in Layout.h on why
-        // one alone isn't treated as a partial placement.
-        if (!placedByArea && cs.gridColumnStart > 0 && cs.gridRowStart > 0) {
-            p.colStart = cs.gridColumnStart - 1; // 1-based line -> 0-based cell index
-            p.colEnd = (cs.gridColumnEnd > 0 ? cs.gridColumnEnd - 1 : p.colStart + 1);
-            p.rowStart = cs.gridRowStart - 1;
-            p.rowEnd = (cs.gridRowEnd > 0 ? cs.gridRowEnd - 1 : p.rowStart + 1);
         }
         placements.push_back(std::move(p));
     }
@@ -2282,36 +2289,102 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
         cx += colWidths[i] + colGap;
     }
 
-    // Explicitly-placed items: clamp to the template's column count (a
-    // line beyond it doesn't create an implicit column - see Layout.h),
-    // then claim their cells. Auto-placed items (colStart still -1) fill
-    // in around them next, row-major, skipping any cell already claimed.
+    // Resolve each item's grid-column/grid-row against the template (see
+    // ComputedStyle's comment on those fields) into a 0-based cell range
+    // per axis, or leave that axis auto (-1) with just a span size for
+    // the placement pass. Columns clamp to the template's count - a line
+    // beyond it doesn't create an implicit column (see Layout.h); rows
+    // grow as needed.
+    int explicitRows = (int)std::max(style.gridTemplateRows.size(), style.gridTemplateAreas.size());
+    auto resolveAxis = [](int startLine, int endLine, int span, int numTracks, int& a, int& b, int& size) {
+        auto idx = [&](int line) { return std::max(line > 0 ? line - 1 : numTracks + 1 + line, 0); };
+        size = std::max(span, 1);
+        if (startLine && endLine) {
+            a = idx(startLine); b = idx(endLine);
+            if (b < a) std::swap(a, b);
+            if (a == b) b = a + 1;
+        } else if (startLine) {
+            a = idx(startLine); b = a + size;
+        } else if (endLine) {
+            b = std::max(idx(endLine), 1); a = std::max(b - size, 0);
+        } else {
+            a = b = -1; // auto
+            return;
+        }
+        size = b - a;
+    };
+    std::vector<int> colSize(placements.size()), rowSize(placements.size());
+    for (size_t i = 0; i < placements.size(); i++) {
+        auto& p = placements[i];
+        if (p.colStart >= 0) { colSize[i] = p.colEnd - p.colStart; rowSize[i] = p.rowEnd - p.rowStart; continue; } // placed by grid-area
+        auto& cs = p.style;
+        resolveAxis(cs.gridColumnStart, cs.gridColumnEnd, cs.gridColumnSpan, numCols, p.colStart, p.colEnd, colSize[i]);
+        resolveAxis(cs.gridRowStart, cs.gridRowEnd, cs.gridRowSpan, explicitRows, p.rowStart, p.rowEnd, rowSize[i]);
+        if (p.colStart >= 0) {
+            p.colStart = std::clamp(p.colStart, 0, numCols - 1);
+            p.colEnd = std::clamp(p.colEnd, p.colStart + 1, numCols);
+        }
+        colSize[i] = std::min(colSize[i], numCols);
+    }
+
+    // CSS's (sparse, grid-auto-flow: row) auto-placement: first items
+    // definite in both axes claim their cells, then items with only a
+    // definite row take the first columns that fit in it, then everything
+    // else goes in source order behind a cursor that only moves forward -
+    // an item with a definite column moves the cursor down a row if that
+    // column is already behind it, a fully auto one takes the next spot
+    // its whole span fits. Simpler than real CSS in one way: a definite
+    // row that's already full doesn't grow implicit columns.
     std::set<std::pair<int, int>> occupied; // (row, col)
     // grid-template-areas defines the row count too, even for a trailing
     // row nothing ends up placed in (e.g. one made entirely of "." cells).
     int maxRowUsed = style.gridTemplateAreas.empty() ? -1 : (int)style.gridTemplateAreas.size() - 1;
-    for (auto& p : placements) {
-        if (p.colStart < 0) continue;
-        p.colStart = std::clamp(p.colStart, 0, numCols - 1);
-        p.colEnd = std::clamp(p.colEnd, p.colStart + 1, numCols);
-        for (int r = p.rowStart; r < p.rowEnd; r++)
-            for (int c = p.colStart; c < p.colEnd; c++)
-                occupied.insert({ r, c });
-        maxRowUsed = std::max(maxRowUsed, p.rowEnd - 1);
+    auto fits = [&](int r, int c, int w, int h) {
+        if (c + w > numCols) return false;
+        for (int rr = r; rr < r + h; rr++)
+            for (int cc = c; cc < c + w; cc++)
+                if (occupied.count({ rr, cc })) return false;
+        return true;
+    };
+    auto place = [&](ItemPlacement& p, int r, int c, int w, int h) {
+        p.rowStart = r; p.rowEnd = r + h;
+        p.colStart = c; p.colEnd = c + w;
+        for (int rr = r; rr < r + h; rr++)
+            for (int cc = c; cc < c + w; cc++)
+                occupied.insert({ rr, cc });
+        maxRowUsed = std::max(maxRowUsed, r + h - 1);
+    };
+    for (auto& p : placements)
+        if (p.colStart >= 0 && p.rowStart >= 0) place(p, p.rowStart, p.colStart, p.colEnd - p.colStart, p.rowEnd - p.rowStart);
+    for (size_t i = 0; i < placements.size(); i++) {
+        auto& p = placements[i];
+        if (p.rowStart < 0 || p.colStart >= 0) continue; // only definite-row, auto-column items
+        int w = colSize[i], h = p.rowEnd - p.rowStart, c = 0;
+        while (c + w <= numCols && !fits(p.rowStart, c, w, h)) c++;
+        if (c + w > numCols) c = 0; // row is full - overlap rather than grow implicit columns
+        place(p, p.rowStart, c, w, h);
     }
     int cursorRow = 0, cursorCol = 0;
-    for (auto& p : placements) {
-        if (p.colStart >= 0) continue; // already explicitly placed
-        while (occupied.count({ cursorRow, cursorCol })) {
-            cursorCol++;
-            if (cursorCol >= numCols) { cursorCol = 0; cursorRow++; }
+    for (size_t i = 0; i < placements.size(); i++) {
+        auto& p = placements[i];
+        if (p.rowStart >= 0) continue; // already placed above
+        int h = rowSize[i];
+        if (p.colStart >= 0) {
+            int w = p.colEnd - p.colStart;
+            if (p.colStart < cursorCol) cursorRow++;
+            while (!fits(cursorRow, p.colStart, w, h)) cursorRow++;
+            place(p, cursorRow, p.colStart, w, h);
+            cursorCol = p.colEnd;
+        } else {
+            int w = colSize[i];
+            for (;;) {
+                if (cursorCol + w > numCols) { cursorCol = 0; cursorRow++; }
+                if (fits(cursorRow, cursorCol, w, h)) break;
+                cursorCol++;
+            }
+            place(p, cursorRow, cursorCol, w, h);
+            cursorCol += w;
         }
-        p.colStart = cursorCol; p.colEnd = cursorCol + 1;
-        p.rowStart = cursorRow; p.rowEnd = cursorRow + 1;
-        occupied.insert({ cursorRow, cursorCol });
-        maxRowUsed = std::max(maxRowUsed, cursorRow);
-        cursorCol++;
-        if (cursorCol >= numCols) { cursorCol = 0; cursorRow++; }
     }
     int numRows = maxRowUsed + 1;
 
