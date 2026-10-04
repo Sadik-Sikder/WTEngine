@@ -44,8 +44,12 @@ struct ImageTexture {
 struct PendingImageUpload {
     std::wstring url;
     std::vector<unsigned char> rgba;
-    int width = 0;
+    int width = 0;  // of `rgba`, in pixels
     int height = 0;
+    // The size layout should give it: the same as width/height for a
+    // bitmap, smaller for an SVG (rasterized at a multiple of it to stay sharp).
+    int naturalWidth = 0;
+    int naturalHeight = 0;
     bool ok = false;
 };
 
@@ -127,4 +131,5 @@ private:
     void startLoadingImage(const std::wstring& url);
     void decodeThreadMain();
     void drainPendingImageUploads();
+    static bool supportsAutoMipmaps();
 };

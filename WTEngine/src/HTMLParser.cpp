@@ -77,7 +77,10 @@ bool HTMLParser::startsWith(const std::wstring& token) {
 std::wstring HTMLParser::parseTagName() {
     skipSpace();
     std::wstring name;
-    while (pos < s.size() && iswalnum(s[pos])) { name.push_back((wchar_t)towlower(s[pos++])); }
+    // Letters and digits, plus '-' (custom elements: <my-widget>), ':' and
+    // '_' (namespaced names like <svg:rect>).
+    while (pos < s.size() && (iswalnum(s[pos]) || s[pos] == L'-' || s[pos] == L':' || s[pos] == L'_'))
+        name.push_back((wchar_t)towlower(s[pos++]));
     return name;
 }
 
@@ -87,7 +90,11 @@ std::map<std::wstring, std::wstring> HTMLParser::parseAttributes() {
         skipSpace();
         if (pos >= s.size() || s[pos] == L'>' || startsWith(L"/>")) break;
         std::wstring k;
-        while (pos < s.size() && (iswalnum(s[pos]) || s[pos] == L'-')) k.push_back((wchar_t)towlower(s[pos++]));
+        // Anything up to whitespace, '/', '>', '=' or a quote, as in HTML -
+        // so xlink:href, xml:lang, data-x, @click and :src stay whole.
+        while (pos < s.size() && !iswspace(s[pos]) && s[pos] != L'/' && s[pos] != L'>' && s[pos] != L'=' &&
+               s[pos] != L'"' && s[pos] != L'\'')
+            k.push_back((wchar_t)towlower(s[pos++]));
         if (k.empty()) { pos++; continue; } // stray character; avoid looping forever
         skipSpace();
         if (pos < s.size() && s[pos] == L'=') {

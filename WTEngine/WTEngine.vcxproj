@@ -154,6 +154,7 @@
     <ClCompile Include="src\FindBar.cpp" />
     <ClCompile Include="src\ResourceLoader.cpp" />
     <ClCompile Include="src\WebStorage.cpp" />
+    <ClCompile Include="src\Svg.cpp" />
   </ItemGroup>
   <!-- The vendored quickjs-ng engine, compiled straight into this project. Mirrors the
        "qjs" target in third_party/quickjs-ng/CMakeLists.txt (only these four files, C11 with
@@ -192,6 +193,7 @@
     <ClInclude Include="include\Renderer.h" />
     <ClInclude Include="include\ResourceLoader.h" />
     <ClInclude Include="include\WebStorage.h" />
+    <ClInclude Include="include\Svg.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

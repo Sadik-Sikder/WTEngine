@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include "Layout.h"
 #include "Renderer.h" // tryParseColor
+#include "Svg.h"
 #include <windows.h>
 #include <string>
 #include <sstream>
@@ -183,6 +184,11 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containin
             out.push_back({ L"", inheritedFontSize, L"", nullptr, true, inheritedVisuallyHidden, inheritedPaint });
             continue;
         }
+
+        // An inline run is words only, so an image inside inline content
+        // (<a><svg>...</svg> Home</a>) can't be placed here. Skipped whole -
+        // otherwise an <svg>'s <title>/<text> would leak in as words.
+        if (e->tag == L"img" || e->tag == L"svg") continue;
 
         ComputedStyle sv = computeStyle(e, inheritedFontSize, containingWidth, inheritedVisuallyHidden, inheritedPaint);
         if (sv.display == Display::None) continue;
@@ -907,17 +913,44 @@ void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth, c
 // an unset axis uses the image's natural decoded size, fetching/decoding it
 // now via `loadImage` so the box gets the real size instead of a guess. A
 // fixed placeholder covers the case where that fetch/decode fails.
+// An <img>, or an inline <svg> (drawn the same way: its markup becomes a
+// data: URI the renderer rasterizes - see Svg.h). Size, per dimension:
+// CSS width/height, then the width/height attributes (an <svg>'s are part
+// of its intrinsic size), then the image's natural size - a dimension that
+// is set alone keeps the natural aspect ratio. Until a bitmap has loaded,
+// its natural size is unknown and a 200x150 placeholder stands in; an
+// SVG's comes straight from its attributes.
 void LayoutRoot::layoutImage(Element* e, int x, int& y, int containingWidth, const ComputedStyle& style) {
     const int defaultWidth = 200, defaultHeight = 150;
-    std::wstring src = getAttr(e, L"src", L"");
+    bool isSvg = e->tag == L"svg";
+    std::wstring src = isSvg ? svgDataUri(e, style.paint.color) : getAttr(e, L"src", L"");
 
     int naturalW = 0, naturalH = 0;
-    bool haveNatural = loadImage && !src.empty() && loadImage(src, naturalW, naturalH);
+    bool haveNatural;
+    if (isSvg) {
+        float w, h;
+        svgIntrinsicSize(e->attrs, w, h);
+        naturalW = (int)std::lround(w);
+        naturalH = (int)std::lround(h);
+        haveNatural = true;
+    }
+    else {
+        haveNatural = loadImage && !src.empty() && loadImage(src, naturalW, naturalH);
+    }
 
-    std::wstring wAttr = getAttr(e, L"width", L"");
-    std::wstring hAttr = getAttr(e, L"height", L"");
-    int width = !wAttr.empty() ? parseFontSize(wAttr, defaultWidth) : (haveNatural ? naturalW : defaultWidth);
-    int height = !hAttr.empty() ? parseFontSize(hAttr, defaultHeight) : (haveNatural ? naturalH : defaultHeight);
+    int width = style.width, height = style.height;
+    if (!isSvg) {
+        std::wstring wAttr = getAttr(e, L"width", L""), hAttr = getAttr(e, L"height", L"");
+        if (width < 0 && !wAttr.empty()) width = parseFontSize(wAttr, defaultWidth);
+        if (height < 0 && !hAttr.empty()) height = parseFontSize(hAttr, defaultHeight);
+    }
+    if (haveNatural && naturalW > 0 && naturalH > 0) {
+        if (width < 0 && height < 0) { width = naturalW; height = naturalH; }
+        else if (width < 0) width = (int)std::lround((double)height * naturalW / naturalH);
+        else if (height < 0) height = (int)std::lround((double)width * naturalH / naturalW);
+    }
+    if (width < 0) width = defaultWidth;
+    if (height < 0) height = defaultHeight;
 
     LayoutBox box;
     box.x = x;
@@ -1027,7 +1060,7 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
                 continue;
             }
 
-            if (e->tag == L"img") {
+            if (e->tag == L"img" || e->tag == L"svg") {
                 flushInline();
                 layoutImage(e, x, y, containingWidth, sv);
                 continue;
@@ -1287,7 +1320,7 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
         int localY = 0;
         if (p.el->tag == L"input" || p.el->tag == L"button" || p.el->tag == L"select") {
             layoutControl(p.el, 0, localY, spanWidth, real);
-        } else if (p.el->tag == L"img") {
+        } else if (p.el->tag == L"img" || p.el->tag == L"svg") {
             layoutImage(p.el, 0, localY, spanWidth, real);
         } else {
             // A grid item is always block-level, regardless of its own
@@ -1603,7 +1636,7 @@ std::vector<LayoutBox> LayoutRoot::layoutItemDetached(Element* item, int width, 
     int localY = 0;
     if (item->tag == L"input" || item->tag == L"button" || item->tag == L"select")
         layoutControl(item, 0, localY, width, style);
-    else if (item->tag == L"img")
+    else if (item->tag == L"img" || item->tag == L"svg")
         layoutImage(item, 0, localY, width, style);
     else
         layoutBlockChild(item, 0, localY, width, style);

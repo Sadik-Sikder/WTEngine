@@ -3,7 +3,11 @@
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F // OpenGL 1.2; Windows' gl.h only declares 1.1
 #endif
+#ifndef GL_GENERATE_MIPMAP
+#define GL_GENERATE_MIPMAP 0x8191 // OpenGL 1.4
+#endif
 #include "Fetcher.h"
+#include "Svg.h"
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -337,13 +341,32 @@ void OpenGLRenderer::decodeThreadMain() {
 
         PendingImageUpload upload;
         upload.url = item.url;
-        upload.ok = item.ok && decodeImage(item.bytes, upload.rgba, upload.width, upload.height);
+        if (item.ok && looksLikeSvg(item.bytes)) {
+            upload.ok = rasterizeSvg(item.bytes, upload.rgba, upload.width, upload.height,
+                                     upload.naturalWidth, upload.naturalHeight);
+        }
+        else {
+            upload.ok = item.ok && decodeImage(item.bytes, upload.rgba, upload.width, upload.height);
+            upload.naturalWidth = upload.width;
+            upload.naturalHeight = upload.height;
+        }
 
         std::lock_guard<std::mutex> lock(uploadMutex);
         pendingUploads.push_back(std::move(upload));
     }
 
     if (comInit) CoUninitialize();
+}
+
+// Whether GL_GENERATE_MIPMAP exists (core since OpenGL 1.4). Windows' gl.h
+// only declares 1.1, so the version is checked at runtime, once.
+bool OpenGLRenderer::supportsAutoMipmaps() {
+    static const bool supported = [] {
+        const char* v = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+        int major = 0, minor = 0;
+        return v && sscanf_s(v, "%d.%d", &major, &minor) == 2 && (major > 1 || minor >= 4);
+    }();
+    return supported;
 }
 
 // Uploads every fetch/decode that finished since the last frame as a GL
@@ -362,7 +385,17 @@ void OpenGLRenderer::drainPendingImageUploads() {
         if (u.ok) {
             glGenTextures(1, &tex.id);
             glBindTexture(GL_TEXTURE_2D, tex.id);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            // Mipmaps where the driver can build them (OpenGL 1.4+): an image
+            // drawn smaller than its pixels - a photo in a small box, or an
+            // SVG, which is rasterized at 2-4x - then averages every pixel
+            // it covers instead of sampling a few, so edges don't turn jagged.
+            if (supportsAutoMipmaps()) {
+                glTexParameteri(GL_TEXTURE_2D, GL_GENERATE_MIPMAP, GL_TRUE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+            }
+            else {
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            }
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             // Clamp, not the default repeat: when a texture is drawn scaled (page
             // zoom), linear filtering would otherwise blend its left edge into its
@@ -370,8 +403,8 @@ void OpenGLRenderer::drainPendingImageUploads() {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, u.width, u.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, u.rgba.data());
-            tex.width = u.width;
-            tex.height = u.height;
+            tex.width = u.naturalWidth;
+            tex.height = u.naturalHeight;
             tex.state = ImageLoadState::Ready;
         }
         else {
