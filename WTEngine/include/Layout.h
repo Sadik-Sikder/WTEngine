@@ -301,6 +301,12 @@ private:
         int marginTop = 6, marginBottom = 6, marginLeft = 0, marginRight = 0;
         int paddingTop = 6, paddingRight = 6, paddingBottom = 6, paddingLeft = 6;
         int width = -1; // -1 = auto: fill the container, same as if unset (today's only behavior)
+        // min-/max-width in px (in the same box as `width`, per box-sizing),
+        // -1 for none.
+        int minWidth = -1, maxWidth = -1;
+        // margin-left/-right: auto - a block narrower than its container
+        // takes the leftover space there (both: centred).
+        bool marginLeftAuto = false, marginRightAuto = false;
         // The used height in px (content box, or border box with
         // box-sizing: border-box), or -1 for auto. A percentage resolves
         // against the containing block's height when that is definite

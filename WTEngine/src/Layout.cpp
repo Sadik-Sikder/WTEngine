@@ -1023,11 +1023,21 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         }
         else if (k == L"margin") {
             parseBoxShorthand(v, containingWidth, 6, sv.marginTop, sv.marginRight, sv.marginBottom, sv.marginLeft);
+            // Which of left/right is `auto`, by the 1-4 value rule (top,
+            // right, bottom, left); auto resolved as 0 above.
+            std::vector<std::wstring> t = cssTokens(lowerCase(v));
+            if (!t.empty() && t.size() <= 4) {
+                static const int kRight[4] = { 0, 1, 1, 1 }, kLeft[4] = { 0, 1, 1, 3 };
+                sv.marginRightAuto = t[kRight[t.size() - 1]] == L"auto";
+                sv.marginLeftAuto = t[kLeft[t.size() - 1]] == L"auto";
+                if (sv.marginRightAuto) sv.marginRight = 0;
+                if (sv.marginLeftAuto) sv.marginLeft = 0;
+            }
         }
         else if (k == L"margin-top") sv.marginTop = resolveLength(v, containingWidth, 6);
-        else if (k == L"margin-right") sv.marginRight = resolveLength(v, containingWidth, 0);
+        else if (k == L"margin-right") { sv.marginRightAuto = lowerCase(trimmed(v)) == L"auto"; sv.marginRight = resolveLength(v, containingWidth, 0); }
         else if (k == L"margin-bottom") sv.marginBottom = resolveLength(v, containingWidth, 6);
-        else if (k == L"margin-left") sv.marginLeft = resolveLength(v, containingWidth, 0);
+        else if (k == L"margin-left") { sv.marginLeftAuto = lowerCase(trimmed(v)) == L"auto"; sv.marginLeft = resolveLength(v, containingWidth, 0); }
         else if (k == L"padding") {
             parseBoxShorthand(v, containingWidth, 6, sv.paddingTop, sv.paddingRight, sv.paddingBottom, sv.paddingLeft);
         }
@@ -1036,6 +1046,8 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         else if (k == L"padding-bottom") sv.paddingBottom = resolveLength(v, containingWidth, 6);
         else if (k == L"padding-left") sv.paddingLeft = resolveLength(v, containingWidth, 6);
         else if (k == L"width") sv.width = resolveLength(v, containingWidth, -1);
+        else if (k == L"min-width") sv.minWidth = resolveLength(v, containingWidth, -1);
+        else if (k == L"max-width") sv.maxWidth = lowerCase(trimmed(v)) == L"none" ? -1 : resolveLength(v, containingWidth, -1);
         else if (k == L"height") sv.height = resolveHeight(v, sv.fontSize, -1);
         else if (k == L"min-height") sv.minHeight = resolveHeight(v, sv.fontSize, -1);
         else if (k == L"max-height") sv.maxHeight = v == L"none" ? -1 : resolveHeight(v, sv.fontSize, -1);
@@ -1584,6 +1596,8 @@ void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth, c
     // border, as browsers size most controls (box-sizing: border-box).
     if (box.control != LayoutBox::Checkbox) {
         if (style.width >= 0) box.width = std::min(std::max(style.width, 16), maxWidth);
+        if (style.maxWidth >= 0) box.width = std::min(box.width, std::max(style.maxWidth, 16));
+        if (style.minWidth >= 0) box.width = std::min(std::max(box.width, style.minWidth), maxWidth);
         if (style.height > 0) box.height = std::max(style.height, style.fontSize + 4);
     }
 
@@ -1645,8 +1659,19 @@ LayoutBox LayoutRoot::makeImageBox(Element* e, int containingWidth, const Comput
         else if (width < 0) width = (int)std::lround((double)height * naturalW / naturalH);
         else if (height < 0) height = (int)std::lround((double)width * naturalH / naturalW);
     }
+    bool heightFollowsWidth = style.height < 0 && (isSvg || getAttr(e, L"height", L"").empty());
     if (width < 0) width = defaultWidth;
     if (height < 0) height = defaultHeight;
+
+    // min-/max-width - img { max-width: 100% } - keeping the image's
+    // proportions when its height wasn't set on its own.
+    int clamped = width;
+    if (style.maxWidth >= 0) clamped = std::min(clamped, style.maxWidth);
+    if (style.minWidth >= 0) clamped = std::max(clamped, style.minWidth);
+    if (clamped != width && width > 0) {
+        if (heightFollowsWidth) height = (int)std::lround((double)height * clamped / width);
+        width = clamped;
+    }
 
     LayoutBox box;
     box.x = 0;
@@ -1822,15 +1847,19 @@ void LayoutRoot::layoutOutOfFlow(ContainingBlock& cb, int cbX, int cbY, int cbW,
             s.boxSizing = BoxSizing::BorderBox;
             s.height = std::max(cbH - T - B - s.marginTop - s.marginBottom, 0);
         }
+        // The width it's laid out in: between left and right when both are
+        // set (where margin: auto then centres it), else the containing
+        // block for a set width, else shrink-to-fit.
         int available;
-        if (s.width >= 0) available = cbW;
-        else if (!s.left.isAuto && !s.right.isAuto) available = std::max(cbW - L - R, 0);
+        if (!s.left.isAuto && !s.right.isAuto) available = std::max(cbW - L - R, 0);
+        else if (s.width >= 0) available = cbW;
         else available = shrinkToFitWidth(p.el, s, std::max(cbW - (s.left.isAuto ? 0 : L) - (s.right.isAuto ? 0 : R), 0));
         // Its outer (margin box) width, to place it from the right.
-        int outer = s.width >= 0
-            ? (s.boxSizing == BoxSizing::BorderBox ? s.width : s.width + s.paddingLeft + s.paddingRight + 2 * s.borderWidth) +
-                  s.marginLeft + s.marginRight
-            : available;
+        const int chromeX = s.boxSizing == BoxSizing::BorderBox ? 0 : s.paddingLeft + s.paddingRight + 2 * s.borderWidth;
+        int widthValue = s.width >= 0 ? s.width : available - s.marginLeft - s.marginRight - chromeX;
+        if (s.maxWidth >= 0) widthValue = std::min(widthValue, s.maxWidth);
+        if (s.minWidth >= 0) widthValue = std::max(widthValue, s.minWidth);
+        int outer = std::max(widthValue, 0) + chromeX + s.marginLeft + s.marginRight;
 
         int height = 0;
         std::vector<LayoutBox> placed = layoutItemDetached(p.el, available, s, height);
@@ -1995,16 +2024,27 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     // after padding and border). With no explicit `width` the box just
     // fills what its container offers, as always; with one set, box-sizing
     // decides which width it names - see the BoxSizing comment in Layout.h.
-    int outerWidth;
-    if (sv.width >= 0) {
-        outerWidth = sv.boxSizing == BoxSizing::BorderBox
-            ? sv.width
-            : sv.width + sv.paddingLeft + sv.paddingRight + 2 * sv.borderWidth;
-    } else {
-        outerWidth = std::max(containingWidth - sv.marginLeft - sv.marginRight, 0);
-    }
+    // `width` (and min-/max-width) name the content box, or the border box
+    // with box-sizing: border-box; `chromeX` converts between that and the
+    // outer (border-box) width.
+    const int chromeX = sv.boxSizing == BoxSizing::BorderBox ? 0 : sv.paddingLeft + sv.paddingRight + 2 * sv.borderWidth;
+    int widthValue = sv.width >= 0 ? sv.width
+                                   : std::max(containingWidth - sv.marginLeft - sv.marginRight - chromeX, 0); // auto: fill the container
+    if (sv.maxWidth >= 0) widthValue = std::min(widthValue, sv.maxWidth);
+    if (sv.minWidth >= 0) widthValue = std::max(widthValue, sv.minWidth);
+    int outerWidth = widthValue + chromeX;
     int contentWidth = std::max(outerWidth - sv.paddingLeft - sv.paddingRight - 2 * sv.borderWidth, 0);
-    int boxX = x + sv.marginLeft;
+
+    // margin: auto - what's left of the container goes to the auto margin(s):
+    // both centres the box (margin: 0 auto), one pushes it to the other side.
+    int marginLeft = sv.marginLeft;
+    if (sv.marginLeftAuto || sv.marginRightAuto) {
+        int free = std::max(containingWidth - outerWidth - (sv.marginLeftAuto ? 0 : sv.marginLeft) -
+                            (sv.marginRightAuto ? 0 : sv.marginRight), 0);
+        if (sv.marginLeftAuto && sv.marginRightAuto) marginLeft = free / 2;
+        else if (sv.marginLeftAuto) marginLeft = free;
+    }
+    int boxX = x + marginLeft;
 
     y += sv.marginTop;
     int contentStartY = y;
@@ -2488,6 +2528,11 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
 
     std::vector<int> basis(n), minWidth(n);
     std::vector<float> grow(n), shrink(n);
+    // With auto margins in play, items without a width are sized to their
+    // content (as CSS always does) rather than this engine's usual implicit
+    // flex-grow - otherwise they'd fill the row and leave the margins nothing.
+    bool autoMarginsUsed = false;
+    for (const auto& s : itemStyles) autoMarginsUsed |= s.marginLeftAuto || s.marginRightAuto;
     for (int i = 0; i < n; i++) {
         const ComputedStyle& s = itemStyles[i];
         int chrome = s.paddingLeft + s.paddingRight + 2 * s.borderWidth;
@@ -2498,7 +2543,7 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
         if (w >= 0) {
             basis[i] = w;
             grow[i] = s.flexGrow;
-        } else if (wraps) {
+        } else if (wraps || autoMarginsUsed) {
             basis[i] = shrinkToFitWidth(items[i], s, containingWidth);
             grow[i] = s.flexGrow;
         } else {
@@ -2540,6 +2585,13 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
             else if (free < 0 && totalScaledShrink > 0)
                 itemWidths[i] = std::max(minWidth[i],
                     basis[i] + (int)std::lround(free * (shrink[i] * basis[i] / totalScaledShrink)));
+            // min-/max-width have the last word (the space a clamped item
+            // gives up isn't handed on to the others - a simplification).
+            const ComputedStyle& s = itemStyles[i];
+            int extra = (s.boxSizing == BoxSizing::BorderBox ? 0 : s.paddingLeft + s.paddingRight + 2 * s.borderWidth) +
+                        s.marginLeft + s.marginRight;
+            if (s.maxWidth >= 0) itemWidths[i] = std::min(itemWidths[i], s.maxWidth + extra);
+            if (s.minWidth >= 0) itemWidths[i] = std::max(itemWidths[i], s.minWidth + extra);
         }
 
         // Lay out each item at its resolved width to discover its natural
@@ -2584,9 +2636,22 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
             }
         }
 
+        // Auto margins on items take the leftover space first, split evenly
+        // between them - margin-left: auto pushes an item (and those after
+        // it) to the end - and justify-content then has nothing left to do.
+        int autoMargins = 0;
+        for (int i = a; i < b; i++) autoMargins += itemStyles[i].marginLeftAuto + itemStyles[i].marginRightAuto;
+        int perAutoMargin = 0;
+        if (autoMargins > 0) {
+            startX = x;
+            extraGap = 0;
+            perAutoMargin = leftover / autoMargins;
+        }
+
         int cursorX = startX;
         for (int i = a; i < b; i++) {
             int k = i - a;
+            if (itemStyles[i].marginLeftAuto) cursorX += perAutoMargin;
             int itemY = 0;
             if (style.alignItems == AlignItems::Center) itemY = (lineHeight - itemHeights[k]) / 2;
             else if (style.alignItems == AlignItems::FlexEnd) itemY = lineHeight - itemHeights[k];
@@ -2605,6 +2670,7 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
                 boxes.push_back(std::move(box));
             }
             cursorX += itemWidths[i] + colGap + extraGap;
+            if (itemStyles[i].marginRightAuto) cursorX += perAutoMargin;
         }
         lineY += lineHeight;
     }
