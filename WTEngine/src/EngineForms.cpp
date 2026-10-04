@@ -6,6 +6,7 @@
 #include "Fetcher.h"
 #include "JSBinding.h"
 #include "JSEngine.h"
+#include <GLFW/glfw3.h> // key codes only
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
@@ -164,21 +165,69 @@ Engine::Cursor Engine::cursorAt(int x, int y, Renderer& renderer) const {
     return linkAt(x, y, renderer).empty() ? Cursor::Arrow : Cursor::Hand;
 }
 
-void Engine::focusInput(const LayoutBox& box) {
-    focusedEl = box.el;
-    focusedForm = box.form;
-    editor.setText(attrOf(box.el, L"value"));
-    editor.setMasked(isPassword(box.el));
-    inputScrollX = 0;
+bool Engine::inPage(const Element* el) const {
+    if (!el || !document) return false;
+    const Element* root = document->root ? document->root.get() : document->body.get();
+    return root && treeContains(root, el);
 }
 
+JSContext* Engine::jsContext() const {
+    return jsEngine ? jsEngine->context() : nullptr;
+}
+
+// Moves focus to `box`'s field: the previously focused one (if any) is
+// blurred first, then "focus" and "focusin" fire on the new one.
+void Engine::focusInput(const LayoutBox& box) {
+    Element* el = box.el;
+    Element* form = box.form;
+    if (focusedEl && focusedEl != el) {
+        blurInput();
+        if (!stillInPage(el)) return; // a blur/change listener removed the field
+    }
+    focusedEl = el;
+    focusedForm = form;
+    editor.setText(attrOf(el, L"value"));
+    editor.setMasked(isPassword(el));
+    inputScrollX = 0;
+    focusValue_ = editor.text();
+    userEdited_ = false;
+
+    if (JSContext* ctx = jsContext()) {
+        fireEvent(ctx, el, L"focus", false, false);
+        if (stillInPage(el)) fireEvent(ctx, el, L"focusin", true, false);
+        if (!stillInPage(el) || !stillInPage(form)) { focusedEl = nullptr; focusedForm = nullptr; }
+    }
+}
+
+// Takes focus away from the focused field, firing "change" (if the user
+// changed its value), "blur" and "focusout" on it.
 void Engine::blurInput() {
+    Element* el = focusedEl;
+    if (!el) return;
+    bool changed = userEdited_ && attrOf(el, L"value") != focusValue_;
     focusedEl = nullptr;
     focusedForm = nullptr;
+    userEdited_ = false;
+
+    JSContext* ctx = jsContext();
+    if (!ctx || !stillInPage(el)) return;
+    if (changed) fireEvent(ctx, el, L"change", true, false);
+    if (stillInPage(el)) fireEvent(ctx, el, L"blur", false, false);
+    if (stillInPage(el)) fireEvent(ctx, el, L"focusout", true, false);
 }
 
 void Engine::syncValue() {
     if (focusedEl) focusedEl->attrs[L"value"] = editor.text();
+}
+
+void Engine::afterEdit(const std::wstring& before, const wchar_t* inputType, const std::wstring& data) {
+    if (!focusedEl || editor.text() == before) return;
+    userEdited_ = true;
+    Element* el = focusedEl;
+    JSContext* ctx = jsContext();
+    if (!ctx) return;
+    fireInputEvent(ctx, el, inputType, data);
+    if (!stillInPage(focusedEl)) { focusedEl = nullptr; focusedForm = nullptr; }
 }
 
 bool Engine::onClick(int x, int y, double now, Renderer& renderer) {
@@ -196,7 +245,15 @@ bool Engine::onClick(int x, int y, double now, Renderer& renderer) {
                 int top = rowY + (int)i * rowHeight;
                 if (docX >= openSelectBox.x && docX < openSelectBox.x + openSelectBox.width &&
                     docY >= top && docY < top + rowHeight) {
-                    chooseOption(openSelect, opts[i]);
+                    Element* select = openSelect;
+                    bool changed = selectedOption(select) != opts[i];
+                    chooseOption(select, opts[i]);
+                    openSelect = nullptr;
+                    JSContext* ctx = jsContext();
+                    if (changed && ctx) {
+                        fireEvent(ctx, select, L"input", true, false);
+                        if (stillInPage(select)) fireEvent(ctx, select, L"change", true, false);
+                    }
                     break;
                 }
             }
@@ -211,17 +268,18 @@ bool Engine::onClick(int x, int y, double now, Renderer& renderer) {
         return false;
     }
 
-    // Run addEventListener('click') handlers first, bubbling up from the
-    // control like any other click. preventDefault() then cancels the
-    // control's own action below (toggle, submit, open the dropdown) - but not
-    // focusing a text field, matching browsers, where click's preventDefault
-    // doesn't stop focus.
-    bool prevented = jsEngine && ::dispatchClick(jsEngine->context(), b->el);
+    // Run click listeners first, bubbling up from the control like any
+    // other click. preventDefault() then cancels the control's own action
+    // below (toggle, submit, open the dropdown) - but not focusing a text
+    // field, matching browsers, where click's preventDefault doesn't stop
+    // focus.
+    Element* control = b->el;
+    JSContext* ctx = jsContext();
+    bool prevented = ctx && fireMouseEvent(ctx, control, L"click", mouseInfoAt(x, y));
 
     // A handler that rewrote the page (innerHTML=, removeChild, ...) may have
-    // freed the control we're about to act on; if so there's nothing left to do.
-    if (domState.domDirty && document && document->body &&
-        !treeContains(document->body.get(), b->el)) {
+    // removed the control we're about to act on; if so there's nothing left to do.
+    if (!stillInPage(control)) {
         blurInput();
         return true;
     }
@@ -238,20 +296,27 @@ bool Engine::onClick(int x, int y, double now, Renderer& renderer) {
         else editor.placeCaretAt(localX, renderer, fs);
         break;
     }
-    case LayoutBox::Button:
+    case LayoutBox::Button: {
+        Element* form = b->form;
         blurInput();
-        if (!prevented && b->form && isSubmitButton(b->el)) queueSubmit(b->form, b->el);
+        if (!prevented && form && isSubmitButton(control) && stillInPage(control) && stillInPage(form))
+            queueSubmit(form, control);
         break;
+    }
     case LayoutBox::Checkbox:
         blurInput();
-        if (prevented) break;
-        if (b->el->attrs.count(L"checked")) b->el->attrs.erase(L"checked");
-        else b->el->attrs[L"checked"] = L"";
+        if (prevented || !stillInPage(control)) break;
+        if (control->attrs.count(L"checked")) control->attrs.erase(L"checked");
+        else control->attrs[L"checked"] = L"";
+        if (ctx) {
+            fireEvent(ctx, control, L"input", true, false);
+            if (stillInPage(control)) fireEvent(ctx, control, L"change", true, false);
+        }
         break;
     case LayoutBox::Select:
         blurInput();
-        if (prevented) break;
-        openSelect = b->el;
+        if (prevented || !stillInPage(control)) break;
+        openSelect = control;
         openSelectBox = *b;
         break;
     default:
@@ -276,29 +341,57 @@ Element* Engine::elementAt(int x, int y) const {
 }
 
 bool Engine::dispatchClick(int x, int y) {
-    if (!jsEngine) return false;
+    JSContext* ctx = jsContext();
     Element* target = elementAt(x, y);
-    if (!target) return false;
+    if (!ctx || !target) return false;
+    return fireMouseEvent(ctx, target, L"click", mouseInfoAt(x, y));
+}
 
-    return ::dispatchClick(jsEngine->context(), target);
+bool Engine::onKeyEvent(const KeyInfo& info, bool down) {
+    if (down) suppressChar_ = false;
+    JSContext* ctx = jsContext();
+    if (!ctx || !document || !document->body) return false;
+    if (focusedEl && !stillInPage(focusedEl)) { focusedEl = nullptr; focusedForm = nullptr; }
+
+    Element* target = focusedEl ? focusedEl : document->body.get();
+    bool prevented = fireKeyboardEvent(ctx, target, down ? L"keydown" : L"keyup", info);
+    if (focusedEl && !stillInPage(focusedEl)) { focusedEl = nullptr; focusedForm = nullptr; }
+    if (down && prevented) suppressChar_ = true;
+    return prevented;
 }
 
 void Engine::onChar(unsigned int cp) {
+    if (suppressChar_) { suppressChar_ = false; return; } // its keydown was cancelled
     if (!focusedEl) return;
+    std::wstring before = editor.text();
     editor.onChar(cp);
     syncValue();
+    std::wstring typed;
+    if (cp >= 0x10000) { // outside the BMP: a UTF-16 surrogate pair
+        typed.push_back((wchar_t)(0xD800 + ((cp - 0x10000) >> 10)));
+        typed.push_back((wchar_t)(0xDC00 + ((cp - 0x10000) & 0x3FF)));
+    }
+    else {
+        typed.push_back((wchar_t)cp);
+    }
+    afterEdit(before, L"insertText", typed);
 }
 
 void Engine::insertText(const std::wstring& s) {
     if (!focusedEl) return;
+    std::wstring before = editor.text();
     editor.insert(s);
     syncValue();
+    afterEdit(before, L"insertFromPaste", s);
 }
 
 bool Engine::onEditKey(int key) {
     if (!focusedEl) return false;
+    std::wstring before = editor.text();
     bool handled = editor.onEditKey(key);
     syncValue();
+    // Backspace and Delete are the only edit keys that change the text.
+    afterEdit(before, key == GLFW_KEY_DELETE ? L"deleteContentForward" : L"deleteContentBackward", L"");
     return handled;
 }
 
@@ -340,7 +433,14 @@ void Engine::submitFocused() {
     if (focusedEl && focusedForm) queueSubmit(focusedForm, nullptr);
 }
 
+// Fires "submit" at the form first: a listener calling preventDefault()
+// (typically to send the form with fetch() itself) cancels the submission.
 void Engine::queueSubmit(Element* form, Element* submitter) {
+    if (JSContext* ctx = jsContext()) {
+        if (fireSubmitEvent(ctx, form, submitter)) return;
+        if (!stillInPage(form)) return;
+        if (submitter && !stillInPage(submitter)) submitter = nullptr;
+    }
     submission = FormSubmission{};
     submission.action = attrOf(form, L"action");
     submission.post = lower(attrOf(form, L"method")) == L"post";

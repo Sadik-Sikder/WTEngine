@@ -19,7 +19,7 @@ enum class LogLevel {
 
 struct LogEntry {
     LogLevel level;
-    std::wstring source; // where it came from: "console", "script", "click handler", "timer", "promise", ...
+    std::wstring source; // where it came from: "console", "script", "click listener", "timer", "promise", ...
     std::wstring text;   // may contain newlines (e.g. an error's stack)
 };
 

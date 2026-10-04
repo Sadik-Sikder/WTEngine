@@ -47,6 +47,7 @@ add_executable(WTEngine
     src/DevConsole.cpp
     src/FindBar.cpp
     src/ResourceLoader.cpp
+    src/WebStorage.cpp
 )
 
 target_include_directories(WTEngine PRIVATE include)

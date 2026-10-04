@@ -11,7 +11,7 @@ constexpr std::chrono::milliseconds kScriptTimeout{ 2000 };
 
 // Resets the watchdog deadline to now() + kScriptTimeout. Every real entry
 // point into JS (JSEngine::eval, runPendingJobs, and JSBinding.cpp's
-// fireDueTimers/dispatchClick) must call this immediately before its
+// fireDueTimers/event dispatch) must call this immediately before its
 // JS_Eval/JS_Call/JS_ExecutePendingJob - the interrupt handler is polled
 // per JSRuntime, not per call, so this is what makes the timeout measure
 // "how long did this one script/callback run" instead of wall clock since
@@ -65,5 +65,5 @@ void runPendingJobs(struct JSContext* ctx);
 std::wstring describeException(struct JSContext* ctx, struct JSValue exc);
 
 // Logs a caught exception to the console as an error from `source`
-// ("click handler", "timer", ...) and frees it.
+// ("click listener", "timer", ...) and frees it.
 void reportException(struct JSContext* ctx, struct JSValue exc, const wchar_t* source);

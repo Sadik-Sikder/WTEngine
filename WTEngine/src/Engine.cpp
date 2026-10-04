@@ -241,6 +241,8 @@ void Engine::beginScripts() {
     jsEngine = std::make_unique<JSEngine>(); // fresh realm per page
     scriptTasks_.clear();
     scriptCursor_ = 0;
+    domContentLoadedFired_ = false;
+    loadFired_ = false;
     if (!document || !document->body) { scriptLoader_.start({}); return; }
 
     installDOMBindings(jsEngine->context(), document->body.get(), &domState);
@@ -309,6 +311,31 @@ void Engine::advanceScripts() {
         if (!result.ok) consoleLog().add(LogLevel::Error, L"script", result.text);
         domState.domDirty = true; // conservatively assume the script may have mutated the DOM
     }
+    fireReadyEvents();
+}
+
+// Fires the page's lifecycle events once each, as soon as they're due:
+// DOMContentLoaded when every script has run (the DOM itself is complete
+// before any script runs - see beginScripts), then load once every
+// stylesheet has also arrived. (Unlike browsers, load doesn't wait for
+// images.) Each is preceded by document.readyState advancing and its
+// readystatechange event. Called from advanceScripts, so both first get a
+// chance during loadHTML and then every frame via pollResources.
+void Engine::fireReadyEvents() {
+    JSContext* ctx = jsContext();
+    if (!ctx || scriptCursor_ < scriptTasks_.size()) return;
+    if (!domContentLoadedFired_) {
+        domContentLoadedFired_ = true;
+        advanceReadyState(ctx, L"interactive");
+        fireEvent(ctx, document->body.get(), L"DOMContentLoaded", true, false);
+        domState.domDirty = true; // listeners commonly build the page here
+    }
+    if (loadFired_) return;
+    for (const auto& task : styleTasks_) if (!task.applied) return;
+    loadFired_ = true;
+    advanceReadyState(ctx, L"complete");
+    fireEvent(ctx, nullptr, L"load", false, false);
+    domState.domDirty = true;
 }
 
 // Precomputed per-<link> band, wide enough that no single stylesheet will
@@ -414,6 +441,7 @@ void Engine::parseAndBuild(const std::wstring& html) {
     focusedForm = nullptr;
     hasSubmission = false;
     openSelect = nullptr;
+    mouseTarget_ = nullptr;
     hoverSet.clear(); // points into the old DOM
     hoverSetLive = false;
 
@@ -571,6 +599,13 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     // A script mutated the DOM (appendChild, textContent=, setAttribute,
     // innerHTML=, ...) since the last layout - re-layout to pick it up.
     if (domState.domDirty) {
+        // The mutation may have freed elements the engine holds on to.
+        // Once domDirty is cleared nothing would catch that later, so drop
+        // any that are gone now.
+        if (focusedEl && !inPage(focusedEl)) { focusedEl = nullptr; focusedForm = nullptr; }
+        if (focusedForm && !inPage(focusedForm)) focusedForm = nullptr;
+        if (openSelect && !inPage(openSelect)) openSelect = nullptr;
+        if (mouseTarget_ && !inPage(mouseTarget_)) mouseTarget_ = nullptr;
         domState.domDirty = false;
         hoverSetLive = false; // the mutation may have freed hovered elements
         // syncValue keeps the focused field's `value` attribute equal to
@@ -697,8 +732,16 @@ void Engine::updateHover(int x, int y) {
     // elements; render() will relayout first, and the next call catches up.
     if (!document || domState.domDirty) return;
 
+    Element* under = elementAt(x, y);
+    if (under != mouseTarget_) {
+        Element* from = mouseTarget_;
+        mouseTarget_ = under;
+        fireMouseTransition(from, under, mouseInfoAt(x, y));
+        if (domState.domDirty) return; // a listener changed the page: boxes are stale until render() relayouts
+    }
+
     CSS::HoverSet next;
-    for (const Element* el = elementAt(x, y); el; el = el->parent) next.insert(el);
+    for (const Element* el = under; el; el = el->parent) next.insert(el);
     if (next == hoverSet) return;
 
     bool matters = false;
@@ -723,6 +766,46 @@ void Engine::updateHover(int x, int y) {
     hoverSet = std::move(next);
     hoverSetLive = true;
     if (matters && lastLayoutMs <= kHoverRelayoutBudgetMs) doLayout();
+}
+
+// The mouse moved from element `from` to `to` (either may be nullptr: off
+// the page). Fires mouseout at `from` and mouseover at `to` (both bubble),
+// then mouseleave at each element left and mouseenter at each one entered
+// - the ancestors the two don't share, innermost first for leave and
+// outermost first for enter, as in browsers.
+void Engine::fireMouseTransition(Element* from, Element* to, const MouseInfo& info) {
+    JSContext* ctx = jsContext();
+    if (!ctx) return;
+
+    // Taken before any listener runs: one may move or free these elements.
+    std::vector<Element*> fromChain, toChain;
+    for (Element* e = from; e; e = e->parent) fromChain.push_back(e);
+    for (Element* e = to; e; e = e->parent) toChain.push_back(e);
+    std::vector<Element*> left, entered;
+    for (Element* e : fromChain)
+        if (std::find(toChain.begin(), toChain.end(), e) == toChain.end()) left.push_back(e);
+    for (Element* e : toChain)
+        if (std::find(fromChain.begin(), fromChain.end(), e) == fromChain.end()) entered.push_back(e);
+    std::reverse(entered.begin(), entered.end());
+
+    if (from && stillInPage(from)) fireMouseEvent(ctx, from, L"mouseout", info, stillInPage(to) ? to : nullptr);
+    for (Element* e : left)
+        if (stillInPage(e)) fireMouseEvent(ctx, e, L"mouseleave", info, stillInPage(to) ? to : nullptr);
+    if (to && stillInPage(to)) fireMouseEvent(ctx, to, L"mouseover", info, stillInPage(from) ? from : nullptr);
+    for (Element* e : entered)
+        if (stillInPage(e)) fireMouseEvent(ctx, e, L"mouseenter", info, stillInPage(from) ? from : nullptr);
+}
+
+MouseInfo Engine::mouseInfoAt(int x, int y) const {
+    MouseInfo info;
+    int pageX, pageY;
+    if (toPage(x, y, pageX, pageY)) {
+        info.pageX = pageX;
+        info.pageY = pageY;
+        info.clientX = pageX;
+        info.clientY = pageY - scrollY;
+    }
+    return info;
 }
 
 std::wstring Engine::linkAt(int x, int y, Renderer& renderer) const {

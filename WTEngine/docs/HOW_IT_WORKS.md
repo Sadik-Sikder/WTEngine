@@ -90,6 +90,7 @@ src/                       include/
   DevConsole.cpp             DevConsole.h    — console log + F12 panel, §11
   FindBar.cpp                FindBar.h       — the Ctrl+F find bar, §10
   ResourceLoader.cpp         ResourceLoader.h — background script/stylesheet fetch, §5
+  WebStorage.cpp             WebStorage.h    — localStorage/sessionStorage data, §11
                              PageHistory.h   — back/forward stacks (header only)
 third_party/quickjs-ng/    vendored JS engine, built unmodified
 libs/glfw/                 prebuilt glfw3.lib
@@ -186,7 +187,8 @@ The page paints once immediately after `parseAndBuild`/`beginScripts` return - w
 | F5, Ctrl+R | Reload (works while typing in a field too; ignored on key-repeat) |
 | Esc (nothing focused) | Stop the page load in progress |
 | F12 | Open/close the developer console (§11); opening focuses its input line |
-| Keys / chars | Go to the address bar if focused, otherwise to the focused page input |
+| Keys / chars | Go to the address bar if focused, otherwise to the page: `keydown`/`keyup` fire at the focused field or `document` first (§11) - `preventDefault()` on `keydown` cancels the key's action below and the character it would type - then to the focused page input. The browser's own shortcuts above (F5, Ctrl+L, Ctrl+F, F12, zoom, Alt+←/→) never reach the page |
+| Mouse movement | `Engine::updateHover` fires `mouseover`/`mouseout`/`mouseenter`/`mouseleave` when the element under the mouse changes, and updates `:hover` |
 | Tab / Shift+Tab | Next/previous text field |
 | Ctrl+V / C / A | Paste / copy / select all (clipboard via GLFW). Copy is blocked for password fields |
 | Enter | Address bar: `normalizeInput` then navigate. Page field: submit its form |
@@ -420,10 +422,10 @@ All hit-tests scan `boxes` in **reverse** (last painted = topmost):
 ### Per-page realm
 Every `loadHTML` creates a **fresh** `JSEngine` (quickjs runtime + context) and resets `DOMBindingState`. Nothing survives navigation. `JSEngine::eval` runs a global script and returns the result string, or `"Error: message\nstack"` on exception. `console.log/warn/error` all print `[console] …` to stdout and the debugger output.
 
-**Teardown order matters.** `Engine::beginScripts` resets `domState` first, then destroys the old `JSEngine`, then creates the new one. `domState` owns `JSValue`s (listeners, timers) that must be freed against a runtime that still exists; quickjs asserts (Debug) or corrupts memory (Release) if a runtime is destroyed while any value is alive. Keep that order if you touch it. The same rule is why `domState` is declared after `jsEngine` in `Engine.h` (members destruct in reverse).
+**Teardown order matters.** `Engine::beginScripts` resets `domState` first, then destroys the old `JSEngine`, then creates the new one. `domState` owns `JSValue`s (listeners, timers, node wrappers) that must be freed against a runtime that still exists; quickjs asserts (Debug) or corrupts memory (Release) if a runtime is destroyed while any value is alive. Keep that order if you touch it. The same rule is why `domState` is declared after `jsEngine` in `Engine.h` (members destruct in reverse).
 
 ### Promises and microtasks
-quickjs never runs promise jobs on its own; the host must pump them. `runPendingJobs(ctx)` (`JSEngine.cpp`) drains the job queue, like a browser's microtask checkpoint. It runs after every script's `eval`, after each click listener, and after each timer callback, so `Promise.then` and `async`/`await` continuations behave in the expected order (`sync code → promise callbacks → timers`). A job that throws is printed as `[promise] Error: …` and the rest still run. **Any new place that calls into JS (`JS_Call`, `JS_Eval`) should call `runPendingJobs` afterwards.** Unhandled promise rejections are not reported (no rejection tracker is installed).
+quickjs never runs promise jobs on its own; the host must pump them. `runPendingJobs(ctx)` (`JSEngine.cpp`) drains the job queue, like a browser's microtask checkpoint. It runs after every script's `eval`, after each event listener the engine calls, and after each timer callback, so `Promise.then` and `async`/`await` continuations behave in the expected order (`sync code → promise callbacks → timers`). A job that throws is printed as `[promise] Error: …` and the rest still run. **Any new place that calls into JS (`JS_Call`, `JS_Eval`) should call `runPendingJobs` afterwards.** Unhandled promise rejections are not reported (no rejection tracker is installed).
 
 ### Script execution (`Engine::beginScripts` / `advanceScripts`)
 - Runs **after the entire DOM is built**, in document order. So no `document.write`, and scripts can see the whole page.
@@ -434,7 +436,7 @@ quickjs never runs promise jobs on its own; the host must pump them. `runPending
 ### Script execution watchdog
 JS runs synchronously on the UI thread (there's no worker/off-thread execution model, and quickjs contexts aren't meant to be shared across threads), so a script stuck in an infinite loop used to freeze the whole window indefinitely - the same freeze class as the pre-fix `fetchPage()`/`LayoutRoot::layout()` issues above, just triggered by page JS instead of networking or CSS matching.
 
-Fixed with quickjs-ng's `JS_SetInterruptHandler` (`JSEngine.cpp`): installed once per `JSEngine`/`JSRuntime`, it's polled from inside the bytecode interpreter every ~10000 ops. `ArmScriptWatchdog(ctx)` resets a `steady_clock` deadline (`kScriptTimeout` = 2000ms, `JSEngine.h`) to `now() + kScriptTimeout`, and is called immediately before **every** real entry point into JS - `JSEngine::eval` (script tags), `runPendingJobs` (promise jobs, per job drained), and `JSBinding.cpp`'s `fireDueTimers`/`dispatchClick` (per timer/listener call) - so the deadline always measures "how long has this one script/callback run," not wall clock since page load. Exceeding it throws quickjs's own uncatchable `InternalError: interrupted` (`JS_ThrowInterrupted`/`JS_SetUncatchableError` in quickjs.c) - uncatchable specifically so a script's own `try { while(true){} } catch(e){}` can't defeat it. The four call sites already had a call-then-check-exception pattern (§ above, and the Events/timers section below), so no new control flow was needed beyond arming the deadline and, for timers, distinguishing a watchdog kill from an ordinary throw (`JS_IsUncatchableError`) to decide whether to keep the timer around.
+Fixed with quickjs-ng's `JS_SetInterruptHandler` (`JSEngine.cpp`): installed once per `JSEngine`/`JSRuntime`, it's polled from inside the bytecode interpreter every ~10000 ops. `ArmScriptWatchdog(ctx)` resets a `steady_clock` deadline (`kScriptTimeout` = 2000ms, `JSEngine.h`) to `now() + kScriptTimeout`, and is called immediately before **every** real entry point into JS - `JSEngine::eval` (script tags), `runPendingJobs` (promise jobs, per job drained), and `JSBinding.cpp`'s `fireDueTimers` and event dispatch (per timer/listener call; not for `dispatchEvent()` called by a script that's already running, which stays under that script's deadline) - so the deadline always measures "how long has this one script/callback run," not wall clock since page load. Exceeding it throws quickjs's own uncatchable `InternalError: interrupted` (`JS_ThrowInterrupted`/`JS_SetUncatchableError` in quickjs.c) - uncatchable specifically so a script's own `try { while(true){} } catch(e){}` can't defeat it. The four call sites already had a call-then-check-exception pattern (§ above, and the Events/timers section below), so no new control flow was needed beyond arming the deadline and, for timers, distinguishing a watchdog kill from an ordinary throw (`JS_IsUncatchableError`) to decide whether to keep the timer around.
 
 Verified against three cases (a scratchpad test page + `CloseMainWindow`/stdout capture, since `wprintf` is fully-buffered once redirected and only flushes on normal process exit): a `<script>while(true){}</script>` page recovers and finishes rendering the rest of the DOM instead of hanging (confirmed both via `Process.Responding` staying `True` throughout and via `[script] Error: InternalError: interrupted` in the log); a `setInterval(() => { while(true){} }, 0)` is killed once and then *not* rescheduled (CPU time measured over the following 6s: +0.84s, not the ~6s repeated-kill churn it'd be if the timer kept re-firing); and a genuine `throw new Error(...)` still surfaces as `Error: <message>` unchanged, confirming no regression to the normal error path.
 
@@ -447,7 +449,7 @@ Everything a page's JS says or throws goes into `consoleLog()` - one process-wid
 |---|---|
 | `console` | `console.log/info/debug/warn/error` - arguments formatted by `__wtInspect` (strings as-is; objects/arrays expanded two levels; elements as `<p#id.class>`; errors with their stack) |
 | `script` | An uncaught error in a `<script>`. Scripts are evaluated with a filename - the script's URL, or `<inline script N>` - so the stack names the script and line |
-| `click handler`, `timer` | An exception in an event listener or a `setTimeout`/`setInterval` callback (previously swallowed) |
+| `click listener` (`<type> listener`), `inline handler`, `timer` | An exception in an event listener or a `setTimeout`/`setInterval` callback (previously swallowed), or an inline `on*="..."` attribute that doesn't compile |
 | `promise` | A promise rejected with no handler by the end of a microtask checkpoint: `JS_SetHostPromiseRejectionTracker` records each rejection and forgets it if a handler is attached later; `runPendingJobs` reports what's left as `Uncaught (in promise) ...`, as browsers do. This is how a failed `fetch()` without `.catch` shows up |
 | `network` | An external script or stylesheet that failed to download (previously skipped silently) |
 | `input` | Errors from the console's own input line |
@@ -463,9 +465,17 @@ A watchdog kill is reported as "Script stopped: it ran longer than 2000 ms...". 
 ### What JS can see
 Everything is installed by `installDOMBindings`.
 
-**Globals:** `document` (a wrapper around `<body>`), `window` (an alias of the global object), `self`/`parent`/`top` (all also aliases of the global object - WTEngine has no `<iframe>`/frame support, so every page legitimately *is* its own top-level, un-framed window, exactly like `self === parent === top === window` for a real un-framed page), `location`, `console`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `fetch`, `Headers`.
+**Globals:** `document` (a wrapper around `<body>`), `window` (an alias of the global object), `self`/`parent`/`top` (all also aliases of the global object - WTEngine has no `<iframe>`/frame support, so every page legitimately *is* its own top-level, un-framed window, exactly like `self === parent === top === window` for a real un-framed page), `location`, `console`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `fetch`, `Headers`, `addEventListener`/`removeEventListener`/`dispatchEvent` (on `window`), `Event`/`UIEvent`/`MouseEvent`/`KeyboardEvent`/`InputEvent`/`FocusEvent`/`CustomEvent`/`SubmitEvent`, `DOMException`, `localStorage`, `sessionStorage`.
 
-Some of the API is written in JavaScript rather than C++: `kBootstrapJS` in `JSBinding.cpp`, evaluated at the end of `installDOMBindings`, defines `fetch()`'s option handling, `Headers`, the `Response` object, and `element.style`. It builds on the native bindings (`__wtFetch`, `getAttribute`/`setAttribute`) rather than adding new C++ for things that are simpler in JS.
+Some of the API is written in JavaScript rather than C++: `kBootstrapJS` in `JSBinding.cpp`, evaluated at the end of `installDOMBindings`, defines `fetch()`'s option handling, `Headers`, the `Response` object, `DOMException`, the event classes, the `Storage` objects, and `element.style`. It builds on the native bindings (`__wtFetch`, `__wtStorage*`, `getAttribute`/`setAttribute`) rather than adding new C++ for things that are simpler in JS.
+
+### `localStorage` / `sessionStorage` (`WebStorage.h`/`.cpp`)
+Both are a `Proxy` over a `Storage` object, so `getItem`/`setItem`/`removeItem`/`clear`/`key`/`length` work, and so do `localStorage.foo`, `localStorage['foo'] = 'x'`, `delete localStorage.foo`, `'foo' in localStorage`, `Object.keys(localStorage)` and `JSON.stringify(localStorage)`. Values are converted to strings.
+- **Partitioned by origin** (`storageOrigin`): `scheme://host[:port]` for http(s) pages (default ports dropped), one shared `file://` origin for every page loaded from disk, and a memory-only area for anything else (the built-in start page).
+- **`localStorage`** is loaded from `%LOCALAPPDATA%\WTEngine\Local Storage\<origin>.txt` the first time an origin uses it, and written back after every change (to a temporary file, then swapped in). One item per line, `key<TAB>value`, with `\\`, `\t`, `\n`, `\r` escaped.
+- **`sessionStorage`** is memory-only and lasts for the whole run: there is only one tab, so "the session" is the program's lifetime.
+- **Quota:** 5,000,000 UTF-16 code units of keys plus values per origin, as browsers allow roughly 5 MB; going over throws a `QuotaExceededError` `DOMException` and changes nothing.
+- No `storage` event (there's only one tab to tell).
 
 ### `fetch()`
 `fetch(url, { method, headers, body })` returns a Promise, as in a browser:
@@ -505,20 +515,41 @@ A relative URL is resolved against the page's own URL with `resolveUrl` - same r
 | `style` | A `Proxy` over the `style=""` attribute: `el.style.backgroundColor = 'red'` (camelCase → kebab-case), `cssText`, `getPropertyValue`, `setProperty`, `removeProperty`, `length`. Setting `''`/`null` removes a property. Each write goes through `setAttribute`, so it triggers the usual relayout. Only inline declarations are visible - no computed style |
 | `getAttribute`, `setAttribute`, `hasAttribute`, `removeAttribute` | |
 | `createElement`, `createTextNode` | Available on any node, including `document` |
-| `appendChild`, `removeChild` | |
+| `appendChild`, `insertBefore`, `replaceChild` | Inserting a node that's already somewhere - in the page or in another detached subtree - **moves** it, as in browsers. Inserting a node into itself or its own descendant throws a `HierarchyRequestError` `DOMException`; a reference/old child that isn't a child throws `NotFoundError` |
+| `removeChild`, `remove()` | Detach (not destroy) the node; see Memory model |
+| `parentNode`, `parentElement` | The parent element, or `null` |
 | `getElementById`, `getElementsByTagName` | Search the subtree of the node they're called on |
 | `querySelector`, `querySelectorAll` | Same selector grammar as CSS (§8), including combinators, attribute selectors and structural pseudo-classes; results are plain arrays. Combinators only look at ancestors inside the searched subtree, but sibling combinators and structural pseudo-classes see the element's real siblings |
-| `addEventListener('click', fn)` | Only `click` is supported |
-
-**Event object:** `event.target`, `event.preventDefault()`.
+| `addEventListener`, `removeEventListener`, `dispatchEvent` | Any event type; see Events below |
+| `onclick`, `oninput`, `onchange`, `onsubmit`, `onkeydown`, ... | `on*` handler properties for the types in `kHandlerTypes` |
+| `body`, `head`, `documentElement`, `readyState` | On `document` only (it wraps `<body>`, so `document.body` is `document` itself) |
 
 ### Memory model
-- JS wrapper objects hold a raw `Node*` (no finalizer, non-owning).
-- Nodes made by `createElement`/`createTextNode`, or removed by `removeChild`, are kept alive in `DOMBindingState::detachedNodes` until the page is left. `appendChild` moves the `shared_ptr` from there into the parent. Because of this, **only freshly created (detached) nodes can be appended; re-parenting an existing node silently does nothing.**
-- Listeners and timers hold `JSValue`s in `ListenerStorage` / `TimerStorage` (defined only in `JSBinding.cpp` so `quickjs.h` stays out of `Engine.h`). They are freed when the state is reset.
+- Each node has **one** JS wrapper object for its lifetime (`NodeWrappers`, cached by `wrapNode`), so `e.target === el` holds and expando properties (`el.myData = …`) stick. Wrappers hold a raw `Node*` (no finalizer). The cache also holds a `shared_ptr` to each wrapped node, so a node JS has seen stays alive until the page is left, even after a script frees it from the tree (`innerHTML =`): JS can never touch freed memory through a wrapper.
+- Nodes made by `createElement`/`createTextNode`, or removed by `removeChild`/`remove()`, are kept alive in `DOMBindingState::detachedNodes` until the page is left. Inserting moves the `shared_ptr` that owns the node - its parent's child slot or its `detachedNodes` entry (`takeNode`) - so the `Node` object itself never changes and every raw pointer to it (layout boxes, focus, listeners) stays valid.
+- Listeners, timers and wrappers hold `JSValue`s in `ListenerStorage` / `TimerStorage` / `NodeWrappers` (defined only in `JSBinding.cpp` so `quickjs.h` stays out of `Engine.h`). They are freed when the state is reset.
+- **Elements the engine holds** (`focusedEl`, `openSelect`, the hovered element, the element a just-dispatched event targeted) may be freed by any listener. Code that keeps an `Element*` across an event dispatch checks `Engine::stillInPage(el)` before using it again, and `render` drops any that are gone before it clears `domDirty`.
 
 ### Events and timers
-- **Click:** `dispatchClick` walks from the hit element up through `parent`, calling every registered listener at each level (bubbling). `preventDefault()` suppresses link navigation, and for form controls it cancels the control's action (checkbox toggle, form submit, dropdown open). `stopPropagation` does not exist; an exception in a listener is reported to the developer console ("click handler", with its stack) and bubbling continues (a watchdog kill included - see above; unlike timers, a hung click listener isn't auto-disabled, since a click doesn't repeat on its own the way an interval does). Timer callbacks' exceptions are likewise reported ("timer").
+- **Dispatch** (`dispatch` in `JSBinding.cpp`): the path is fixed first - the target, its ancestors via `parent`, then `window` - and its elements are held alive for the whole dispatch. Then the three phases: capture (listeners registered with `capture: true`, from `window` down), target (all of the target's listeners, in registration order), and bubble (non-capture listeners back up to `window`, if the event bubbles). `stopPropagation()` ends it after the current node and `stopImmediatePropagation()` after the current listener; listeners added during dispatch don't run, and removed ones are skipped. An exception is reported to the developer console (`<type> listener`, with its stack) and dispatch continues. A watchdog kill is included; a hung listener isn't auto-disabled, since unlike an interval an event doesn't repeat on its own.
+- **Listeners** (`ListenerStorage`, keyed by element, `nullptr` = `window`): `addEventListener(type, fn | {handleEvent}, capture | {capture, once})` (`passive`/`signal` are accepted and ignored; adding the same function twice registers it once), `removeEventListener` by strict equality of the function and capture flag. An `on*` handler - `el.onclick = fn`, or an inline `onclick="..."` attribute compiled on first use as `function (event) { … }` - is a listener flagged `handler`, so it runs in the order it was first set; returning `false` cancels the event. `window.onload = fn` and other `window.on*` are ordinary global properties, read at the `window` step; `<body onload="...">` sets `window.onload`.
+- **Event objects** are plain JS (`kBootstrapJS`): `type`, `target`, `currentTarget`, `eventPhase`, `bubbles`, `cancelable`, `defaultPrevented`, `isTrusted` (true for engine-fired events), `timeStamp`, `preventDefault()` (only if cancelable), `stopPropagation()`, `stopImmediatePropagation()`, `composedPath()`, plus the subclass fields: `MouseEvent` (`clientX/Y`, `pageX/Y`, `button`, `relatedTarget`, modifier keys), `KeyboardEvent` (`key`, `code`, `keyCode`/`which`, `location`, `repeat`, modifier keys), `InputEvent` (`inputType`, `data`), `SubmitEvent` (`submitter`), `CustomEvent` (`detail`). A page can construct any of them and send it with `dispatchEvent`.
+- **What the engine fires** (`fire*` in `JSBinding.h`):
+
+| Event | Target | When |
+|---|---|---|
+| `readystatechange`, `DOMContentLoaded` | `document` | Once every `<script>` has run (`Engine::fireReadyEvents`); `document.readyState` goes `loading` → `interactive` |
+| `readystatechange`, `load` | `document`, `window` | Once every stylesheet has also arrived (images aren't waited for); `readyState` → `complete` |
+| `click` | Element under the mouse | `onClick` (controls) / `dispatchClick`. `preventDefault()` cancels following a link or the control's action |
+| `mouseover`, `mouseout`, `mouseenter`, `mouseleave` | Element under the mouse | `updateHover`, when that element changes; `relatedTarget` is the other one |
+| `keydown`, `keyup` | Focused field, else `document` | `main.cpp`'s `onKey` → `Engine::onKeyEvent`. `key` is layout-aware (`ToUnicodeEx` on the scancode); `keyCode` is the Windows virtual-key code, as browsers on Windows report |
+| `focus`, `focusin`, `blur`, `focusout` | Text field | `focusInput` / `blurInput` |
+| `input` | Text field, checkbox, `<select>` | After each edit that changes a field's text (`afterEdit`), a checkbox toggle, or picking a different option |
+| `change` | Same | On blur if the user changed the field's value; right after a checkbox toggle or a new option |
+| `submit` | `<form>` | `queueSubmit`, before collecting fields. `preventDefault()` cancels the submission (the usual "send it with `fetch` instead" pattern) |
+
+- Every engine-fired event runs synchronously, each listener with its own watchdog deadline and a microtask checkpoint after it. Any DOM change it makes sets `domDirty` as usual.
+- Timer callbacks' exceptions are reported to the console as `timer`.
 - **Timers:** stored with an absolute due time on the same clock as `render()`'s `timeSeconds` (`glfwGetTime`). `fireDueTimers` runs once per frame, so timer resolution is one frame (~16 ms). Callbacks are looked up by id right before being called, so a timer can safely clear itself or others. New timers scheduled inside a callback wait until the next frame. Intervals resync to "now" instead of catching up on missed ticks. A callback killed by the script watchdog (above) is removed instead of being rescheduled - otherwise a broken `setInterval(fn, 0)` would get killed and immediately re-armed every frame forever, trading the old "window frozen" failure for a new "permanent 100% CPU" one.
 - **Dirty flag:** any mutating binding sets `domDirty`; `Engine::render` re-lays-out at the top of the next frame.
 
@@ -532,7 +563,8 @@ Part of `Engine`, split out for size.
 - **Select:** click opens a dropdown overlay (`openSelect`, plus a snapshot of the closed box). The overlay is **not** part of `boxes` — it is drawn last and hit-tested first. Any click, inside or outside, closes it; a click on a row chooses that option (sets `selected`). Any re-layout also closes it.
 - **Buttons:** if inside a form and a submit type (`<button>` defaults to submit; `<input>` only for `submit`/`image`), the form is queued.
 - **Submission** (`queueSubmit` → `takeSubmission` → `submitForm` in `main.cpp`): `collectFields` walks the form's subtree in document order, encoding `name=value` pairs. Included: text-like inputs, checked checkboxes (`on` if no value), the selected option of each `<select>`, and the clicked submit button. Excluded: unnamed controls, `button/reset/file` inputs, unclicked submit buttons. **Method:** `post` → POST body (`application/x-www-form-urlencoded`); anything else → GET, fields appended as the query string. The action is resolved against the current URL; only `http(s)` targets are sent.
-- **Click vs. JS:** when a click lands on a control, `onClick` first runs the JS click listeners for that control (bubbling up through its ancestors, so a listener on a wrapping `<div>` or the `<form>` also fires). If none called `event.preventDefault()`, the control's own action follows: a checkbox toggles, a submit button queues its form, a select opens. `preventDefault()` cancels that action, which is how the common `button.addEventListener('click', e => { e.preventDefault(); … })` pattern works. Focusing a text field is not cancelled, matching browsers. Because `onClick` already dispatched the click, `main.cpp` must not call `dispatchClick` again for a control hit. If a listener rewrites the page and removes the control (e.g. `innerHTML =`), the action is skipped. Not supported: a `submit` event on the form itself (only clicks on the submit button and Enter in a text field submit), and clicks that land on an open `<select>` dropdown don't reach listeners (the dropdown consumes them).
+- **Click vs. JS:** when a click lands on a control, `onClick` first runs the JS click listeners for that control (bubbling up through its ancestors, so a listener on a wrapping `<div>` or the `<form>` also fires). If none called `event.preventDefault()`, the control's own action follows: a checkbox toggles, a submit button queues its form, a select opens. `preventDefault()` cancels that action, which is how the common `button.addEventListener('click', e => { e.preventDefault(); … })` pattern works. Focusing a text field is not cancelled, matching browsers. Because `onClick` already dispatched the click, `main.cpp` must not call `dispatchClick` again for a control hit. If a listener rewrites the page and removes the control (e.g. `innerHTML =`), the action is skipped. Clicks that land on an open `<select>` dropdown don't reach listeners (the dropdown consumes them).
+- **Form events:** focusing a field fires `focus`/`focusin`, leaving it `change` (only if the user edited it to a different value - a script setting `.value` doesn't count), `blur` and `focusout`. Moving focus straight to another field blurs the old one first. Each edit that changes the text fires `input` (`insertText`, `insertFromPaste`, `deleteContentBackward`/`Forward`). A checkbox toggle and picking a different `<select>` option fire `input` then `change`. Submitting (a submit button, or Enter in a field) fires `submit` at the form first; `preventDefault()` cancels it. See §11's event table.
 
 ## 13. Fetching (`Fetcher.cpp`)
 
@@ -627,10 +659,12 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 
 **JavaScript**
 - `window.onerror`/`unhandledrejection` events don't exist - errors reach the developer console (§11), not page code.
-- No `XMLHttpRequest`, `localStorage`, `DOMContentLoaded`/`load` events (`window.onload = fn` is accepted but never fired), computed style (`getComputedStyle`; `element.style` only sees inline declarations), `innerHTML` getter, `removeEventListener`, `stopPropagation`, or events other than `click`. (`location`, `fetch()`, `element.style`/`.value`/`.checked` and `document.title` are supported - §11.)
+- No `XMLHttpRequest`, computed style (`getComputedStyle`; `element.style` only sees inline declarations), or `innerHTML` getter. (`location`, `fetch()`, events, `localStorage`, `element.style`/`.value`/`.checked` and `document.title` are supported - §11.)
+- **Only scripts inside `<body>` run** (`collectScripts` starts at `document->body`): a `<script>` in `<head>`, where real pages often put theirs, is ignored.
+- Events the engine doesn't fire yet, though listeners and `on*` handlers for them can be registered: `mousedown`/`mouseup`/`mousemove`/`dblclick`/`contextmenu`/`wheel`, `keypress`, `scroll`/`resize`, `<img>`/`<script>` `load`/`error`, and `focus`/`blur` on anything but a text field. `load` doesn't wait for images. `el.click()`, `form.submit()` and `form.requestSubmit()` don't exist.
+- Mouse events only find elements that have a box: text, controls, images, and blocks with a background or border. Moving or clicking over the empty part of a plain `<div>` reaches its nearest painted ancestor instead (often none).
+- `document` is the `<body>` element's wrapper rather than a separate Document node, so `document.body === document`, and a listener on `document` sits between `<body>` and `<html>` in the event path instead of above `<html>`.
 - ES modules (`type="module"`) are skipped.
-- Re-parenting an already-attached node (`appendChild` of an existing element) silently does nothing.
-- No `submit` event on forms (§12).
 
 **Engine**
 - Page navigation itself no longer blocks the UI thread (`PageLoader`, §5) and gives up after 8s if a fetch is stuck. The networking backend was also replaced (WinINet → Boost.Beast/Asio + OpenSSL, §13) to give connection attempts a short per-address timeout instead of waiting out the OS's own. External script/stylesheet fetches are backgrounded too, and concurrently rather than serially (`ResourceLoader`, §5). All network I/O now runs on one async network thread (§13), and no blocking fetch API exists any more, so nothing can wait on the network.
@@ -655,23 +689,23 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 | Support a new HTML tag or control | `HTMLParser` void/raw lists; `layoutControl` + `drawControl` + `collectFields` |
 | Add a JS DOM method or property | Add a function and a list entry in `js_node_proto_funcs` (`JSBinding.cpp`) |
 | Add a JS global | `js_global_funcs` (`JSBinding.cpp`) or `JSEngine::JSEngine` (console-style) |
-| Fire another kind of event | Model on `dispatchClick` + `js_addEventListener` (currently `click` only) |
+| Fire another kind of event | A `fire*` function in `JSBinding.cpp` (or plain `fireEvent`), called from where `Engine` sees the input; add its `on*` property to `kHandlerTypes` + `js_node_proto_funcs` (§19 Example D) |
 | Change drawing | `Renderer` interface, then `OpenGLRenderer` |
 | Add a keyboard shortcut | `onKey` in `main.cpp` |
 | Change history behaviour | `PageHistory.h`, `visitPage` / `goHistory` in `main.cpp` |
 
 ## 19. Worked examples (how a feature touches the code)
 
-These are sketches of the *shape* of a change, so you know which files and functions are involved. They aren't implemented.
+These are sketches of the *shape* of a change, so you know which files and functions are involved. Those marked "(implemented)" describe how an existing feature was added.
 
-### Example A — a simple new JS method: `element.remove()`
+### Example A — a simple new JS method: `element.remove()` (implemented)
 Only `JSBinding.cpp` changes.
-1. Write `static JSValue js_remove(JSContext*, JSValueConst this_val, int, JSValueConst*)`. Get the element with `unwrapElement(this_val)`, then use its `parent` pointer to find it in `parent->children`.
-2. Do what `js_removeChild` does: move the `shared_ptr` into `state->detachedNodes`, set `parent = nullptr`, erase from `children`.
-3. Call `markDirty(ctx)` so the next frame re-lays-out.
+1. Write `static JSValue js_remove(JSContext*, JSValueConst this_val, int, JSValueConst*)`. Get the node with `unwrapNode(this_val)`.
+2. Detach it with `detachNode`, which `removeChild` shares: `takeNode` takes the `shared_ptr` out of its parent's `children` (clearing `parent`), and it goes into `state->detachedNodes`.
+3. `detachNode` calls `markDirty(ctx)` so the next frame re-lays-out.
 4. Register it: `JS_CFUNC_DEF("remove", 0, js_remove)` in `js_node_proto_funcs`.
 
-Rules of thumb for any binding: convert strings with `argStr` / `jsStr`; never store a raw `Node*` you don't know is still in the tree; call `markDirty` after any DOM mutation.
+Rules of thumb for any binding: convert strings with `argStr` / `jsStr`; return nodes with `wrapNode` (never a fresh `JS_NewObjectClass`), so each node keeps one wrapper; never store a raw `Node*` you don't know is still in the tree; call `markDirty` after any DOM mutation.
 
 ### Example B — a new tag's appearance: `<hr>`
 `hr` is already parsed (it's a void tag) but it has no children and no background, so layout produces nothing. To draw a line:
@@ -686,10 +720,12 @@ Read this as a map of how `color` and `font-weight` were added; a new inherited 
 3. `appendWords` / `layoutInlineRun`: copy `paint` from `InlineItem` into the emitted `LayoutBox`. Anything that changes glyph width (like bold) must also reach `textWidth`, or wrapping will be measured with the wrong font.
 4. `Engine::render` (`Engine.cpp`): text is drawn with `parseColor(b.color)` (black when empty) and `b.bold`.
 
-### Example D — a new event type (e.g. `mouseover`, `keydown`)
-1. Decide where the native event is caught (`main.cpp` callback) and forward it into `Engine` (like `dispatchClick`).
-2. In `JSBinding.cpp`, extend `ListenerStorage` beyond the single `click` map, accept the new name in `js_addEventListener` (it currently rejects everything except `"click"`), and write a dispatcher modelled on `dispatchClick`.
-3. Remember JS callbacks must run on the UI thread and can mutate the DOM, so the existing `domDirty` mechanism will handle the re-layout.
+### Example D — a new event type (e.g. `mousedown`)
+`addEventListener` already accepts any type, so only firing it is new.
+1. Catch the native input (`onMouseButton` in `main.cpp`) and forward it into `Engine` (like `dispatchClick`).
+2. In `Engine`, fire it with the matching `fire*` from `JSBinding.h` (`fireMouseEvent(ctx, target, L"mousedown", mouseInfoAt(x, y))`), or add one if the event needs new fields: `makeEvent` builds the event object from a `kBootstrapJS` class, and you set its fields before `fireAndFree`.
+3. Treat every `Element*` held across the call as possibly freed: check `stillInPage` before using it again. Any DOM change a listener makes is picked up by the existing `domDirty` relayout.
+4. Its `onmousedown` property already exists; for a type that isn't in `kHandlerTypes`, add it there and a `HANDLER_DEF` line in `js_node_proto_funcs`.
 
 ### Debugging tips
 - `console.log` from a page script prints to stdout and the debugger Output window; script exceptions print as `[script] Error: … <stack>`.

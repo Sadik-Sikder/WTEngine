@@ -96,23 +96,31 @@ public:
     // Handles a click at window (x, y): focuses a text field, toggles a
     // checkbox, or presses a button. Returns true if a control was hit;
     // otherwise any focused field loses focus. When a control is hit, its
-    // addEventListener('click', ...) listeners (and its ancestors', via
-    // bubbling) run first, and event.preventDefault() cancels the toggle /
-    // submit / dropdown - so the caller must not also call dispatchClick.
+    // click listeners (and its ancestors', via bubbling) run first, and
+    // event.preventDefault() cancels the toggle / submit / dropdown - so the
+    // caller must not also call dispatchClick.
     bool onClick(int x, int y, double timeSeconds, Renderer& renderer);
 
-    // Fires any addEventListener('click', ...) registered on the element
-    // at window (x, y), bubbling up through its ancestors. Returns true if
-    // a listener called event.preventDefault() - the caller should then
-    // skip its own default handling (e.g. following a link) for this click.
+    // Fires a click event at the element at window (x, y), bubbling up
+    // through its ancestors. Returns true if a listener called
+    // event.preventDefault() - the caller should then skip its own default
+    // handling (e.g. following a link) for this click.
     bool dispatchClick(int x, int y);
+
+    // Fires keydown (down) or keyup at the focused field, or at document if
+    // none has focus. Returns true if a listener called preventDefault():
+    // the caller should then skip the key's own action (scrolling, editing,
+    // Tab, Enter, ...); the character a cancelled keydown would type is
+    // dropped too (onChar).
+    bool onKeyEvent(const KeyInfo& info, bool down);
 
     // Tells the engine where the mouse is (window coordinates; anywhere
     // off the page, e.g. over the address bar, clears the hover). Call
-    // once per frame after render(). If the change could affect a :hover
-    // rule, re-lays-out the page so the next frame shows it - unless the
-    // last layout was too slow to repeat on every mouse move (see
-    // kHoverRelayoutBudgetMs in Engine.cpp).
+    // once per frame after render(). Fires mouseover/mouseout and
+    // mouseenter/mouseleave when the element under the mouse changes. If
+    // the change could affect a :hover rule, re-lays-out the page so the
+    // next frame shows it - unless the last layout was too slow to repeat
+    // on every mouse move (see kHoverRelayoutBudgetMs in Engine.cpp).
     void updateHover(int x, int y);
 
     bool hasFocusedInput() const { return focusedEl != nullptr; }
@@ -194,6 +202,28 @@ private:
     std::unique_ptr<JSEngine> jsEngine;
     DOMBindingState domState; // reset alongside jsEngine; see JSBinding.h
     void beginScripts();
+    JSContext* jsContext() const; // the page's JS realm, or nullptr
+
+    // Page lifecycle events: DOMContentLoaded once every script has run,
+    // load once every stylesheet has too (see fireReadyEvents).
+    bool domContentLoadedFired_ = false;
+    bool loadFired_ = false;
+    void fireReadyEvents();
+
+    // Whether `el` is still in the page. A JS event listener can free
+    // elements (innerHTML = ...), so any Element* held across one must be
+    // checked with this before it's used again. inPage walks the whole
+    // tree; stillInPage skips that when no script has changed the DOM since
+    // the last layout.
+    bool inPage(const Element* el) const;
+    bool stillInPage(const Element* el) const { return el && (!domState.domDirty || inPage(el)); }
+
+    // MouseEvent coordinates for window point (x, y).
+    MouseInfo mouseInfoAt(int x, int y) const;
+    Element* mouseTarget_ = nullptr; // the element under the mouse, for mouseover/mouseout
+    void fireMouseTransition(Element* from, Element* to, const MouseInfo& info);
+
+    bool suppressChar_ = false; // the last keydown was cancelled: drop the character it types
 
     // A page's own <link rel=stylesheet> and <script src> fetches happen
     // concurrently on background threads (ResourceLoader) instead of
@@ -224,6 +254,14 @@ private:
     Element* focusedForm = nullptr;
     TextEditor editor;
     float inputScrollX = 0;
+    // The focused field's value when it gained focus, and whether the user
+    // has edited it since - "change" fires on blur only for a user edit
+    // that left the value different (a script setting .value doesn't count).
+    std::wstring focusValue_;
+    bool userEdited_ = false;
+    // After an edit to the focused field: fires "input" if its text changed
+    // from `before`.
+    void afterEdit(const std::wstring& before, const wchar_t* inputType, const std::wstring& data);
     bool hasSubmission = false;
     FormSubmission submission;
 

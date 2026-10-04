@@ -335,12 +335,156 @@ static void onChar(GLFWwindow* window, unsigned int codepoint) {
     else app->engine->onChar(codepoint);
 }
 
-static void onKey(GLFWwindow* window, int key, int, int action, int mods) {
-    if (action == GLFW_RELEASE) return; // PRESS and REPEAT both edit
+// The DOM `code` for a key: which physical key it is, whatever the layout.
+static std::wstring domKeyCode(int key) {
+    if (key >= GLFW_KEY_A && key <= GLFW_KEY_Z) return L"Key" + std::wstring(1, (wchar_t)(L'A' + key - GLFW_KEY_A));
+    if (key >= GLFW_KEY_0 && key <= GLFW_KEY_9) return L"Digit" + std::wstring(1, (wchar_t)(L'0' + key - GLFW_KEY_0));
+    if (key >= GLFW_KEY_F1 && key <= GLFW_KEY_F25) return L"F" + std::to_wstring(key - GLFW_KEY_F1 + 1);
+    if (key >= GLFW_KEY_KP_0 && key <= GLFW_KEY_KP_9) return L"Numpad" + std::wstring(1, (wchar_t)(L'0' + key - GLFW_KEY_KP_0));
+    switch (key) {
+    case GLFW_KEY_SPACE: return L"Space";
+    case GLFW_KEY_APOSTROPHE: return L"Quote";
+    case GLFW_KEY_COMMA: return L"Comma";
+    case GLFW_KEY_MINUS: return L"Minus";
+    case GLFW_KEY_PERIOD: return L"Period";
+    case GLFW_KEY_SLASH: return L"Slash";
+    case GLFW_KEY_SEMICOLON: return L"Semicolon";
+    case GLFW_KEY_EQUAL: return L"Equal";
+    case GLFW_KEY_LEFT_BRACKET: return L"BracketLeft";
+    case GLFW_KEY_BACKSLASH: return L"Backslash";
+    case GLFW_KEY_RIGHT_BRACKET: return L"BracketRight";
+    case GLFW_KEY_GRAVE_ACCENT: return L"Backquote";
+    case GLFW_KEY_ESCAPE: return L"Escape";
+    case GLFW_KEY_ENTER: return L"Enter";
+    case GLFW_KEY_TAB: return L"Tab";
+    case GLFW_KEY_BACKSPACE: return L"Backspace";
+    case GLFW_KEY_INSERT: return L"Insert";
+    case GLFW_KEY_DELETE: return L"Delete";
+    case GLFW_KEY_RIGHT: return L"ArrowRight";
+    case GLFW_KEY_LEFT: return L"ArrowLeft";
+    case GLFW_KEY_DOWN: return L"ArrowDown";
+    case GLFW_KEY_UP: return L"ArrowUp";
+    case GLFW_KEY_PAGE_UP: return L"PageUp";
+    case GLFW_KEY_PAGE_DOWN: return L"PageDown";
+    case GLFW_KEY_HOME: return L"Home";
+    case GLFW_KEY_END: return L"End";
+    case GLFW_KEY_CAPS_LOCK: return L"CapsLock";
+    case GLFW_KEY_SCROLL_LOCK: return L"ScrollLock";
+    case GLFW_KEY_NUM_LOCK: return L"NumLock";
+    case GLFW_KEY_PRINT_SCREEN: return L"PrintScreen";
+    case GLFW_KEY_PAUSE: return L"Pause";
+    case GLFW_KEY_KP_DECIMAL: return L"NumpadDecimal";
+    case GLFW_KEY_KP_DIVIDE: return L"NumpadDivide";
+    case GLFW_KEY_KP_MULTIPLY: return L"NumpadMultiply";
+    case GLFW_KEY_KP_SUBTRACT: return L"NumpadSubtract";
+    case GLFW_KEY_KP_ADD: return L"NumpadAdd";
+    case GLFW_KEY_KP_ENTER: return L"NumpadEnter";
+    case GLFW_KEY_KP_EQUAL: return L"NumpadEqual";
+    case GLFW_KEY_LEFT_SHIFT: return L"ShiftLeft";
+    case GLFW_KEY_LEFT_CONTROL: return L"ControlLeft";
+    case GLFW_KEY_LEFT_ALT: return L"AltLeft";
+    case GLFW_KEY_LEFT_SUPER: return L"MetaLeft";
+    case GLFW_KEY_RIGHT_SHIFT: return L"ShiftRight";
+    case GLFW_KEY_RIGHT_CONTROL: return L"ControlRight";
+    case GLFW_KEY_RIGHT_ALT: return L"AltRight";
+    case GLFW_KEY_RIGHT_SUPER: return L"MetaRight";
+    case GLFW_KEY_MENU: return L"ContextMenu";
+    default: return L"Unidentified";
+    }
+}
+
+// The DOM `key` for a non-printing key, or empty for one that types text.
+static std::wstring namedDomKey(int key) {
+    if (key >= GLFW_KEY_F1 && key <= GLFW_KEY_F25) return L"F" + std::to_wstring(key - GLFW_KEY_F1 + 1);
+    switch (key) {
+    case GLFW_KEY_ESCAPE: return L"Escape";
+    case GLFW_KEY_ENTER: case GLFW_KEY_KP_ENTER: return L"Enter";
+    case GLFW_KEY_TAB: return L"Tab";
+    case GLFW_KEY_BACKSPACE: return L"Backspace";
+    case GLFW_KEY_INSERT: return L"Insert";
+    case GLFW_KEY_DELETE: return L"Delete";
+    case GLFW_KEY_RIGHT: return L"ArrowRight";
+    case GLFW_KEY_LEFT: return L"ArrowLeft";
+    case GLFW_KEY_DOWN: return L"ArrowDown";
+    case GLFW_KEY_UP: return L"ArrowUp";
+    case GLFW_KEY_PAGE_UP: return L"PageUp";
+    case GLFW_KEY_PAGE_DOWN: return L"PageDown";
+    case GLFW_KEY_HOME: return L"Home";
+    case GLFW_KEY_END: return L"End";
+    case GLFW_KEY_CAPS_LOCK: return L"CapsLock";
+    case GLFW_KEY_SCROLL_LOCK: return L"ScrollLock";
+    case GLFW_KEY_NUM_LOCK: return L"NumLock";
+    case GLFW_KEY_PRINT_SCREEN: return L"PrintScreen";
+    case GLFW_KEY_PAUSE: return L"Pause";
+    case GLFW_KEY_LEFT_SHIFT: case GLFW_KEY_RIGHT_SHIFT: return L"Shift";
+    case GLFW_KEY_LEFT_CONTROL: case GLFW_KEY_RIGHT_CONTROL: return L"Control";
+    case GLFW_KEY_LEFT_ALT: case GLFW_KEY_RIGHT_ALT: return L"Alt";
+    case GLFW_KEY_LEFT_SUPER: case GLFW_KEY_RIGHT_SUPER: return L"Meta";
+    case GLFW_KEY_MENU: return L"ContextMenu";
+    default: return L"";
+    }
+}
+
+// Describes a GLFW key event as a DOM KeyboardEvent. A printing key's
+// `key` is the character it types on the current keyboard layout (so
+// Shift+2 is "@" on a US layout, "\"" on a UK one), worked out by Windows
+// from the scancode; `keyCode` is the Windows virtual-key code, which is
+// what browsers on Windows report too.
+static KeyInfo keyInfoFor(int key, int scancode, int action, int mods) {
+    KeyInfo info;
+    info.code = domKeyCode(key);
+    info.ctrl = (mods & GLFW_MOD_CONTROL) != 0;
+    info.shift = (mods & GLFW_MOD_SHIFT) != 0;
+    info.alt = (mods & GLFW_MOD_ALT) != 0;
+    info.meta = (mods & GLFW_MOD_SUPER) != 0;
+    info.repeat = action == GLFW_REPEAT;
+    switch (key) {
+    case GLFW_KEY_LEFT_SHIFT: case GLFW_KEY_LEFT_CONTROL: case GLFW_KEY_LEFT_ALT: case GLFW_KEY_LEFT_SUPER:
+        info.location = 1; break;
+    case GLFW_KEY_RIGHT_SHIFT: case GLFW_KEY_RIGHT_CONTROL: case GLFW_KEY_RIGHT_ALT: case GLFW_KEY_RIGHT_SUPER:
+        info.location = 2; break;
+    default:
+        if (key >= GLFW_KEY_KP_0 && key <= GLFW_KEY_KP_EQUAL) info.location = 3;
+    }
+
+    // GLFW flags an extended key's scancode with 0x100; Windows wants an
+    // 0xE0 prefix instead (arrows, Home/End, Delete, ... - without it they
+    // map to their numpad twins).
+    UINT sc = (scancode & 0x100) ? (0xE000 | (scancode & 0xFF)) : (UINT)scancode;
+    UINT vk = MapVirtualKeyW(sc, MAPVK_VSC_TO_VK_EX);
+    info.keyCode = (int)vk;
+    if (key == GLFW_KEY_KP_ENTER) info.keyCode = VK_RETURN; // shares Enter's scancode, extended
+
+    info.key = namedDomKey(key);
+    if (info.key.empty() && vk) {
+        // Ask for the character with Ctrl and Alt released: Ctrl+A's key is
+        // "a" (not the control character ^A), as in browsers.
+        BYTE state[256] = {};
+        if (info.shift) state[VK_SHIFT] = 0x80;
+        if (GetKeyState(VK_CAPITAL) & 1) state[VK_CAPITAL] = 0x01;
+        wchar_t buf[8];
+        int n = ToUnicodeEx(vk, sc, state, buf, 8, 0x4 /* don't change keyboard state */, GetKeyboardLayout(0));
+        if (n > 0) info.key.assign(buf, n);
+        else if (n < 0) info.key = L"Dead"; // a dead key (accent) waiting for the next one
+    }
+    if (info.key.empty()) info.key = L"Unidentified";
+    return info;
+}
+
+static void onKey(GLFWwindow* window, int key, int scancode, int action, int mods) {
     App* app = static_cast<App*>(glfwGetWindowUserPointer(window));
     AddressBar& bar = app->bar;
     Engine& engine = *app->engine;
     bool ctrl = (mods & GLFW_MOD_CONTROL) != 0;
+
+    // While the page has keyboard focus (not the address bar, find bar or
+    // console), it gets keyup for every key and keydown for every key the
+    // browser doesn't keep for itself (below, up to the console).
+    bool pageHasKeys = !bar.focused() && !app->find.focused() && !app->console.focused();
+    if (action == GLFW_RELEASE) { // PRESS and REPEAT both edit
+        if (pageHasKeys) engine.onKeyEvent(keyInfoFor(key, scancode, action, mods), false);
+        return;
+    }
 
     // Alt+Left / Alt+Right: back / forward (works even while typing in a field)
     if ((mods & GLFW_MOD_ALT) && (key == GLFW_KEY_LEFT || key == GLFW_KEY_RIGHT)) {
@@ -442,6 +586,11 @@ static void onKey(GLFWwindow* window, int key, int, int action, int mods) {
         }
         return;
     }
+
+    // keydown: a listener calling preventDefault() cancels the key's own
+    // action below (scrolling, editing, Tab, Enter) and the character it
+    // would type.
+    if (pageHasKeys && engine.onKeyEvent(keyInfoFor(key, scancode, action, mods), true)) return;
 
     // Keys go to whichever text field has focus: the address bar or a page input
     bool inBar = bar.focused();
