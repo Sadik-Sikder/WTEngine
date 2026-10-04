@@ -309,6 +309,73 @@ static std::wstring firstText(Element* el) {
     return L"";
 }
 
+// Replaces every var(--name) / var(--name, fallback) in `v` with that
+// custom property's value, or else the fallback. Returns false if one has
+// neither - the whole declaration is then invalid and ignored, as in CSS.
+// `depth` stops a var() cycle (--a: var(--b); --b: var(--a)).
+static bool substituteVars(const std::wstring& v, const CSSVars* vars, std::wstring& out, int depth = 0) {
+    if (depth > 16) return false;
+    out.clear();
+    size_t i = 0;
+    while (true) {
+        size_t at = v.find(L"var(", i);
+        if (at == std::wstring::npos) { out.append(v, i, std::wstring::npos); return true; }
+        out.append(v, i, at - i);
+
+        size_t p = at + 4, comma = std::wstring::npos;
+        for (int level = 1; p < v.size(); p++) {
+            if (v[p] == L'(') level++;
+            else if (v[p] == L')' && --level == 0) break;
+            else if (v[p] == L',' && level == 1 && comma == std::wstring::npos) comma = p;
+        }
+        if (p >= v.size()) return false; // unbalanced parentheses
+
+        std::wstring name = trimmed(v.substr(at + 4, (comma == std::wstring::npos ? p : comma) - (at + 4)));
+        for (auto& c : name) c = (wchar_t)towlower(c); // CSS::parseDeclarations lowercases the names it defines
+        std::wstring piece;
+        const std::wstring* value = vars ? vars->find(name) : nullptr;
+        if (value) {
+            if (!substituteVars(*value, vars, piece, depth + 1)) return false;
+        }
+        else if (comma != std::wstring::npos) {
+            if (!substituteVars(trimmed(v.substr(comma + 1, p - comma - 1)), vars, piece, depth + 1)) return false;
+        }
+        else {
+            return false;
+        }
+        out += piece;
+        i = p + 1;
+    }
+}
+
+bool LayoutRoot::parseRadius(const std::wstring& v, int fontSize, LayoutBox::CornerRadius& out) {
+    size_t used = 0;
+    float n;
+    try { n = std::stof(v, &used); } catch (...) { return false; }
+    std::wstring unit = v.substr(used);
+    if (n < 0) return false;
+    if (unit == L"%") out = { n, true };
+    else if (unit == L"px" || (unit.empty() && n == 0)) out = { n, false };
+    else if (unit == L"em" || unit == L"rem") out = { n * fontSize, false };
+    else return false;
+    return true;
+}
+
+void LayoutBox::cornerRadii(float out[4]) const {
+    float smaller = (float)std::min(width, height);
+    for (int i = 0; i < 4; i++)
+        out[i] = radius[i].percent ? radius[i].value / 100.0f * smaller : radius[i].value;
+    // Adjacent corners can't overlap along a side: scale all four down
+    // together until they fit, as CSS does.
+    float scale = 1;
+    auto fit = [&](float side, float a, float b) { if (a + b > side && a + b > 0) scale = std::min(scale, side / (a + b)); };
+    fit((float)width, out[0], out[1]);
+    fit((float)width, out[3], out[2]);
+    fit((float)height, out[0], out[3]);
+    fit((float)height, out[1], out[2]);
+    for (int i = 0; i < 4; i++) out[i] *= scale;
+}
+
 // Computes the cascaded style properties layout uses, for both plain
 // elements and form controls: stylesheet rules first (least to most
 // specific, source order breaking ties), then inline style="" - which, per
@@ -378,6 +445,29 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         else if (k == L"box-sizing") {
             if (v == L"border-box") sv.boxSizing = BoxSizing::BorderBox;
             else if (v == L"content-box") sv.boxSizing = BoxSizing::ContentBox;
+        }
+        else if (k == L"border-radius") {
+            // 1-4 values: all corners; tl+br / tr+bl; tl / tr+bl / br; or
+            // each of tl tr br bl. An elliptical "/ <vertical radii>" part
+            // is dropped - corners are always circular here.
+            std::wstring horizontal = v.substr(0, v.find(L'/'));
+            std::vector<LayoutBox::CornerRadius> r;
+            for (const auto& tok : cssTokens(horizontal)) {
+                LayoutBox::CornerRadius c;
+                if (!parseRadius(tok, sv.fontSize, c)) { r.clear(); break; }
+                r.push_back(c);
+            }
+            static const int kPick[4][4] = { { 0, 0, 0, 0 }, { 0, 1, 0, 1 }, { 0, 1, 2, 1 }, { 0, 1, 2, 3 } };
+            if (!r.empty() && r.size() <= 4)
+                for (int i = 0; i < 4; i++) sv.radius[i] = r[kPick[r.size() - 1][i]];
+        }
+        else if (k == L"border-top-left-radius" || k == L"border-top-right-radius" ||
+                 k == L"border-bottom-right-radius" || k == L"border-bottom-left-radius") {
+            int corner = k == L"border-top-left-radius" ? 0 : k == L"border-top-right-radius" ? 1
+                       : k == L"border-bottom-right-radius" ? 2 : 3;
+            auto toks = cssTokens(v);
+            LayoutBox::CornerRadius c;
+            if (!toks.empty() && parseRadius(toks[0], sv.fontSize, c)) sv.radius[corner] = c;
         }
         else if (k == L"border-color") sv.borderColor = v;
         else if (k == L"border-width") sv.borderWidth = resolveLength(v, containingWidth, 0);
@@ -512,6 +602,9 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         }
     };
 
+    // Every declaration that applies, in cascade order: matched rules (least
+    // to most specific), then inline style.
+    std::vector<const std::pair<std::wstring, std::wstring>*> cascade;
     if (rules) {
         std::vector<const CSS::Rule*> matched;
         auto consider = [&](const std::vector<const CSS::Rule*>& bucket) {
@@ -551,10 +644,48 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
                 return a->order < b->order;
             });
         for (const auto* rule : matched)
-            for (const auto& decl : rule->declarations) applyDecl(decl.first, decl.second);
+            for (const auto& decl : rule->declarations) cascade.push_back(&decl);
     }
-    for (const auto& decl : CSS::parseDeclarations(getAttr(e, L"style", L"")))
-        applyDecl(decl.first, decl.second);
+    auto inlineDecls = CSS::parseDeclarations(getAttr(e, L"style", L""));
+    for (const auto& decl : inlineDecls) cascade.push_back(&decl);
+
+    // Custom properties first, so a var() anywhere in this element's
+    // declarations sees every one defined on it, wherever in the cascade
+    // either appears. A new layer is only made for values that differ from
+    // what's inherited (see CSSVars).
+    std::shared_ptr<CSSVars> own;
+    for (const auto* decl : cascade) {
+        const std::wstring& k = decl->first;
+        if (k.size() < 3 || k[0] != L'-' || k[1] != L'-') continue;
+        if (!own) {
+            const std::wstring* inherited = inheritedPaint.vars ? inheritedPaint.vars->find(k) : nullptr;
+            if (inherited && *inherited == decl->second) continue;
+            own = std::make_shared<CSSVars>();
+            own->parent = inheritedPaint.vars;
+        }
+        own->own[k] = decl->second;
+    }
+    if (own) {
+        // Substitute var() in the values defined here; one that can't be
+        // resolved (or is part of a cycle) is dropped, as in CSS.
+        std::vector<std::wstring> names;
+        for (const auto& [name, value] : own->own) names.push_back(name);
+        std::unordered_map<std::wstring, std::wstring> resolved;
+        for (const auto& name : names) {
+            std::wstring out;
+            if (substituteVars(own->own[name], own.get(), out)) resolved[name] = std::move(out);
+        }
+        own->own = std::move(resolved);
+        sv.paint.vars = own;
+    }
+
+    for (const auto* decl : cascade) {
+        const std::wstring& k = decl->first;
+        if (k.size() >= 2 && k[0] == L'-' && k[1] == L'-') continue;
+        if (decl->second.find(L"var(") == std::wstring::npos) { applyDecl(k, decl->second); continue; }
+        std::wstring value;
+        if (substituteVars(decl->second, sv.paint.vars.get(), value)) applyDecl(k, value);
+    }
 
     sv.visuallyHidden = inheritedVisuallyHidden || sv.opacity <= 0.0f || sv.visibilityHidden;
     return sv;
@@ -714,6 +845,7 @@ void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth, c
     box.x = x;
     box.fontSize = style.fontSize;
     box.background = style.background;
+    std::copy(std::begin(style.radius), std::end(style.radius), std::begin(box.radius));
     box.el = e;
     box.form = currentForm;
     box.visuallyHidden = style.visuallyHidden;
@@ -792,6 +924,7 @@ void LayoutRoot::layoutImage(Element* e, int x, int& y, int containingWidth, con
     box.fontSize = style.fontSize;
     box.background = style.background;
     box.imageSrc = src;
+    std::copy(std::begin(style.radius), std::end(style.radius), std::begin(box.radius)); // rounded avatars etc.
     box.width = std::min(width, std::max(containingWidth, 1));
     box.height = height;
     box.el = e;
@@ -823,8 +956,21 @@ void LayoutRoot::layout() {
     rebuildRuleIndex();
     if (!rootNode) return;
 
+    // Layout starts at <body>, but it inherits from its ancestors - normally
+    // just <html>, where `:root { --brand: ... }` and `html { color: ... }`
+    // rules land. They're also on ancestorStack, so selectors like
+    // "html .x" see them. (Font size still starts at 14px.)
+    auto* root = static_cast<Element*>(rootNode);
+    std::vector<Element*> ancestors;
+    for (Element* a = root->parent; a; a = a->parent) ancestors.insert(ancestors.begin(), a);
+    TextPaint paint;
+    for (Element* a : ancestors) {
+        paint = computeStyle(a, 14, viewportWidth - 20, false, paint).paint;
+        ancestorStack.push_back(a);
+    }
+
     int y = 10;
-    layoutElement(static_cast<Element*>(rootNode), 10, y, viewportWidth - 20, 14, false, TextPaint{});
+    layoutElement(root, 10, y, viewportWidth - 20, 14, false, paint);
 }
 
 void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, int inheritedFontSize,
@@ -950,6 +1096,7 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
         box.background = sv.background;
         box.borderWidth = sv.borderWidth;
         box.borderColor = sv.borderColor;
+        std::copy(std::begin(sv.radius), std::end(sv.radius), std::begin(box.radius));
         box.el = e;
         box.visuallyHidden = sv.visuallyHidden;
         bgIndex = boxes.size();

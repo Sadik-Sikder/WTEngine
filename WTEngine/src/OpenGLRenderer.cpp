@@ -381,7 +381,117 @@ void OpenGLRenderer::drainPendingImageUploads() {
     }
 }
 
-void OpenGLRenderer::drawImage(float x, float y, float w, float h, const std::wstring& url) {
+// --- Rounded shapes ---------------------------------------------------------
+// Drawn as triangles around a contour that follows the rounded corners.
+// OpenGL's polygons have hard, aliased edges, so each shape also gets a
+// 1px "fringe" strip along its edge that fades from the shape's alpha to
+// zero, which reads as a smooth edge.
+
+namespace {
+    struct Pt { float x, y; };
+
+    // Points around the rounded rectangle (x, y, w, h), clockwise from the
+    // top-left corner, shrunk inward by `inset` (negative grows it) - every
+    // radius shrinks by the same amount, so insets of one shape line up
+    // point for point. `segments` per corner is fixed by the caller so
+    // every contour of one shape has the same number of points.
+    std::vector<Pt> roundedContour(float x, float y, float w, float h, const float radii[4],
+                                   float inset, int segments) {
+        const float kPi = 3.14159265f;
+        x += inset; y += inset; w -= 2 * inset; h -= 2 * inset;
+        // Corner centres sit at (radius - inset) from the inset edge, i.e.
+        // fixed relative to the original rectangle; a corner whose radius
+        // the inset swallows becomes a sharp one.
+        float r[4];
+        for (int i = 0; i < 4; i++) r[i] = std::max(radii[i] - inset, 0.0f);
+        const Pt centres[4] = {
+            { x + r[0], y + r[0] }, { x + w - r[1], y + r[1] },
+            { x + w - r[2], y + h - r[2] }, { x + r[3], y + h - r[3] },
+        };
+        std::vector<Pt> pts;
+        pts.reserve(4 * (segments + 1));
+        for (int c = 0; c < 4; c++) {
+            float start = kPi + c * kPi / 2; // top-left starts pointing left (y grows downwards)
+            for (int s = 0; s <= segments; s++) {
+                float a = start + (kPi / 2) * s / segments;
+                pts.push_back({ centres[c].x + r[c] * std::cos(a), centres[c].y + r[c] * std::sin(a) });
+            }
+        }
+        return pts;
+    }
+
+    int segmentsFor(const float radii[4]) {
+        float biggest = std::max({ radii[0], radii[1], radii[2], radii[3] });
+        return std::clamp((int)(biggest / 2), 2, 16);
+    }
+
+    // With a texture bound, texture coordinates map the box (x, y, w, h)
+    // onto the whole image.
+    struct TexMap { bool on; float x, y, w, h; };
+
+    void vertex(const Pt& p, const TexMap& tm) {
+        if (tm.on) glTexCoord2f((p.x - tm.x) / tm.w, (p.y - tm.y) / tm.h);
+        glVertex2f(p.x, p.y);
+    }
+
+    // A strip between two contours of equal length, `a` at alpha `alphaA`
+    // and `b` at `alphaB`.
+    void strip(const std::vector<Pt>& a, const std::vector<Pt>& b, Color c, float alphaA, float alphaB,
+               const TexMap& tm) {
+        glBegin(GL_TRIANGLE_STRIP);
+        for (size_t i = 0; i <= a.size(); i++) {
+            size_t k = i % a.size();
+            glColor4f(c.r, c.g, c.b, c.a * alphaA); vertex(a[k], tm);
+            glColor4f(c.r, c.g, c.b, c.a * alphaB); vertex(b[k], tm);
+        }
+        glEnd();
+    }
+
+    // A filled rounded rectangle with a faded 1px edge.
+    void fillRounded(float x, float y, float w, float h, const float radii[4], Color c, const TexMap& tm) {
+        if (w <= 0 || h <= 0) return;
+        int seg = segmentsFor(radii);
+        std::vector<Pt> inner = roundedContour(x, y, w, h, radii, 0.5f, seg);
+        std::vector<Pt> outer = roundedContour(x, y, w, h, radii, -0.5f, seg);
+
+        glColor4f(c.r, c.g, c.b, c.a);
+        glBegin(GL_TRIANGLE_FAN); // the shape is convex, so a fan from its centre covers it
+        vertex({ x + w / 2, y + h / 2 }, tm);
+        for (size_t i = 0; i <= inner.size(); i++) vertex(inner[i % inner.size()], tm);
+        glEnd();
+        strip(inner, outer, c, 1, 0, tm);
+    }
+}
+
+void OpenGLRenderer::drawRoundedRect(float x, float y, float w, float h, const float radii[4], Color color) {
+    fillRounded(x, y, w, h, radii, color, { false });
+}
+
+void OpenGLRenderer::drawRoundedFrame(float x, float y, float w, float h, const float radii[4],
+                                      float thickness, Color c) {
+    if (w <= 0 || h <= 0 || thickness <= 0) return;
+    int seg = segmentsFor(radii);
+    const TexMap none{ false };
+    if (thickness < 1.5f) {
+        // Too thin for a solid core: fade in to the middle of the ring and out again.
+        auto outer = roundedContour(x, y, w, h, radii, -0.5f, seg);
+        auto mid = roundedContour(x, y, w, h, radii, thickness / 2, seg);
+        auto inner = roundedContour(x, y, w, h, radii, thickness + 0.5f, seg);
+        float a = std::min(thickness, 1.0f);
+        strip(outer, mid, c, 0, a, none);
+        strip(mid, inner, c, a, 0, none);
+        return;
+    }
+    auto outerFade = roundedContour(x, y, w, h, radii, -0.5f, seg);
+    auto outer = roundedContour(x, y, w, h, radii, 0.5f, seg);
+    auto inner = roundedContour(x, y, w, h, radii, thickness - 0.5f, seg);
+    auto innerFade = roundedContour(x, y, w, h, radii, thickness + 0.5f, seg);
+    strip(outerFade, outer, c, 0, 1, none);
+    strip(outer, inner, c, 1, 1, none);
+    strip(inner, innerFade, c, 1, 0, none);
+}
+
+void OpenGLRenderer::drawImage(float x, float y, float w, float h, const std::wstring& url, const float* radii) {
     if (url.empty()) return;
 
     const ImageTexture& tex = getOrCreateImageTexture(url);
@@ -391,12 +501,19 @@ void OpenGLRenderer::drawImage(float x, float y, float w, float h, const std::ws
     glBindTexture(GL_TEXTURE_2D, tex.id);
     glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
 
-    glBegin(GL_QUADS);
-    glTexCoord2f(0.0f, 0.0f); glVertex2f(x, y);
-    glTexCoord2f(1.0f, 0.0f); glVertex2f(x + w, y);
-    glTexCoord2f(1.0f, 1.0f); glVertex2f(x + w, y + h);
-    glTexCoord2f(0.0f, 1.0f); glVertex2f(x, y + h);
-    glEnd();
+    if (radii && (radii[0] > 0 || radii[1] > 0 || radii[2] > 0 || radii[3] > 0)) {
+        // The vertex colour multiplies the texture, so the fringe's fading
+        // alpha softens the image's own rounded edge too.
+        fillRounded(x, y, w, h, radii, { 1, 1, 1, 1 }, { true, x, y, w, h });
+    }
+    else {
+        glBegin(GL_QUADS);
+        glTexCoord2f(0.0f, 0.0f); glVertex2f(x, y);
+        glTexCoord2f(1.0f, 0.0f); glVertex2f(x + w, y);
+        glTexCoord2f(1.0f, 1.0f); glVertex2f(x + w, y + h);
+        glTexCoord2f(0.0f, 1.0f); glVertex2f(x, y + h);
+        glEnd();
+    }
 
     glDisable(GL_TEXTURE_2D);
 }

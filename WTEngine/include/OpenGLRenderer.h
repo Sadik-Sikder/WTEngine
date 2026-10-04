@@ -61,7 +61,11 @@ public:
     void drawText(float x, float y, const std::wstring& text,
         float fontSize, Color color, bool bold = false) override;
     float measureText(const std::wstring& text, float fontSize, bool bold = false) override;
-    void drawImage(float x, float y, float w, float h, const std::wstring& url) override;
+    void drawRoundedRect(float x, float y, float w, float h, const float radii[4], Color color) override;
+    void drawRoundedFrame(float x, float y, float w, float h, const float radii[4],
+                          float thickness, Color color) override;
+    void drawImage(float x, float y, float w, float h, const std::wstring& url,
+                   const float* radii = nullptr) override;
     bool preloadImage(const std::wstring& url, int& outWidth, int& outHeight) override;
     int imageGeneration() const override { return imageGen; }
     void setClip(float x, float y, float w, float h) override;

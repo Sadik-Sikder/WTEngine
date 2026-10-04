@@ -136,6 +136,55 @@ bool tryParseColor(const std::wstring& raw, Color& out) {
         return true;
     }
 
+    if (s.rfind(L"hsl(", 0) == 0 || s.rfind(L"hsla(", 0) == 0) {
+        size_t open = s.find(L'('), close = s.rfind(L')');
+        if (close == std::wstring::npos || close < open) return false;
+        std::wstring args = s.substr(open + 1, close - open - 1);
+        for (auto& c : args) if (c == L',' || c == L'/') c = L' ';
+        std::wistringstream ss(args);
+        std::vector<std::wstring> parts;
+        for (std::wstring t; ss >> t;) parts.push_back(t);
+        if (parts.size() != 3 && parts.size() != 4) return false;
+
+        // Hue: a bare number is degrees; deg/rad/grad/turn units too.
+        size_t used = 0;
+        float h;
+        try { h = std::stof(parts[0], &used); } catch (...) { return false; }
+        std::wstring unit = parts[0].substr(used);
+        if (unit == L"rad") h = h * 180.0f / 3.14159265f;
+        else if (unit == L"grad") h = h * 0.9f;
+        else if (unit == L"turn") h = h * 360.0f;
+        else if (!unit.empty() && unit != L"deg") return false;
+        h = std::fmod(std::fmod(h, 360.0f) + 360.0f, 360.0f) / 60.0f;
+
+        // Saturation and lightness: percentages (a bare number is read as
+        // one too, as CSS Color 4 allows).
+        float sl[2];
+        for (int i = 0; i < 2; i++) {
+            const std::wstring& t = parts[i + 1];
+            try { sl[i] = std::stof(t, &used); } catch (...) { return false; }
+            if (used != t.size() && !(used + 1 == t.size() && t[used] == L'%')) return false;
+            sl[i] = std::clamp(sl[i] / 100.0f, 0.0f, 1.0f);
+        }
+        float alpha = 1;
+        if (parts.size() == 4 && !parseColorComponent(parts[3], true, alpha)) return false;
+
+        float chroma = (1 - std::fabs(2 * sl[1] - 1)) * sl[0];
+        float x = chroma * (1 - std::fabs(std::fmod(h, 2.0f) - 1));
+        float r = 0, g = 0, b = 0;
+        switch ((int)h) {
+        case 0: r = chroma; g = x; break;
+        case 1: r = x; g = chroma; break;
+        case 2: g = chroma; b = x; break;
+        case 3: g = x; b = chroma; break;
+        case 4: r = x; b = chroma; break;
+        default: r = chroma; b = x; break;
+        }
+        float m = sl[1] - chroma / 2;
+        out = { r + m, g + m, b + m, alpha };
+        return true;
+    }
+
     if (s == L"transparent") { out = { 0, 0, 0, 0 }; return true; }
 
     auto it = namedColors().find(s);
@@ -655,10 +704,24 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
             continue;
         }
 
+        // border-radius: background (inside the border, its corners rounded
+        // to match the border's inner edge), then the border ring over it.
+        if (b.rounded()) {
+            float r[4], inner[4];
+            b.cornerRadii(r);
+            float bw = (float)b.borderWidth;
+            for (int i = 0; i < 4; i++) inner[i] = std::max(r[i] - bw, 0.0f);
+            if (!b.background.empty())
+                renderer.drawRoundedRect(b.x + bw, screenY + bw, b.width - 2 * bw, b.height - 2 * bw,
+                                         inner, parseColor(b.background));
+            if (bw > 0)
+                renderer.drawRoundedFrame(b.x, screenY, b.width, b.height, r, bw, parseColor(b.borderColor));
+        }
+
         // Draw border: four thin rects forming a hollow frame, not one
         // filled rect, so a box with a border but no background still shows
         // whatever's behind it through the middle - like a real CSS border.
-        if (b.borderWidth > 0) {
+        else if (b.borderWidth > 0) {
             Color bc = parseColor(b.borderColor);
             int bw = b.borderWidth;
             renderer.drawRect(b.x, screenY, b.width, bw, bc);                          // top
@@ -668,7 +731,7 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
         }
 
         // Draw background, inset by the border so it fills only the middle
-        if (!b.background.empty()) {
+        if (!b.background.empty() && !b.rounded()) {
             renderer.drawRect(
                 b.x + b.borderWidth,
                 screenY + b.borderWidth,
@@ -681,7 +744,9 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
         // Draw image
         if (!b.imageSrc.empty()) {
             std::wstring src = resolveImageSrc(pageBaseUrl, b.imageSrc);
-            if (!src.empty()) renderer.drawImage(b.x, screenY, b.width, b.height, src);
+            float r[4];
+            b.cornerRadii(r);
+            if (!src.empty()) renderer.drawImage(b.x, screenY, b.width, b.height, src, b.rounded() ? r : nullptr);
             continue;
         }
 

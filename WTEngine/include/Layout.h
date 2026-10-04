@@ -7,6 +7,23 @@
 #include "DOM.h"
 #include "CSS.h"
 
+// The CSS custom properties (--name: value) in effect on an element: the
+// ones it defines itself, with any var() in them already substituted, plus
+// (through `parent`) everything it inherits. Layered rather than copied,
+// since pages commonly define hundreds on :root and a few more on many
+// elements below it.
+struct CSSVars {
+    std::unordered_map<std::wstring, std::wstring> own;
+    std::shared_ptr<const CSSVars> parent;
+    const std::wstring* find(const std::wstring& name) const {
+        for (const CSSVars* s = this; s; s = s->parent.get()) {
+            auto it = s->own.find(name);
+            if (it != s->own.end()) return &it->second;
+        }
+        return nullptr;
+    }
+};
+
 // Simple layout box result
 struct LayoutBox {
     // Interactive form controls get a box of their own; the Engine draws
@@ -30,6 +47,21 @@ struct LayoutBox {
     // the middle - matching a real CSS border, which never fills its box.
     int borderWidth = 0;
     std::wstring borderColor;
+
+    // border-radius, per corner: top-left, top-right, bottom-right,
+    // bottom-left. A percentage is of the box's smaller side - so 50% makes
+    // a square a circle, but a wide box a pill rather than CSS's ellipse
+    // (corners are always circular here). Resolved when painting, once the
+    // box's final size is known (see cornerRadii).
+    struct CornerRadius { float value = 0; bool percent = false; };
+    CornerRadius radius[4];
+    bool rounded() const {
+        for (const auto& r : radius) if (r.value > 0) return true;
+        return false;
+    }
+    // The four radii in pixels, scaled down together where adjacent
+    // corners would overlap along a side, as CSS does.
+    void cornerRadii(float out[4]) const;
 
     Control control = NoControl;
     // The element this box was generated from: a control's own element,
@@ -69,12 +101,16 @@ struct LayoutRoot {
 
     void layout(); // compute boxes from rootNode
 private:
-    // The inherited text properties besides font-size: `color` (a raw CSS
-    // color string, empty = default black) and bold (font-weight). Passed
-    // down the tree alongside inheritedFontSize, exactly the same way.
+    // The inherited properties besides font-size: `color` (a raw CSS color
+    // string, empty = default black), bold (font-weight), and custom
+    // properties. Passed down the tree alongside inheritedFontSize, exactly
+    // the same way. `vars` is shared, not copied, between an element and
+    // the descendants that don't change any custom property - a new layer
+    // is only made where one does.
     struct TextPaint {
         std::wstring color;
         bool bold = false;
+        std::shared_ptr<const CSSVars> vars;
     };
 
     // `inheritedFontSize` is the size to use for `el`'s own direct text, and
@@ -157,6 +193,7 @@ private:
         int height = -1;
         int borderWidth = 0;
         std::wstring borderColor;
+        LayoutBox::CornerRadius radius[4]; // border-radius - see LayoutBox
         BoxSizing boxSizing = BoxSizing::ContentBox;
         int fontSize = 14;
         Display display = Display::Block;
@@ -228,6 +265,8 @@ private:
     };
     ComputedStyle computeStyle(Element* e, int inheritedFontSize, int containingWidth,
                                 bool inheritedVisuallyHidden, const TextPaint& inheritedPaint);
+    // Parses one corner radius: px, %, em/rem (against `fontSize`), or 0.
+    static bool parseRadius(const std::wstring& v, int fontSize, LayoutBox::CornerRadius& out);
     // Splits a shorthand value like "4px 8px" on whitespace and expands it
     // to all four sides per CSS's 1/2/3/4-value shorthand rule (used for
     // both `margin` and `padding`). Missing tokens, or a value that fails

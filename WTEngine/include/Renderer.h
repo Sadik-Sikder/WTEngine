@@ -29,10 +29,20 @@ public:
         float fontSize, Color color, bool bold = false) = 0;
     virtual float measureText(const std::wstring& text, float fontSize, bool bold = false) = 0;
 
+    // A filled rectangle with rounded corners, and a rounded border ring
+    // `thickness` wide just inside the rectangle's edge. `radii` are the
+    // corner radii (top-left, top-right, bottom-right, bottom-left), already
+    // scaled to fit (LayoutBox::cornerRadii). Edges are anti-aliased.
+    virtual void drawRoundedRect(float x, float y, float w, float h, const float radii[4], Color color) = 0;
+    virtual void drawRoundedFrame(float x, float y, float w, float h, const float radii[4],
+                                  float thickness, Color color) = 0;
+
     // Draws the image at `url` (already resolved to an absolute URL or local
-    // path) into the given box. Fetches and decodes lazily on first use and
-    // caches the result; does nothing if fetching or decoding fails.
-    virtual void drawImage(float x, float y, float w, float h, const std::wstring& url) = 0;
+    // path) into the given box, its corners rounded by `radii` if given.
+    // Fetches and decodes lazily on first use and caches the result; does
+    // nothing if fetching or decoding fails.
+    virtual void drawImage(float x, float y, float w, float h, const std::wstring& url,
+                           const float* radii = nullptr) = 0;
 
     // Starts (if not already cached) fetching and decoding the image at
     // `url` on a background thread, and returns its natural pixel size via

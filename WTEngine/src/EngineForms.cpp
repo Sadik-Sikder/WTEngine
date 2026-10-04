@@ -84,6 +84,22 @@ namespace {
         }
     }
 
+    // A control's 1px outline just outside its box, and its fill - with
+    // rounded corners if it has a border-radius.
+    void drawControlFrame(Renderer& r, const LayoutBox& b, float x, float y, float w, float h,
+                          Color border, Color fill) {
+        if (!b.rounded()) {
+            r.drawRect(x - 1, y - 1, w + 2, h + 2, border);
+            r.drawRect(x, y, w, h, fill);
+            return;
+        }
+        float rad[4], outer[4];
+        b.cornerRadii(rad);
+        for (int i = 0; i < 4; i++) outer[i] = rad[i] > 0 ? rad[i] + 1 : 0;
+        r.drawRoundedRect(x - 1, y - 1, w + 2, h + 2, outer, border);
+        r.drawRoundedRect(x, y, w, h, rad, fill);
+    }
+
     // <button> defaults to submit; <input> only when type=submit/image.
     bool isSubmitButton(const Element* el) {
         std::wstring type = lower(attrOf(el, L"type"));
@@ -463,8 +479,7 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
 
     switch (b.control) {
     case LayoutBox::TextField: {
-        r.drawRect(fx - 1, fy - 1, fw + 2, fh + 2, focused ? kCtlFocus : kCtlBorder);
-        r.drawRect(fx, fy, fw, fh, fill);
+        drawControlFrame(r, b, fx, fy, fw, fh, focused ? kCtlFocus : kCtlBorder, fill);
 
         std::wstring shown;
         if (focused) {
@@ -508,8 +523,7 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
         break;
     }
     case LayoutBox::Button: {
-        r.drawRect(fx - 1, fy - 1, fw + 2, fh + 2, kCtlBorder);
-        r.drawRect(fx, fy, fw, fh, b.background.empty() ? kButtonFill : parseColor(b.background));
+        drawControlFrame(r, b, fx, fy, fw, fh, kCtlBorder, b.background.empty() ? kButtonFill : parseColor(b.background));
         r.setClip(fx + 1, fy + 1, fw - 2, fh - 2);
         float tw = r.measureText(b.text, kFont);
         r.drawText(fx + std::max((fw - tw) / 2, 4.0f), fy + 5, b.text, kFont, kInk);
@@ -517,8 +531,7 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
         break;
     }
     case LayoutBox::Checkbox: {
-        r.drawRect(fx - 1, fy - 1, fw + 2, fh + 2, kCtlBorder);
-        r.drawRect(fx, fy, fw, fh, fill);
+        drawControlFrame(r, b, fx, fy, fw, fh, kCtlBorder, fill);
         if (b.el->attrs.count(L"checked")) r.drawRect(fx + 4, fy + 4, fw - 8, fh - 8, kCtlFocus);
         break;
     }
@@ -528,8 +541,7 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
         // selected, read live rather than baked in at layout time (see
         // chooseOption/selectedOption), so picking one never needs a
         // re-layout.
-        r.drawRect(fx - 1, fy - 1, fw + 2, fh + 2, openSelect == b.el ? kCtlFocus : kCtlBorder);
-        r.drawRect(fx, fy, fw, fh, fill);
+        drawControlFrame(r, b, fx, fy, fw, fh, openSelect == b.el ? kCtlFocus : kCtlBorder, fill);
         r.setClip(fx + 1, fy + 1, fw - 2, fh - 2);
         if (Element* opt = selectedOption(b.el)) r.drawText(fx + kInputPad, fy + 4, optionLabel(opt), kFont, kInk);
         r.clearClip();
