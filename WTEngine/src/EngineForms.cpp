@@ -484,6 +484,12 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
     const bool focused = b.el == focusedEl;
     const float kFont = b.fontSize > 0 ? (float)b.fontSize : kDefaultFont;
     const Color fill = b.background.empty() ? kWhite : parseColor(b.background);
+    // The control's CSS text colour, and its text centred vertically - so a
+    // control made taller with CSS keeps its label in the middle. (A GDI
+    // text cell is about 1.33 em tall; at the default heights this lands
+    // where the text always was.)
+    const Color ink = b.color.empty() ? kInk : parseColor(b.color);
+    const float textY = fy + std::floor((fh - kFont * 1.33f) / 2);
 
     switch (b.control) {
     case LayoutBox::TextField: {
@@ -517,15 +523,15 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
 
         if (shown.empty()) {
             std::wstring hint = attrOf(b.el, L"placeholder");
-            if (!hint.empty()) r.drawText(fx + kInputPad, fy + 4, hint, kFont, kPlaceholder);
+            if (!hint.empty()) r.drawText(fx + kInputPad, textY, hint, kFont, kPlaceholder);
         }
         else {
-            r.drawText(textX, fy + 4, shown, kFont, kInk);
+            r.drawText(textX, textY, shown, kFont, ink);
         }
 
         if (focused && !editor.hasSelection() && std::fmod(t, 1.0) < 0.6) { // blinking caret
             float caretX = r.measureText(shown.substr(0, editor.cursor()), kFont);
-            r.drawRect(fx + kInputPad + caretX - inputScrollX, fy + 4, 1.5f, fh - 8, kInk);
+            r.drawRect(fx + kInputPad + caretX - inputScrollX, textY, 1.5f, kFont * 1.33f, ink);
         }
         r.clearClip();
         break;
@@ -533,8 +539,8 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
     case LayoutBox::Button: {
         drawControlFrame(r, b, fx, fy, fw, fh, kCtlBorder, b.background.empty() ? kButtonFill : parseColor(b.background));
         r.setClip(fx + 1, fy + 1, fw - 2, fh - 2);
-        float tw = r.measureText(b.text, kFont);
-        r.drawText(fx + std::max((fw - tw) / 2, 4.0f), fy + 5, b.text, kFont, kInk);
+        float tw = r.measureText(b.text, kFont, b.bold, b.italic, b.family);
+        r.drawText(fx + std::max((fw - tw) / 2, 4.0f), textY, b.text, kFont, ink, b.bold, b.italic, b.family);
         r.clearClip();
         break;
     }
@@ -551,7 +557,7 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
         // re-layout.
         drawControlFrame(r, b, fx, fy, fw, fh, openSelect == b.el ? kCtlFocus : kCtlBorder, fill);
         r.setClip(fx + 1, fy + 1, fw - 2, fh - 2);
-        if (Element* opt = selectedOption(b.el)) r.drawText(fx + kInputPad, fy + 4, optionLabel(opt), kFont, kInk);
+        if (Element* opt = selectedOption(b.el)) r.drawText(fx + kInputPad, textY, optionLabel(opt), kFont, ink, b.bold, b.italic, b.family);
         r.clearClip();
         break;
     }

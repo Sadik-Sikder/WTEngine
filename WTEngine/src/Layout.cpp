@@ -593,6 +593,9 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
     };
 
     auto applyDecl = [&](const std::wstring& k, const std::wstring& v) {
+        if (k == L"color") sv.colorSet = true;
+        if (k == L"font" || k == L"font-family" || k == L"font-weight" || k == L"font-style") sv.fontSet = true;
+
         if (k == L"background-color") {
             Color unused;
             if (tryParseColor(v, unused)) sv.background = v;
@@ -1184,6 +1187,23 @@ void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth, c
         box.width = checkboxSize;
         box.height = checkboxSize;
         break;
+    }
+
+    // CSS width/height override those defaults (not for a checkbox, whose
+    // size is its own). The width includes the control's padding and
+    // border, as browsers size most controls (box-sizing: border-box).
+    if (box.control != LayoutBox::Checkbox) {
+        if (style.width >= 0) box.width = std::min(std::max(style.width, 16), maxWidth);
+        if (style.height > 0) box.height = std::max(style.height, style.fontSize + 4);
+    }
+
+    // The label's text style - only what the control's own rules set: like
+    // browsers, controls don't pick up the page's text colour and font.
+    if (style.colorSet) box.color = style.paint.color;
+    if (style.fontSet) {
+        box.bold = style.paint.bold;
+        box.italic = style.paint.italic;
+        box.family = style.paint.family;
     }
 
     y += style.marginTop;
@@ -1900,6 +1920,13 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
             // fed its basis above) - otherwise layoutBlockChild would draw
             // a grown/shrunk item at its original CSS width.
             real.width = -1;
+            // A form control doesn't fill the width it's given the way a
+            // block does - it takes `width` as its own size. One with a CSS
+            // width gets the flexed width that way; one without keeps its
+            // natural size, as in browsers.
+            bool isControl = items[i]->tag == L"input" || items[i]->tag == L"button" || items[i]->tag == L"select";
+            if (isControl && itemStyles[i].width >= 0)
+                real.width = std::max(itemWidths[i] - real.marginLeft - real.marginRight, 0);
             itemBoxes[i - a] = layoutItemDetached(items[i], itemWidths[i], real, itemHeights[i - a]);
             lineHeight = std::max(lineHeight, itemHeights[i - a]);
         }

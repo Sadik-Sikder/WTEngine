@@ -239,6 +239,12 @@ private:
         int borderWidth = 0;
         std::wstring borderColor;
         LayoutBox::CornerRadius radius[4]; // border-radius - see LayoutBox
+        // Whether this element's own rules set color / a font property
+        // (including `inherit`). Form controls only use those - like
+        // browsers, whose built-in styles stop controls inheriting the
+        // page's text colour and font.
+        bool colorSet = false;
+        bool fontSet = false;
         BoxSizing boxSizing = BoxSizing::ContentBox;
         int fontSize = 14;
         Display display = Display::Block;
