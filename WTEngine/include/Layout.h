@@ -146,6 +146,11 @@ private:
         bool isBreak = false;
         bool visuallyHidden = false;
         TextPaint paint;
+        // An <img>/<svg> instead of a word: its box, already sized
+        // (makeImageBox), for layoutInlineRun to place. `marginLeft`/
+        // `marginRight` add space around it within the line.
+        std::shared_ptr<const LayoutBox> image;
+        int marginLeft = 0, marginRight = 0;
     };
     // Splits `text` on whitespace, appending one InlineItem per word.
     void appendWords(const std::wstring& text, int fontSize, const std::wstring& href,
@@ -308,6 +313,9 @@ private:
                                      std::vector<GridTrack>& rowTracks, std::vector<GridTrack>& colTracks);
     void layoutControl(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
     void layoutImage(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
+    LayoutBox makeImageBox(Element* el, int containingWidth, const ComputedStyle& style);
+    // Adds an <img>/<svg> to an inline run, as one item that wraps like a word.
+    void appendImage(Element* el, int containingWidth, const ComputedStyle& style, std::vector<InlineItem>& out);
     // The box-model + content treatment layoutElement gives any block-level
     // child (background/border box, margin/padding, then recurse into
     // children or - if `style.display` is Grid - into layoutGrid). Factored

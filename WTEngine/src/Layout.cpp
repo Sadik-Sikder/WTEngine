@@ -134,7 +134,7 @@ float LayoutRoot::textWidth(const std::wstring& text, int fontSize, bool bold) {
 static bool isInlineTag(const std::wstring& tag) {
     static const std::wstring kInline[] = {
         L"a", L"span", L"b", L"strong", L"i", L"em", L"u", L"small", L"code",
-        L"sub", L"sup", L"mark", L"label", L"abbr", L"cite", L"q"
+        L"sub", L"sup", L"mark", L"label", L"abbr", L"cite", L"q", L"img", L"svg"
     };
     for (const auto& t : kInline) if (tag == t) return true;
     return false;
@@ -185,13 +185,16 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containin
             continue;
         }
 
-        // An inline run is words only, so an image inside inline content
-        // (<a><svg>...</svg> Home</a>) can't be placed here. Skipped whole -
-        // otherwise an <svg>'s <title>/<text> would leak in as words.
-        if (e->tag == L"img" || e->tag == L"svg") continue;
-
         ComputedStyle sv = computeStyle(e, inheritedFontSize, containingWidth, inheritedVisuallyHidden, inheritedPaint);
         if (sv.display == Display::None) continue;
+
+        // An image inside inline content (<a><svg>...</svg> Home</a>) sits
+        // in the line like a word - never recursed into, so an <svg>'s
+        // <title>/<text> can't leak in as words.
+        if (e->tag == L"img" || e->tag == L"svg") {
+            appendImage(e, containingWidth, sv, out);
+            continue;
+        }
 
         std::wstring savedHref = currentHref;
         if (e->tag == L"a") {
@@ -221,15 +224,34 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
 
     auto emitLine = [&]() {
         if (line.empty()) return;
-        int lineHeight = 0;
-        for (auto& p : line) lineHeight = std::max(lineHeight, p.item.fontSize);
-        lineHeight += 8;
+        // Text sits in a band as tall as its largest font plus 8px. An image
+        // taller than that makes the line taller, and the text then sits at
+        // the line's bottom - roughly where a browser puts an image on the
+        // baseline. An image shorter than the text is centred on it, the
+        // usual look of an icon next to a label.
+        int textBand = 0, imageHeight = 0;
         for (auto& p : line) {
+            if (p.item.image) imageHeight = std::max(imageHeight, p.item.image->height);
+            else textBand = std::max(textBand, p.item.fontSize + 8);
+        }
+        int lineHeight = std::max(textBand, imageHeight);
+        int textTop = y + lineHeight - textBand;
+        for (auto& p : line) {
+            if (p.item.image) {
+                LayoutBox box = *p.item.image;
+                // + textInset: offsets are measured where text is drawn, 4px
+                // inside its box - without it an image hugs the word before it.
+                box.x = x + (int)std::lround(p.offset) + textInset + p.item.marginLeft;
+                box.y = textBand > box.height ? textTop + (textBand - box.height) / 2 : y + lineHeight - box.height;
+                box.href = p.item.href;
+                boxes.push_back(box);
+                continue;
+            }
             LayoutBox box;
             box.x = x + (int)std::lround(p.offset);
-            box.y = y;
+            box.y = textTop;
             box.width = (int)std::lround(textWidth(p.item.word, p.item.fontSize, p.item.paint.bold));
-            box.height = lineHeight;
+            box.height = textBand;
             box.text = p.item.word;
             box.href = p.item.href;
             box.fontSize = p.item.fontSize;
@@ -246,6 +268,17 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
 
     for (const auto& raw : items) {
         if (raw.isBreak) { emitLine(); continue; }
+
+        if (raw.image) {
+            // Wraps like a word, with the same gap before it; never split.
+            float w = (float)(raw.marginLeft + raw.image->width + raw.marginRight);
+            float spaceWidth = line.empty() ? 0 : textWidth(L" ", raw.fontSize, raw.paint.bold);
+            if (!line.empty() && lineWidth + spaceWidth + w > maxWidth) emitLine();
+            float offset = line.empty() ? 0 : lineWidth + spaceWidth;
+            lineWidth = offset + w;
+            line.push_back({ raw, offset });
+            continue;
+        }
         if (raw.word.empty()) continue;
 
         InlineItem item = raw;
@@ -919,8 +952,9 @@ void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth, c
 // of its intrinsic size), then the image's natural size - a dimension that
 // is set alone keeps the natural aspect ratio. Until a bitmap has loaded,
 // its natural size is unknown and a 200x150 placeholder stands in; an
-// SVG's comes straight from its attributes.
-void LayoutRoot::layoutImage(Element* e, int x, int& y, int containingWidth, const ComputedStyle& style) {
+// SVG's comes straight from its attributes. The box comes back unplaced
+// (x/y 0): layoutImage stacks it as a block, layoutInlineRun puts it in a line.
+LayoutBox LayoutRoot::makeImageBox(Element* e, int containingWidth, const ComputedStyle& style) {
     const int defaultWidth = 200, defaultHeight = 150;
     bool isSvg = e->tag == L"svg";
     std::wstring src = isSvg ? svgDataUri(e, style.paint.color) : getAttr(e, L"src", L"");
@@ -953,7 +987,8 @@ void LayoutRoot::layoutImage(Element* e, int x, int& y, int containingWidth, con
     if (height < 0) height = defaultHeight;
 
     LayoutBox box;
-    box.x = x;
+    box.x = 0;
+    box.y = 0;
     box.fontSize = style.fontSize;
     box.background = style.background;
     box.imageSrc = src;
@@ -962,7 +997,28 @@ void LayoutRoot::layoutImage(Element* e, int x, int& y, int containingWidth, con
     box.height = height;
     box.el = e;
     box.visuallyHidden = style.visuallyHidden;
+    return box;
+}
 
+void LayoutRoot::appendImage(Element* e, int containingWidth, const ComputedStyle& style, std::vector<InlineItem>& out) {
+    InlineItem item;
+    item.fontSize = style.fontSize;
+    item.href = currentHref; // an icon inside a link is part of the link
+    item.owner = e;
+    item.visuallyHidden = style.visuallyHidden;
+    item.paint = style.paint;
+    item.image = std::make_shared<LayoutBox>(makeImageBox(e, containingWidth, style));
+    // Only horizontal margins mean anything inside a line. The 6px every
+    // element gets by default (ComputedStyle) is for blocks, not this.
+    item.marginLeft = style.marginLeft;
+    item.marginRight = style.marginRight;
+    out.push_back(std::move(item));
+}
+
+// An image displayed as a block: on its own, stacked below what came before.
+void LayoutRoot::layoutImage(Element* e, int x, int& y, int containingWidth, const ComputedStyle& style) {
+    LayoutBox box = makeImageBox(e, containingWidth, style);
+    box.x = x;
     y += style.marginTop;
     box.y = y;
     boxes.push_back(box);
@@ -1061,8 +1117,16 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
             }
 
             if (e->tag == L"img" || e->tag == L"svg") {
-                flushInline();
-                layoutImage(e, x, y, containingWidth, sv);
+                // Inline by default, as in CSS: it joins the text around it
+                // ("Click <img> here" stays one line). display:block puts it
+                // on its own.
+                if (sv.display == Display::Inline) {
+                    appendImage(e, containingWidth, sv, pendingInline);
+                }
+                else {
+                    flushInline();
+                    layoutImage(e, x, y, containingWidth, sv);
+                }
                 continue;
             }
 

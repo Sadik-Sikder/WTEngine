@@ -882,7 +882,13 @@ std::wstring Engine::linkAt(int x, int y, Renderer& renderer) const {
     // Later boxes paint on top, so check them first.
     for (auto it = layoutRoot.boxes.rbegin(); it != layoutRoot.boxes.rend(); ++it) {
         const auto& b = *it;
-        if (b.href.empty() || b.text.empty()) continue;
+        if (b.href.empty()) continue;
+        if (b.text.empty()) {
+            // An image inside a link: its whole box is the link.
+            if (!b.imageSrc.empty() && docX >= b.x && docX < b.x + b.width && docY >= b.y && docY < b.y + b.height)
+                return b.href;
+            continue;
+        }
 
         // Text is drawn at (x + 4, y + 4) and is only as wide as its glyphs,
         // so hit-test that area rather than the whole row.
