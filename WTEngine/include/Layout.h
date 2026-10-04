@@ -6,6 +6,7 @@
 #include <functional>
 #include "DOM.h"
 #include "CSS.h"
+#include "Renderer.h" // Color, Gradient
 
 // The CSS custom properties (--name: value) in effect on an element: the
 // ones it defines itself, with any var() in them already substituted, plus
@@ -22,6 +23,31 @@ struct CSSVars {
         }
         return nullptr;
     }
+};
+
+// A background-size/-position length: pixels, a percentage, or auto.
+struct BgLength {
+    float value = 0;
+    bool percent = false;
+    bool isAuto = false;
+};
+
+// One layer of `background`/`background-image`: an image or a gradient,
+// with how it's sized, placed and repeated. Painted inside the border.
+struct BackgroundLayer {
+    std::wstring image; // url(...) target as written (resolved when drawn); empty for a gradient
+    std::shared_ptr<const Gradient> gradient;
+    enum class Size { Auto, Cover, Contain, Explicit } size = Size::Auto;
+    BgLength width{ 0, false, true }, height{ 0, false, true }; // Size::Explicit
+    BgLength posX{ 0, true, false }, posY{ 0, true, false };    // 0% 0%: the top left
+    bool repeatX = true, repeatY = true;
+};
+
+// One box-shadow. Inset shadows are parsed but not drawn.
+struct BoxShadow {
+    float x = 0, y = 0, blur = 0, spread = 0;
+    Color color{ 0, 0, 0, 1 };
+    bool inset = false;
 };
 
 // Simple layout box result
@@ -63,6 +89,10 @@ struct LayoutBox {
     // box's final size is known (see cornerRadii).
     struct CornerRadius { float value = 0; bool percent = false; };
     CornerRadius radius[4];
+    // Background images/gradients, first on top (as listed in CSS), and
+    // box shadows, first on top too.
+    std::vector<BackgroundLayer> backgrounds;
+    std::vector<BoxShadow> shadows;
     bool rounded() const {
         for (const auto& r : radius) if (r.value > 0) return true;
         return false;
@@ -239,6 +269,8 @@ private:
         int borderWidth = 0;
         std::wstring borderColor;
         LayoutBox::CornerRadius radius[4]; // border-radius - see LayoutBox
+        std::vector<BackgroundLayer> backgrounds; // see LayoutBox
+        std::vector<BoxShadow> shadows;
         // Whether this element's own rules set color / a font property
         // (including `inherit`). Form controls only use those - like
         // browsers, whose built-in styles stop controls inheriting the

@@ -479,6 +479,15 @@ bool Engine::takeSubmission(FormSubmission& out) {
     return true;
 }
 
+// A control's background-image/gradient layers over its fill (gradient
+// buttons), clipped to its rounded corners if it has them.
+void Engine::paintControlBackground(Renderer& r, const LayoutBox& b, float x, float y, float w, float h) {
+    if (b.backgrounds.empty()) return;
+    float rad[4];
+    b.cornerRadii(rad);
+    paintBackgroundLayers(r, b, x, y, w, h, b.rounded() ? rad : nullptr);
+}
+
 void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
     const float fx = (float)b.x, fy = (float)sy, fw = (float)b.width, fh = (float)b.height;
     const bool focused = b.el == focusedEl;
@@ -494,6 +503,7 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
     switch (b.control) {
     case LayoutBox::TextField: {
         drawControlFrame(r, b, fx, fy, fw, fh, focused ? kCtlFocus : kCtlBorder, fill);
+        paintControlBackground(r, b, fx, fy, fw, fh);
 
         std::wstring shown;
         if (focused) {
@@ -538,6 +548,7 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
     }
     case LayoutBox::Button: {
         drawControlFrame(r, b, fx, fy, fw, fh, kCtlBorder, b.background.empty() ? kButtonFill : parseColor(b.background));
+        paintControlBackground(r, b, fx, fy, fw, fh);
         r.setClip(fx + 1, fy + 1, fw - 2, fh - 2);
         float tw = r.measureText(b.text, kFont, b.bold, b.italic, b.family);
         r.drawText(fx + std::max((fw - tw) / 2, 4.0f), textY, b.text, kFont, ink, b.bold, b.italic, b.family);
@@ -556,6 +567,7 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
         // chooseOption/selectedOption), so picking one never needs a
         // re-layout.
         drawControlFrame(r, b, fx, fy, fw, fh, openSelect == b.el ? kCtlFocus : kCtlBorder, fill);
+        paintControlBackground(r, b, fx, fy, fw, fh);
         r.setClip(fx + 1, fy + 1, fw - 2, fh - 2);
         if (Element* opt = selectedOption(b.el)) r.drawText(fx + kInputPad, textY, optionLabel(opt), kFont, ink, b.bold, b.italic, b.family);
         r.clearClip();

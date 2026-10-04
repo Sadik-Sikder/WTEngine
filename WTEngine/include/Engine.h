@@ -294,4 +294,11 @@ private:
     void queueSubmit(Element* form, Element* submitter);
     void drawControl(Renderer& renderer, const LayoutBox& box, int screenY, double timeSeconds);
     void drawOpenSelect(Renderer& renderer); // draws openSelect's dropdown rows, if one is open
+    // A box's box-shadows (outer ones; inset shadows aren't drawn).
+    void paintShadows(Renderer& renderer, const LayoutBox& b, float screenY);
+    // A box's background-image/gradient layers over the area (x, y, w, h) -
+    // inside its border - clipped to `radii` if given.
+    void paintBackgroundLayers(Renderer& renderer, const LayoutBox& b, float x, float y, float w, float h,
+                               const float* radii);
+    void paintControlBackground(Renderer& r, const LayoutBox& b, float x, float y, float w, float h);
 };

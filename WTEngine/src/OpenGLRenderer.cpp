@@ -106,6 +106,7 @@ OpenGLRenderer::~OpenGLRenderer() {
     for (auto& [key, tex] : imageCache) {
         if (tex.id) glDeleteTextures(1, &tex.id);
     }
+    for (auto& [key, id] : gradientCache_) glDeleteTextures(1, &id);
     if (comInitialized) CoUninitialize();
 }
 
@@ -430,7 +431,8 @@ void OpenGLRenderer::drainPendingImageUploads() {
 // Drawn as triangles around a contour that follows the rounded corners.
 // OpenGL's polygons have hard, aliased edges, so each shape also gets a
 // 1px "fringe" strip along its edge that fades from the shape's alpha to
-// zero, which reads as a smooth edge.
+// zero, which reads as a smooth edge. A box-shadow is the same shape with
+// a fringe as wide as its blur.
 
 namespace {
     struct Pt { float x, y; };
@@ -470,12 +472,27 @@ namespace {
         return std::clamp((int)(biggest / 2), 2, 16);
     }
 
-    // With a texture bound, texture coordinates map the box (x, y, w, h)
-    // onto the whole image.
-    struct TexMap { bool on; float x, y, w, h; };
+    bool anyRadius(const float* radii) {
+        return radii && (radii[0] > 0 || radii[1] > 0 || radii[2] > 0 || radii[3] > 0);
+    }
+
+    // With a texture bound, how screen points map to texture coordinates:
+    // u = ux*x + uy*y + u0, v = vx*x + vy*y + v0 - any linear mapping, so
+    // the same shapes can carry an image placed anywhere or a gradient
+    // running in any direction.
+    struct TexMap {
+        bool on = false;
+        float ux = 0, uy = 0, u0 = 0, vx = 0, vy = 0, v0 = 0;
+    };
+    const TexMap kNoTexture{};
+
+    // The texture's whole image stretched over the rectangle (x, y, w, h).
+    TexMap rectMap(float x, float y, float w, float h) {
+        return { true, 1 / w, 0, -x / w, 0, 1 / h, -y / h };
+    }
 
     void vertex(const Pt& p, const TexMap& tm) {
-        if (tm.on) glTexCoord2f((p.x - tm.x) / tm.w, (p.y - tm.y) / tm.h);
+        if (tm.on) glTexCoord2f(tm.ux * p.x + tm.uy * p.y + tm.u0, tm.vx * p.x + tm.vy * p.y + tm.v0);
         glVertex2f(p.x, p.y);
     }
 
@@ -492,12 +509,18 @@ namespace {
         glEnd();
     }
 
-    // A filled rounded rectangle with a faded 1px edge.
-    void fillRounded(float x, float y, float w, float h, const float radii[4], Color c, const TexMap& tm) {
+    // A filled rounded rectangle whose edge fades out over `fade` pixels,
+    // centred on the edge (1px for an ordinary smooth edge).
+    void fillRounded(float x, float y, float w, float h, const float radii[4], Color c, const TexMap& tm,
+                     float fade = 1) {
         if (w <= 0 || h <= 0) return;
+        // The solid core can't shrink past the middle; a fade wider than
+        // the shape just leaves it fainter.
+        float half = std::min(fade / 2, std::min(w, h) / 2 - 0.25f);
+        half = std::max(half, 0.0f);
         int seg = segmentsFor(radii);
-        std::vector<Pt> inner = roundedContour(x, y, w, h, radii, 0.5f, seg);
-        std::vector<Pt> outer = roundedContour(x, y, w, h, radii, -0.5f, seg);
+        std::vector<Pt> inner = roundedContour(x, y, w, h, radii, half, seg);
+        std::vector<Pt> outer = roundedContour(x, y, w, h, radii, -fade / 2, seg);
 
         glColor4f(c.r, c.g, c.b, c.a);
         glBegin(GL_TRIANGLE_FAN); // the shape is convex, so a fan from its centre covers it
@@ -506,37 +529,234 @@ namespace {
         glEnd();
         strip(inner, outer, c, 1, 0, tm);
     }
+
+    // A box filled through `tm`: rounded with a smooth edge if it has
+    // radii, else a plain quad with crisp edges like every other box.
+    void fillBox(float x, float y, float w, float h, const float* radii, Color c, const TexMap& tm) {
+        if (w <= 0 || h <= 0) return;
+        if (anyRadius(radii)) { fillRounded(x, y, w, h, radii, c, tm); return; }
+        glColor4f(c.r, c.g, c.b, c.a);
+        glBegin(GL_QUADS);
+        vertex({ x, y }, tm);
+        vertex({ x + w, y }, tm);
+        vertex({ x + w, y + h }, tm);
+        vertex({ x, y + h }, tm);
+        glEnd();
+    }
+
+    // --- Gradients ----------------------------------------------------------
+
+    // A gradient's stops with their positions resolved, against a gradient
+    // line `length` pixels long, to fractions of it - filling in missing
+    // ones and keeping them in order, the way CSS does.
+    std::vector<std::pair<float, Color>> resolveStops(const std::vector<GradientStop>& stops, float length) {
+        std::vector<std::pair<float, Color>> out;
+        if (stops.empty()) return out;
+        std::vector<float> pos(stops.size(), -1);
+        for (size_t i = 0; i < stops.size(); i++)
+            if (stops[i].hasPos) pos[i] = stops[i].px ? stops[i].pos / std::max(length, 1.0f) : stops[i].pos;
+        if (pos.front() < 0) pos.front() = 0;
+        if (pos.back() < 0) pos.back() = 1;
+        float highest = pos.front();
+        for (auto& p : pos) if (p >= 0) { p = std::max(p, highest); highest = p; } // no going backwards
+        for (size_t i = 1; i < pos.size(); i++) {
+            if (pos[i] >= 0) continue;
+            size_t j = i;
+            while (pos[j] < 0) j++; // the next stop that has a position (the last always does)
+            for (size_t k = i; k < j; k++) pos[k] = pos[i - 1] + (pos[j] - pos[i - 1]) * (k - i + 1) / (j - i + 1);
+            i = j;
+        }
+        for (size_t i = 0; i < stops.size(); i++) out.push_back({ pos[i], stops[i].color });
+        return out;
+    }
+
+    // The colour at `t` along resolved stops, blended with premultiplied
+    // alpha - so fading to `transparent` doesn't pass through grey.
+    Color colorAt(const std::vector<std::pair<float, Color>>& stops, float t) {
+        if (t <= stops.front().first) return stops.front().second;
+        if (t >= stops.back().first) return stops.back().second;
+        size_t i = 1;
+        while (i < stops.size() && stops[i].first < t) i++;
+        const auto& [p0, c0] = stops[i - 1];
+        const auto& [p1, c1] = stops[i];
+        float f = p1 > p0 ? (t - p0) / (p1 - p0) : 1;
+        float a = c0.a + (c1.a - c0.a) * f;
+        if (a <= 0) return { 0, 0, 0, 0 };
+        auto mix = [&](float x0, float x1) { return (x0 * c0.a + (x1 * c1.a - x0 * c0.a) * f) / a; };
+        return { mix(c0.r, c1.r), mix(c0.g, c1.g), mix(c0.b, c1.b), a };
+    }
+
+    void putPixel(std::vector<unsigned char>& rgba, size_t i, Color c) {
+        rgba[i * 4 + 0] = (unsigned char)std::lround(std::clamp(c.r, 0.0f, 1.0f) * 255);
+        rgba[i * 4 + 1] = (unsigned char)std::lround(std::clamp(c.g, 0.0f, 1.0f) * 255);
+        rgba[i * 4 + 2] = (unsigned char)std::lround(std::clamp(c.b, 0.0f, 1.0f) * 255);
+        rgba[i * 4 + 3] = (unsigned char)std::lround(std::clamp(c.a, 0.0f, 1.0f) * 255);
+    }
+
+    std::string stopsKey(const std::vector<std::pair<float, Color>>& stops) {
+        std::string key;
+        char buf[96];
+        for (const auto& [p, c] : stops) {
+            snprintf(buf, sizeof(buf), "%.4f:%.3f,%.3f,%.3f,%.3f;", p, c.r, c.g, c.b, c.a);
+            key += buf;
+        }
+        return key;
+    }
+}
+
+GLuint OpenGLRenderer::gradientTexture(const std::string& key, int width, int height, bool repeat,
+                                       const std::vector<unsigned char>& rgba) {
+    auto it = gradientCache_.find(key);
+    if (it != gradientCache_.end()) return it->second;
+    if (gradientCache_.size() >= 48) {
+        for (auto& [k, id] : gradientCache_) glDeleteTextures(1, &id);
+        gradientCache_.clear();
+    }
+    GLuint id = 0;
+    glGenTextures(1, &id);
+    glBindTexture(GL_TEXTURE_2D, id);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // A repeating gradient's texture is one period, tiled along u.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    gradientCache_[key] = id;
+    return id;
+}
+
+// A linear gradient is baked into a 256x1 texture of its colours along the
+// gradient line, and the box's texture coordinates run along that line, so
+// any angle and any box size share one texture. A radial one is baked into
+// a 256x256 texture over the box itself (it depends on the centre and the
+// box's shape, which are part of its key).
+void OpenGLRenderer::drawGradient(float x, float y, float w, float h, const Gradient& g, const float* radii) {
+    if (w <= 0 || h <= 0 || g.stops.empty()) return;
+    const float kPi = 3.14159265f;
+    TexMap tm;
+    GLuint texture = 0;
+
+    if (!g.radial) {
+        // The direction, as a unit vector (y grows downwards). "to <corner>"
+        // points at the corner along the perpendicular to the diagonal that
+        // joins the other two, as CSS defines it.
+        float dx, dy;
+        if (g.toCorner) {
+            float n = std::sqrt(w * w + h * h);
+            dx = g.cornerX * h / n;
+            dy = g.cornerY * w / n;
+        }
+        else {
+            float a = g.angle * kPi / 180;
+            dx = std::sin(a);
+            dy = -std::cos(a);
+        }
+        // The gradient line runs through the centre, long enough that its
+        // ends' perpendiculars just touch the corners.
+        float length = std::fabs(w * dx) + std::fabs(h * dy);
+        auto stops = resolveStops(g.stops, length);
+        float first = stops.front().first, period = stops.back().first - first;
+        bool repeat = g.repeating && period > 0.001f;
+
+        std::vector<unsigned char> rgba(256 * 4);
+        for (int i = 0; i < 256; i++) {
+            float t = (i + 0.5f) / 256;
+            putPixel(rgba, i, colorAt(stops, repeat ? first + t * period : t));
+        }
+        texture = gradientTexture("L" + std::string(repeat ? "r" : "") + stopsKey(stops), 256, 1, repeat, rgba);
+
+        // t = projection onto the line, 0 at its start and 1 at its end.
+        float cx = x + w / 2, cy = y + h / 2;
+        float ux = dx / length, uy = dy / length, u0 = 0.5f - (cx * dx + cy * dy) / length;
+        if (repeat) { // u in periods from the first stop
+            ux /= period; uy /= period; u0 = (u0 - first) / period;
+        }
+        tm = { true, ux, uy, u0, 0, 0, 0.5f };
+    }
+    else {
+        // Centre and ending shape in pixels: a circle reaching the farthest
+        // corner, or an ellipse through it with the proportions of the
+        // closest sides (CSS's default "farthest-corner" size).
+        float px = g.cx * w, py = g.cy * h;
+        float fx = std::max(px, w - px), fy = std::max(py, h - py);
+        float rx, ry;
+        if (g.circle) rx = ry = std::sqrt(fx * fx + fy * fy);
+        else {
+            float sx = std::min(px, w - px), sy = std::min(py, h - py);
+            if (sx > 0 && sy > 0) {
+                float k = sx / sy;
+                ry = std::sqrt((fx / k) * (fx / k) + fy * fy);
+                rx = k * ry;
+            }
+            else { rx = fx * std::sqrt(2.0f); ry = fy * std::sqrt(2.0f); }
+        }
+        rx = std::max(rx, 1.0f);
+        ry = std::max(ry, 1.0f);
+        auto stops = resolveStops(g.stops, rx);
+        float first = stops.front().first, period = stops.back().first - first;
+        bool repeat = g.repeating && period > 0.001f;
+
+        char shape[96];
+        snprintf(shape, sizeof(shape), "R%d|%.3f,%.3f|%.3f,%.3f|", repeat ? 1 : 0, px / w, py / h, rx / w, ry / h);
+        std::string key = shape + stopsKey(stops);
+        auto cached = gradientCache_.find(key);
+        if (cached != gradientCache_.end()) texture = cached->second;
+        else {
+            const int n = 256;
+            std::vector<unsigned char> rgba((size_t)n * n * 4);
+            for (int j = 0; j < n; j++) {
+                for (int i = 0; i < n; i++) {
+                    float ex = ((i + 0.5f) / n * w - px) / rx, ey = ((j + 0.5f) / n * h - py) / ry;
+                    float t = std::sqrt(ex * ex + ey * ey);
+                    if (repeat) t = first + std::fmod(std::fmod(t - first, period) + period, period);
+                    putPixel(rgba, (size_t)j * n + i, colorAt(stops, t));
+                }
+            }
+            texture = gradientTexture(key, n, n, false, rgba);
+        }
+        tm = rectMap(x, y, w, h);
+    }
+
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    fillBox(x, y, w, h, radii, { 1, 1, 1, 1 }, tm);
+    glDisable(GL_TEXTURE_2D);
+}
+
+void OpenGLRenderer::drawShadow(float x, float y, float w, float h, const float radii[4], float blur, Color color) {
+    if (w <= 0 || h <= 0 || color.a <= 0) return;
+    fillRounded(x, y, w, h, radii, color, kNoTexture, std::max(blur, 1.0f));
 }
 
 void OpenGLRenderer::drawRoundedRect(float x, float y, float w, float h, const float radii[4], Color color) {
-    fillRounded(x, y, w, h, radii, color, { false });
+    fillRounded(x, y, w, h, radii, color, kNoTexture);
 }
 
 void OpenGLRenderer::drawRoundedFrame(float x, float y, float w, float h, const float radii[4],
                                       float thickness, Color c) {
     if (w <= 0 || h <= 0 || thickness <= 0) return;
     int seg = segmentsFor(radii);
-    const TexMap none{ false };
     if (thickness < 1.5f) {
         // Too thin for a solid core: fade in to the middle of the ring and out again.
         auto outer = roundedContour(x, y, w, h, radii, -0.5f, seg);
         auto mid = roundedContour(x, y, w, h, radii, thickness / 2, seg);
         auto inner = roundedContour(x, y, w, h, radii, thickness + 0.5f, seg);
         float a = std::min(thickness, 1.0f);
-        strip(outer, mid, c, 0, a, none);
-        strip(mid, inner, c, a, 0, none);
+        strip(outer, mid, c, 0, a, kNoTexture);
+        strip(mid, inner, c, a, 0, kNoTexture);
         return;
     }
     auto outerFade = roundedContour(x, y, w, h, radii, -0.5f, seg);
     auto outer = roundedContour(x, y, w, h, radii, 0.5f, seg);
     auto inner = roundedContour(x, y, w, h, radii, thickness - 0.5f, seg);
     auto innerFade = roundedContour(x, y, w, h, radii, thickness + 0.5f, seg);
-    strip(outerFade, outer, c, 0, 1, none);
-    strip(outer, inner, c, 1, 1, none);
-    strip(inner, innerFade, c, 1, 0, none);
+    strip(outerFade, outer, c, 0, 1, kNoTexture);
+    strip(outer, inner, c, 1, 1, kNoTexture);
+    strip(inner, innerFade, c, 1, 0, kNoTexture);
 }
 
-void OpenGLRenderer::drawImage(float x, float y, float w, float h, const std::wstring& url, const float* radii) {
+void OpenGLRenderer::drawImage(float x, float y, float w, float h, const std::wstring& url, const float* radii,
+                               const float* tile) {
     if (url.empty()) return;
 
     const ImageTexture& tex = getOrCreateImageTexture(url);
@@ -544,22 +764,10 @@ void OpenGLRenderer::drawImage(float x, float y, float w, float h, const std::ws
 
     glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, tex.id);
-    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-
-    if (radii && (radii[0] > 0 || radii[1] > 0 || radii[2] > 0 || radii[3] > 0)) {
-        // The vertex colour multiplies the texture, so the fringe's fading
-        // alpha softens the image's own rounded edge too.
-        fillRounded(x, y, w, h, radii, { 1, 1, 1, 1 }, { true, x, y, w, h });
-    }
-    else {
-        glBegin(GL_QUADS);
-        glTexCoord2f(0.0f, 0.0f); glVertex2f(x, y);
-        glTexCoord2f(1.0f, 0.0f); glVertex2f(x + w, y);
-        glTexCoord2f(1.0f, 1.0f); glVertex2f(x + w, y + h);
-        glTexCoord2f(0.0f, 1.0f); glVertex2f(x, y + h);
-        glEnd();
-    }
-
+    // The vertex colour multiplies the texture, so a rounded edge's fading
+    // alpha softens the image's own edge too.
+    TexMap tm = tile ? rectMap(tile[0], tile[1], tile[2], tile[3]) : rectMap(x, y, w, h);
+    fillBox(x, y, w, h, radii, { 1, 1, 1, 1 }, tm);
     glDisable(GL_TEXTURE_2D);
 }
 

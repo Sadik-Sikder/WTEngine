@@ -552,6 +552,271 @@ void LayoutBox::cornerRadii(float out[4]) const {
     for (int i = 0; i < 4; i++) out[i] *= scale;
 }
 
+// --- background-image, gradients, box-shadow --------------------------------
+
+// Splits a value on commas outside parentheses: the layers of a
+// background, the shadows of a box-shadow, the arguments of a gradient.
+static std::vector<std::wstring> splitTopLevelCommas(const std::wstring& v) {
+    std::vector<std::wstring> out;
+    std::wstring part;
+    int depth = 0;
+    for (wchar_t c : v) {
+        if (c == L'(') depth++;
+        else if (c == L')' && depth > 0) depth--;
+        if (c == L',' && depth == 0) { out.push_back(trimmed(part)); part.clear(); }
+        else part += c;
+    }
+    out.push_back(trimmed(part));
+    return out;
+}
+
+// A length in pixels for shadows and gradient stops: px, em/rem (against
+// `fontSize`), or a bare 0.
+static bool pixelLength(const std::wstring& tok, int fontSize, float& out) {
+    double n; std::wstring unit;
+    if (!parseNumberAndUnit(tok, n, unit)) return false;
+    if (unit == L"px" || (unit.empty() && n == 0)) out = (float)n;
+    else if (unit == L"em" || unit == L"rem") out = (float)(n * fontSize);
+    else return false;
+    return true;
+}
+
+// A background-position/-size component: a keyword's percentage, a
+// percentage, a length, or (`allowAuto`) auto.
+static bool bgLength(const std::wstring& tok, int fontSize, BgLength& out, bool allowAuto) {
+    if (tok == L"left" || tok == L"top") { out = { 0, true, false }; return true; }
+    if (tok == L"center") { out = { 50, true, false }; return true; }
+    if (tok == L"right" || tok == L"bottom") { out = { 100, true, false }; return true; }
+    if (allowAuto && tok == L"auto") { out = { 0, false, true }; return true; }
+    double n; std::wstring unit;
+    if (parseNumberAndUnit(tok, n, unit) && unit == L"%") { out = { (float)n, true, false }; return true; }
+    float px;
+    if (pixelLength(tok, fontSize, px)) { out = { px, false, false }; return true; }
+    return false;
+}
+
+static bool isPositionKeyword(const std::wstring& t) {
+    return t == L"left" || t == L"right" || t == L"top" || t == L"bottom" || t == L"center";
+}
+
+// background-position's 1-, 2- and keyword forms ("center", "right top",
+// "top", "20px 50%"). The 3/4-value offset forms ("right 10px bottom 5px")
+// keep just their keywords.
+static void parseBgPosition(std::vector<std::wstring> toks, int fontSize, BgLength& x, BgLength& y) {
+    if (toks.size() >= 3) {
+        std::vector<std::wstring> keywords;
+        for (const auto& t : toks) if (isPositionKeyword(t)) keywords.push_back(t);
+        toks = keywords;
+    }
+    if (toks.empty()) return;
+    BgLength center{ 50, true, false };
+    if (toks.size() == 1) {
+        if (toks[0] == L"top" || toks[0] == L"bottom") { x = center; bgLength(toks[0], fontSize, y, false); }
+        else if (bgLength(toks[0], fontSize, x, false)) y = center;
+        return;
+    }
+    std::wstring a = toks[0], b = toks[1];
+    if (a == L"top" || a == L"bottom" || b == L"left" || b == L"right") std::swap(a, b); // "top right" = "right top"
+    BgLength px, py;
+    if (bgLength(a, fontSize, px, false) && bgLength(b, fontSize, py, false)) { x = px; y = py; }
+}
+
+static void parseBgSize(const std::vector<std::wstring>& toks, int fontSize, BackgroundLayer& layer) {
+    if (toks.empty()) return;
+    if (toks[0] == L"cover") { layer.size = BackgroundLayer::Size::Cover; return; }
+    if (toks[0] == L"contain") { layer.size = BackgroundLayer::Size::Contain; return; }
+    BgLength w, h{ 0, false, true };
+    if (!bgLength(toks[0], fontSize, w, true)) return;
+    if (toks.size() > 1 && !bgLength(toks[1], fontSize, h, true)) return;
+    layer.size = BackgroundLayer::Size::Explicit;
+    layer.width = w;
+    layer.height = h;
+}
+
+static bool isRepeatKeyword(const std::wstring& t) {
+    return t == L"repeat" || t == L"no-repeat" || t == L"repeat-x" || t == L"repeat-y" || t == L"space" || t == L"round";
+}
+
+static void parseBgRepeat(const std::vector<std::wstring>& toks, BackgroundLayer& layer) {
+    if (toks.empty()) return;
+    auto repeats = [](const std::wstring& t) { return t != L"no-repeat"; }; // space/round tile like repeat here
+    if (toks[0] == L"repeat-x") { layer.repeatX = true; layer.repeatY = false; }
+    else if (toks[0] == L"repeat-y") { layer.repeatX = false; layer.repeatY = true; }
+    else if (toks.size() >= 2) { layer.repeatX = repeats(toks[0]); layer.repeatY = repeats(toks[1]); }
+    else layer.repeatX = layer.repeatY = repeats(toks[0]);
+}
+
+// A CSS angle in degrees, or false.
+static bool cssAngle(const std::wstring& tok, float& degrees) {
+    double n; std::wstring unit;
+    if (!parseNumberAndUnit(tok, n, unit)) return false;
+    if (unit == L"deg") degrees = (float)n;
+    else if (unit == L"turn") degrees = (float)(n * 360);
+    else if (unit == L"rad") degrees = (float)(n * 180 / 3.14159265);
+    else if (unit == L"grad") degrees = (float)(n * 0.9);
+    else if (unit.empty() && n == 0) degrees = 0;
+    else return false;
+    return true;
+}
+
+// linear-gradient(), radial-gradient(), their repeating- forms, and the
+// old -webkit-/-moz- prefixed syntax (where a bare side names where the
+// gradient starts, not where it goes).
+static bool parseGradient(const std::wstring& raw, Gradient& g) {
+    std::wstring v = lowerCase(trimmed(raw));
+    bool prefixed = false;
+    for (const wchar_t* prefix : { L"-webkit-", L"-moz-", L"-o-" }) {
+        if (v.rfind(prefix, 0) == 0) { v.erase(0, wcslen(prefix)); prefixed = true; }
+    }
+    if (v.rfind(L"repeating-", 0) == 0) { g.repeating = true; v.erase(0, 10); }
+    if (v.rfind(L"linear-gradient(", 0) == 0) g.radial = false;
+    else if (v.rfind(L"radial-gradient(", 0) == 0) g.radial = true;
+    else return false;
+    size_t open = v.find(L'('), close = v.rfind(L')');
+    if (close == std::wstring::npos || close <= open) return false;
+    std::vector<std::wstring> args = splitTopLevelCommas(v.substr(open + 1, close - open - 1));
+
+    size_t first = 0;
+    std::vector<std::wstring> head = cssTokens(args[0]);
+    if (!g.radial) {
+        float deg;
+        if (head.size() == 1 && cssAngle(head[0], deg)) {
+            g.angle = prefixed ? 90 - deg : deg; // the old syntax measured angles from the right, counterclockwise
+            first = 1;
+        }
+        else if (!head.empty() && (head[0] == L"to" || (prefixed && isPositionKeyword(head[0])))) {
+            int sx = 0, sy = 0;
+            for (const auto& t : head) {
+                if (t == L"left") sx = -1; else if (t == L"right") sx = 1;
+                else if (t == L"top") sy = -1; else if (t == L"bottom") sy = 1;
+            }
+            if (prefixed && head[0] != L"to") { sx = -sx; sy = -sy; } // "top" = starts at the top, goes down
+            if (sx && sy) { g.toCorner = true; g.cornerX = sx; g.cornerY = sy; }
+            else if (sx) g.angle = sx > 0 ? 90.0f : 270.0f;
+            else if (sy) g.angle = sy > 0 ? 180.0f : 0.0f;
+            first = 1;
+        }
+    }
+    else {
+        // [circle | ellipse] [<size keyword>] [at <position>] - only the
+        // shape and centre are used; the size is always farthest-corner.
+        bool shapeArg = false;
+        for (size_t i = 0; i < head.size(); i++) {
+            const auto& t = head[i];
+            if (t == L"circle") { g.circle = true; shapeArg = true; }
+            else if (t == L"ellipse" || t.find(L"-side") != std::wstring::npos ||
+                     t.find(L"-corner") != std::wstring::npos) shapeArg = true;
+            else if (t == L"at") {
+                shapeArg = true;
+                BgLength x{ 50, true, false }, y{ 50, true, false };
+                parseBgPosition(std::vector<std::wstring>(head.begin() + i + 1, head.end()), 16, x, y);
+                if (x.percent) g.cx = x.value / 100;
+                if (y.percent) g.cy = y.value / 100;
+                break;
+            }
+        }
+        if (shapeArg) first = 1;
+    }
+
+    // Colour stops: a colour with zero, one or two positions. A lone
+    // position (an interpolation hint) is skipped.
+    for (size_t i = first; i < args.size(); i++) {
+        Color color;
+        bool hasColor = false;
+        std::vector<GradientStop> positions;
+        for (const auto& t : cssTokens(args[i])) {
+            if (!hasColor && tryParseColor(t, color)) { hasColor = true; continue; }
+            double n; std::wstring unit;
+            GradientStop s;
+            float px;
+            if (parseNumberAndUnit(t, n, unit) && unit == L"%") { s.hasPos = true; s.pos = (float)(n / 100); }
+            else if (pixelLength(t, 16, px)) { s.hasPos = true; s.px = true; s.pos = px; }
+            else continue;
+            positions.push_back(s);
+        }
+        if (!hasColor) continue;
+        if (positions.empty()) positions.push_back(GradientStop{});
+        for (auto& s : positions) { s.color = color; g.stops.push_back(s); }
+    }
+    if (g.stops.empty()) return false;
+    if (g.stops.size() == 1) g.stops.push_back(g.stops[0]); // one colour: a solid fill
+    return true;
+}
+
+// An image layer's image: url(...) (quotes removed) or a gradient.
+static bool parseBgImage(const std::wstring& tok, BackgroundLayer& layer) {
+    std::wstring lower = lowerCase(tok);
+    if (lower.rfind(L"url(", 0) == 0 && tok.size() > 5 && tok.back() == L')') {
+        std::wstring url = trimmed(tok.substr(4, tok.size() - 5));
+        if (url.size() >= 2 && (url[0] == L'"' || url[0] == L'\'')) url = url.substr(1, url.size() - 2);
+        if (url.empty()) return false;
+        layer.image = url;
+        return true;
+    }
+    if (lower.find(L"gradient(") != std::wstring::npos) {
+        auto g = std::make_shared<Gradient>();
+        if (!parseGradient(tok, *g)) return false;
+        layer.gradient = g;
+        return true;
+    }
+    return false;
+}
+
+// One layer of the `background` shorthand: any of an image, a position
+// (with "/ size" after it), a repeat, and other keywords, in any order.
+// The colour is handled separately.
+static void parseBackgroundLayer(const std::wstring& text, int fontSize, BackgroundLayer& layer) {
+    // "center/cover" is one token; split the slash out (outside parentheses).
+    std::wstring spaced;
+    int depth = 0;
+    for (wchar_t c : text) {
+        if (c == L'(') depth++;
+        else if (c == L')' && depth > 0) depth--;
+        if (c == L'/' && depth == 0) spaced += L" / ";
+        else spaced += c;
+    }
+    std::vector<std::wstring> position, size, repeat;
+    bool afterSlash = false;
+    for (const auto& tok : cssTokens(spaced)) {
+        std::wstring t = lowerCase(tok);
+        BgLength unused;
+        if (t == L"/") afterSlash = true;
+        else if (parseBgImage(tok, layer)) continue;
+        else if (isRepeatKeyword(t)) repeat.push_back(t);
+        else if (afterSlash && (t == L"cover" || t == L"contain" || bgLength(t, fontSize, unused, true))) size.push_back(t);
+        else if (bgLength(t, fontSize, unused, false)) position.push_back(t);
+    }
+    parseBgPosition(position, fontSize, layer.posX, layer.posY);
+    parseBgSize(size, fontSize, layer);
+    parseBgRepeat(repeat, layer);
+}
+
+// box-shadow: comma-separated [inset] <x> <y> [<blur> [<spread>]] [<color>],
+// the colour anywhere; no colour means the text colour.
+static std::vector<BoxShadow> parseBoxShadows(const std::wstring& v, int fontSize, const std::wstring& textColor) {
+    std::vector<BoxShadow> out;
+    if (lowerCase(trimmed(v)) == L"none") return out;
+    for (const auto& part : splitTopLevelCommas(v)) {
+        BoxShadow s;
+        bool hasColor = false;
+        std::vector<float> lengths;
+        for (const auto& tok : cssTokens(part)) {
+            float px;
+            if (lowerCase(tok) == L"inset") s.inset = true;
+            else if (pixelLength(tok, fontSize, px)) lengths.push_back(px);
+            else if (tryParseColor(tok, s.color)) hasColor = true;
+        }
+        if (lengths.size() < 2) continue; // not a shadow
+        s.x = lengths[0];
+        s.y = lengths[1];
+        s.blur = lengths.size() > 2 ? std::max(lengths[2], 0.0f) : 0;
+        s.spread = lengths.size() > 3 ? lengths[3] : 0;
+        if (!hasColor) s.color = textColor.empty() ? Color{ 0, 0, 0, 1 } : parseColor(textColor);
+        out.push_back(s);
+    }
+    return out;
+}
+
 // Computes the cascaded style properties layout uses, for both plain
 // elements and form controls: stylesheet rules first (least to most
 // specific, source order breaking ties), then inline style="" - which, per
@@ -584,6 +849,15 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
     // percentage or em is of this element's final font size.
     std::wstring lineHeightRaw;
 
+    // Background layers and shadows, also built once the cascade is done:
+    // the `background` shorthand and its longhands override each other in
+    // whichever order they come, so each is kept with its place in the
+    // cascade (`seq`) and the later one wins, property by property.
+    struct Recorded { std::wstring value; int seq = -1; };
+    Recorded bgShorthand, bgImage, bgSize, bgPosition, bgRepeat;
+    int declSeq = 0;
+    std::wstring shadowRaw;
+
     // Sets font-family from a CSS family list; a list naming nothing
     // installed (only web fonts, say) leaves the inherited face.
     auto applyFamily = [&](const std::wstring& list) {
@@ -601,16 +875,22 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             if (tryParseColor(v, unused)) sv.background = v;
         }
         else if (k == L"background") {
-            // The shorthand can carry an image, position, repeat, etc.
-            // alongside the color ("#fff url(x.png) no-repeat") - keep just
-            // the first token that's a color. "background: none" (or only
-            // an image) clears any earlier color.
+            // The color comes from the last layer ("url(a.png), #fff");
+            // the layers themselves are built after the cascade (see
+            // Recorded). "background: none" (or only an image) clears any
+            // earlier color.
             Color unused;
             sv.background.clear();
-            for (const auto& tok : cssTokens(v)) {
+            for (const auto& tok : cssTokens(splitTopLevelCommas(v).back())) {
                 if (tryParseColor(tok, unused)) { sv.background = tok; break; }
             }
+            bgShorthand = { v, ++declSeq };
         }
+        else if (k == L"background-image") bgImage = { v, ++declSeq };
+        else if (k == L"background-size") bgSize = { v, ++declSeq };
+        else if (k == L"background-position") bgPosition = { v, ++declSeq };
+        else if (k == L"background-repeat") bgRepeat = { v, ++declSeq };
+        else if (k == L"box-shadow") shadowRaw = v;
         else if (k == L"color") {
             // inherit/currentcolor keep the inherited value; anything that
             // isn't a valid color is ignored, same as a real browser.
@@ -981,6 +1261,40 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         }
     }
 
+    // Background layers: from the shorthand or background-image, whichever
+    // came later; then any size/position/repeat longhand that came after
+    // the shorthand, its comma list repeated across the layers as in CSS.
+    if (bgShorthand.seq >= 0 || bgImage.seq >= 0) {
+        std::vector<BackgroundLayer> layers;
+        std::vector<bool> hasImage;
+        if (bgShorthand.seq > bgImage.seq) {
+            for (const auto& part : splitTopLevelCommas(bgShorthand.value)) {
+                BackgroundLayer layer;
+                parseBackgroundLayer(part, sv.fontSize, layer);
+                hasImage.push_back(!layer.image.empty() || layer.gradient);
+                layers.push_back(std::move(layer));
+            }
+        }
+        else {
+            for (const auto& part : splitTopLevelCommas(bgImage.value)) {
+                BackgroundLayer layer;
+                hasImage.push_back(parseBgImage(part, layer)); // "none" holds a place in the list
+                layers.push_back(std::move(layer));
+            }
+        }
+        auto applyList = [&](const Recorded& r, auto apply) {
+            if (r.seq < 0 || r.seq < bgShorthand.seq || layers.empty()) return;
+            std::vector<std::wstring> items = splitTopLevelCommas(r.value);
+            for (size_t i = 0; i < layers.size(); i++) apply(cssTokens(lowerCase(items[i % items.size()])), layers[i]);
+        };
+        applyList(bgSize, [&](const std::vector<std::wstring>& t, BackgroundLayer& l) { parseBgSize(t, sv.fontSize, l); });
+        applyList(bgPosition, [&](const std::vector<std::wstring>& t, BackgroundLayer& l) { parseBgPosition(t, sv.fontSize, l.posX, l.posY); });
+        applyList(bgRepeat, [&](const std::vector<std::wstring>& t, BackgroundLayer& l) { parseBgRepeat(t, l); });
+        for (size_t i = 0; i < layers.size(); i++)
+            if (hasImage[i]) sv.backgrounds.push_back(std::move(layers[i]));
+    }
+    if (!shadowRaw.empty()) sv.shadows = parseBoxShadows(shadowRaw, sv.fontSize, sv.paint.color);
+
     sv.visuallyHidden = inheritedVisuallyHidden || sv.opacity <= 0.0f || sv.visibilityHidden;
     return sv;
 }
@@ -1140,6 +1454,8 @@ void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth, c
     box.fontSize = style.fontSize;
     box.background = style.background;
     std::copy(std::begin(style.radius), std::end(style.radius), std::begin(box.radius));
+    box.backgrounds = style.backgrounds; // gradient buttons
+    box.shadows = style.shadows;
     box.el = e;
     box.form = currentForm;
     box.visuallyHidden = style.visuallyHidden;
@@ -1265,6 +1581,8 @@ LayoutBox LayoutRoot::makeImageBox(Element* e, int containingWidth, const Comput
     box.background = style.background;
     box.imageSrc = src;
     std::copy(std::begin(style.radius), std::end(style.radius), std::begin(box.radius)); // rounded avatars etc.
+    box.backgrounds = style.backgrounds;
+    box.shadows = style.shadows;
     box.width = std::min(width, std::max(containingWidth, 1));
     box.height = height;
     box.el = e;
@@ -1462,7 +1780,7 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     // one — plain structural wrappers like <html>/<body> get no box at
     // all, they just position their children.
     size_t bgIndex = static_cast<size_t>(-1);
-    if (!sv.background.empty() || sv.borderWidth > 0) {
+    if (!sv.background.empty() || sv.borderWidth > 0 || !sv.backgrounds.empty() || !sv.shadows.empty()) {
         LayoutBox box;
         box.x = boxX;
         box.y = contentStartY;
@@ -1472,6 +1790,8 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
         box.borderWidth = sv.borderWidth;
         box.borderColor = sv.borderColor;
         std::copy(std::begin(sv.radius), std::end(sv.radius), std::begin(box.radius));
+        box.backgrounds = sv.backgrounds;
+        box.shadows = sv.shadows;
         box.el = e;
         box.visuallyHidden = sv.visuallyHidden;
         bgIndex = boxes.size();

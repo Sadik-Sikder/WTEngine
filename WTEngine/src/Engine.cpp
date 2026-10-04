@@ -397,6 +397,42 @@ void Engine::fireReadyEvents() {
 // completion order.
 static constexpr int kStyleOrderBand = 1'000'000;
 
+// Rewrites every url(...) in a stylesheet's text that's relative to an
+// absolute one, resolved against the stylesheet's own URL - which is what
+// a relative url() in CSS is relative to. Rules from every stylesheet end
+// up in one list, and images are resolved against the page when drawn, so
+// without this "url(../img/hero.jpg)" in /css/site.css would be looked up
+// next to the page instead. data: URIs and unresolvable ones are left as is.
+static std::wstring absolutizeCssUrls(const std::wstring& css, const std::wstring& base) {
+    if (base.empty()) return css;
+    std::wstring out;
+    size_t i = 0;
+    while (true) {
+        size_t at = css.find(L"url(", i);
+        if (at == std::wstring::npos) { out.append(css, i, std::wstring::npos); return out; }
+        size_t close = css.find(L')', at + 4);
+        if (close == std::wstring::npos) { out.append(css, i, std::wstring::npos); return out; }
+        out.append(css, i, at + 4 - i);
+        std::wstring inner = css.substr(at + 4, close - at - 4);
+        size_t a = inner.find_first_not_of(L" \t\r\n"), b = inner.find_last_not_of(L" \t\r\n");
+        std::wstring url = a == std::wstring::npos ? L"" : inner.substr(a, b - a + 1);
+        wchar_t quote = 0;
+        if (url.size() >= 2 && (url[0] == L'"' || url[0] == L'\'') && url.back() == url[0]) {
+            quote = url[0];
+            url = url.substr(1, url.size() - 2);
+        }
+        std::wstring resolved = url.empty() || url.rfind(L"data:", 0) == 0 || url[0] == L'#' ? L"" : resolveUrl(base, url);
+        if (resolved.empty()) out += inner;
+        else {
+            if (quote) out += quote;
+            out += resolved;
+            if (quote) out += quote;
+        }
+        out += L')';
+        i = close + 1;
+    }
+}
+
 // Applies every styleTask_/scriptTask_ that has become ready since the last
 // call, in whatever order their fetches happened to complete (stylesheets)
 // or strictly in document order (scripts, via advanceScripts) - called
@@ -418,7 +454,10 @@ void Engine::pollResources() {
             continue;
         }
 
-        std::vector<CSS::Rule> extra = CSS::parseStylesheet(res.html);
+        // url()s in a stylesheet are relative to the stylesheet, not the page
+        // (a stylesheet read from disk has no finalUrl - its path is the base).
+        const std::wstring& sheetUrl = res.finalUrl.empty() ? styleLoader_.url(task.fetchIndex) : res.finalUrl;
+        std::vector<CSS::Rule> extra = CSS::parseStylesheet(absolutizeCssUrls(res.html, sheetUrl));
         for (auto& r : extra) r.order += task.orderBase;
         document->styles.insert(document->styles.end(),
                                  std::make_move_iterator(extra.begin()),
@@ -700,54 +739,47 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
         // deliberate simplification, see Layout.h's LayoutBox comment.
         if (b.visuallyHidden) continue;
 
+        // box-shadow, under everything else the box draws (controls too).
+        paintShadows(renderer, b, (float)screenY);
+
         if (b.control != LayoutBox::NoControl) {
             drawControl(renderer, b, screenY, timeSeconds);
             continue;
         }
 
-        // border-radius: background (inside the border, its corners rounded
-        // to match the border's inner edge), then the border ring over it.
-        if (b.rounded()) {
-            float r[4], inner[4];
-            b.cornerRadii(r);
-            float bw = (float)b.borderWidth;
-            for (int i = 0; i < 4; i++) inner[i] = std::max(r[i] - bw, 0.0f);
-            if (!b.background.empty())
-                renderer.drawRoundedRect(b.x + bw, screenY + bw, b.width - 2 * bw, b.height - 2 * bw,
-                                         inner, parseColor(b.background));
-            if (bw > 0)
-                renderer.drawRoundedFrame(b.x, screenY, b.width, b.height, r, bw, parseColor(b.borderColor));
+        // The background - colour, then image/gradient layers - inside the
+        // border, its corners rounded to match the border's inner edge;
+        // then the border over it.
+        float r[4], inner[4];
+        b.cornerRadii(r);
+        const bool rounded = b.rounded();
+        const float bw = (float)b.borderWidth;
+        for (int i = 0; i < 4; i++) inner[i] = std::max(r[i] - bw, 0.0f);
+        const float ax = b.x + bw, ay = screenY + bw, aw = b.width - 2 * bw, ah = b.height - 2 * bw;
+        if (!b.background.empty()) {
+            if (rounded) renderer.drawRoundedRect(ax, ay, aw, ah, inner, parseColor(b.background));
+            else renderer.drawRect(ax, ay, aw, ah, parseColor(b.background));
         }
+        paintBackgroundLayers(renderer, b, ax, ay, aw, ah, rounded ? inner : nullptr);
 
-        // Draw border: four thin rects forming a hollow frame, not one
-        // filled rect, so a box with a border but no background still shows
-        // whatever's behind it through the middle - like a real CSS border.
-        else if (b.borderWidth > 0) {
+        if (bw > 0) {
             Color bc = parseColor(b.borderColor);
-            int bw = b.borderWidth;
-            renderer.drawRect(b.x, screenY, b.width, bw, bc);                          // top
-            renderer.drawRect(b.x, screenY + b.height - bw, b.width, bw, bc);          // bottom
-            renderer.drawRect(b.x, screenY, bw, b.height, bc);                         // left
-            renderer.drawRect(b.x + b.width - bw, screenY, bw, b.height, bc);          // right
-        }
-
-        // Draw background, inset by the border so it fills only the middle
-        if (!b.background.empty() && !b.rounded()) {
-            renderer.drawRect(
-                b.x + b.borderWidth,
-                screenY + b.borderWidth,
-                b.width - 2 * b.borderWidth,
-                b.height - 2 * b.borderWidth,
-                parseColor(b.background)
-            );
+            if (rounded) renderer.drawRoundedFrame(b.x, screenY, b.width, b.height, r, bw, bc);
+            else {
+                // Four thin rects forming a hollow frame, not one filled
+                // rect, so a box with a border but no background still shows
+                // whatever's behind it through the middle - like a real CSS border.
+                renderer.drawRect(b.x, screenY, b.width, bw, bc);                          // top
+                renderer.drawRect(b.x, screenY + b.height - bw, b.width, bw, bc);          // bottom
+                renderer.drawRect(b.x, screenY, bw, b.height, bc);                         // left
+                renderer.drawRect(b.x + b.width - bw, screenY, bw, b.height, bc);          // right
+            }
         }
 
         // Draw image
         if (!b.imageSrc.empty()) {
             std::wstring src = resolveImageSrc(pageBaseUrl, b.imageSrc);
-            float r[4];
-            b.cornerRadii(r);
-            if (!src.empty()) renderer.drawImage(b.x, screenY, b.width, b.height, src, b.rounded() ? r : nullptr);
+            if (!src.empty()) renderer.drawImage(b.x, screenY, b.width, b.height, src, rounded ? r : nullptr);
             continue;
         }
 
@@ -788,6 +820,94 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     drawOpenSelect(renderer); // on top of the page, same treatment main.cpp gives AddressBar
     renderer.resetTransform();
     drawScrollbar(renderer); // window coordinates: browser UI, not zoomed
+}
+
+// Each shadow is the box's shape moved by its offset and grown by its
+// spread (corners too), with its edge blurred. The last one listed is
+// painted first, so the first ends up on top, as in CSS. Unlike CSS, a
+// shadow isn't cut away under the box itself - which only shows through a
+// box with a see-through background.
+void Engine::paintShadows(Renderer& renderer, const LayoutBox& b, float screenY) {
+    if (b.shadows.empty()) return;
+    float r[4];
+    b.cornerRadii(r);
+    for (auto it = b.shadows.rbegin(); it != b.shadows.rend(); ++it) {
+        const BoxShadow& s = *it;
+        if (s.inset) continue;
+        float grown[4];
+        for (int i = 0; i < 4; i++) grown[i] = r[i] > 0 ? std::max(r[i] + s.spread, 0.0f) : 0;
+        renderer.drawShadow(b.x + s.x - s.spread, screenY + s.y - s.spread,
+                            b.width + 2 * s.spread, b.height + 2 * s.spread, grown, s.blur, s.color);
+    }
+}
+
+// Layers are painted last-listed first, so the first is on top. A
+// gradient fills the whole area. An image is sized (auto/cover/contain/
+// explicit), placed (a percentage puts that point of the image on that
+// point of the area, as CSS does) and repeated along each axis that
+// repeats. An image that covers the whole area is drawn as one rounded
+// shape, so rounded corners clip it; a smaller or repeating one is clipped
+// to the area's rectangle.
+void Engine::paintBackgroundLayers(Renderer& renderer, const LayoutBox& b, float x, float y, float w, float h,
+                                   const float* radii) {
+    if (b.backgrounds.empty() || w <= 0 || h <= 0) return;
+    for (auto it = b.backgrounds.rbegin(); it != b.backgrounds.rend(); ++it) {
+        const BackgroundLayer& layer = *it;
+        if (layer.gradient) {
+            renderer.drawGradient(x, y, w, h, *layer.gradient, radii);
+            continue;
+        }
+        std::wstring src = resolveImageSrc(pageBaseUrl, layer.image);
+        int iw = 0, ih = 0;
+        if (src.empty() || !renderer.preloadImage(src, iw, ih) || iw <= 0 || ih <= 0) continue; // loading, or failed
+
+        // The tile's size.
+        float tw = (float)iw, th = (float)ih;
+        switch (layer.size) {
+        case BackgroundLayer::Size::Cover:
+        case BackgroundLayer::Size::Contain: {
+            float sx = w / iw, sy = h / ih;
+            float s = layer.size == BackgroundLayer::Size::Cover ? std::max(sx, sy) : std::min(sx, sy);
+            tw = iw * s; th = ih * s;
+            break;
+        }
+        case BackgroundLayer::Size::Explicit: {
+            auto resolve = [](const BgLength& l, float area) { return l.percent ? l.value / 100 * area : l.value; };
+            bool autoW = layer.width.isAuto, autoH = layer.height.isAuto;
+            if (!autoW) tw = resolve(layer.width, w);
+            if (!autoH) th = resolve(layer.height, h);
+            if (autoW && !autoH) tw = th * iw / ih; // one auto side keeps the image's proportions
+            if (autoH && !autoW) th = tw * ih / iw;
+            break;
+        }
+        case BackgroundLayer::Size::Auto: break;
+        }
+        if (tw < 1 || th < 1) continue;
+
+        // Its position: a percentage aligns that point of the tile with
+        // that point of the area ("100%" = right edge to right edge).
+        auto place = [](const BgLength& l, float area, float tile) {
+            return l.percent ? (area - tile) * l.value / 100 : l.value;
+        };
+        float tx = x + place(layer.posX, w, tw), ty = y + place(layer.posY, h, th);
+
+        if (tx <= x && ty <= y && tx + tw >= x + w && ty + th >= y + h) { // one tile covers it all
+            float tile[4] = { tx, ty, tw, th };
+            renderer.drawImage(x, y, w, h, src, radii, tile);
+            continue;
+        }
+        // Tiles from the first that reaches the area's edge, along each
+        // repeating axis; one tile along the others.
+        float x0 = tx, y0 = ty;
+        if (layer.repeatX) x0 = tx - std::ceil((tx - x) / tw) * tw;
+        if (layer.repeatY) y0 = ty - std::ceil((ty - y) / th) * th;
+        float x1 = layer.repeatX ? x + w : x0 + 1, y1 = layer.repeatY ? y + h : y0 + 1;
+        if ((x1 - x0) / tw * (y1 - y0) / th > 4000) continue; // a tiny tile over a huge box: not worth it
+        renderer.setClip(x, y, w, h);
+        for (float py = y0; py < y1; py += th)
+            for (float px = x0; px < x1; px += tw) renderer.drawImage(px, py, tw, th, src);
+        renderer.clearClip();
+    }
 }
 
 std::wstring Engine::title() const {

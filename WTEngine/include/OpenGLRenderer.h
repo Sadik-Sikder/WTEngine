@@ -72,7 +72,11 @@ public:
     void drawRoundedFrame(float x, float y, float w, float h, const float radii[4],
                           float thickness, Color color) override;
     void drawImage(float x, float y, float w, float h, const std::wstring& url,
-                   const float* radii = nullptr) override;
+                   const float* radii = nullptr, const float* tile = nullptr) override;
+    void drawGradient(float x, float y, float w, float h, const Gradient& g,
+                      const float* radii = nullptr) override;
+    void drawShadow(float x, float y, float w, float h, const float radii[4], float blur,
+                    Color color) override;
     bool preloadImage(const std::wstring& url, int& outWidth, int& outHeight) override;
     int imageGeneration() const override { return imageGen; }
     void setPageUrl(const std::wstring& url) override { pageUrl_ = url; }
@@ -133,6 +137,13 @@ private:
     std::vector<PendingImageUpload> pendingUploads; // guarded by uploadMutex
     int imageGen = 0; // bumped each time an upload completes; lets Engine know to re-layout
     std::wstring pageUrl_; // the referrer for image requests - see setPageUrl
+
+    // Gradients, each baked once into a small texture (see drawGradient),
+    // keyed by everything that shapes it. Emptied when it grows past a few
+    // dozen - pages use a handful, and rebuilding one is cheap.
+    std::map<std::string, GLuint> gradientCache_;
+    GLuint gradientTexture(const std::string& key, int width, int height, bool repeat,
+                           const std::vector<unsigned char>& rgba);
 
     const ImageTexture& getOrCreateImageTexture(const std::wstring& url);
     void startLoadingImage(const std::wstring& url);
