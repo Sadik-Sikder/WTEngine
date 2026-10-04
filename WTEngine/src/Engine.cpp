@@ -231,7 +231,7 @@ static bool isClassicScript(Element* scriptEl) {
 // instead of freezing the UI thread on each one in turn.
 void Engine::beginScripts() {
     // Drop the previous page's state FIRST, while its JS runtime still exists:
-    // domState holds JSValues (click listeners, pending timers) that must be
+    // domState holds JSValues (event listeners, pending timers) that must be
     // freed against their own runtime, and quickjs asserts if a runtime is
     // destroyed while any value is still alive. So: state, then old realm, then new.
     domState = DOMBindingState{};
@@ -247,8 +247,10 @@ void Engine::beginScripts() {
 
     installDOMBindings(jsEngine->context(), document->body.get(), &domState);
 
+    // From the top of the tree, not <body>: real pages put most of their
+    // scripts in <head>. Those run first, in document order, as in browsers.
     std::vector<Element*> scripts;
-    collectScripts(document->body.get(), scripts);
+    collectScripts(document->root ? document->root.get() : document->body.get(), scripts);
 
     std::vector<std::wstring> urls;
     for (Element* scriptEl : scripts) {

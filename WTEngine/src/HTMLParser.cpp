@@ -279,6 +279,17 @@ std::shared_ptr<Document> HTMLParser::parse(const std::wstring& html) {
             // function returns - leaving click bubbling (which walks `parent`
             // up past <body>) reading freed memory. Keep it alive on the Document.
             doc->root = std::static_pointer_cast<Element>(n);
+            if (found == n && top.size() > 1) {
+                // <body> is itself top-level (no <html> wrapper): wrap every
+                // top-level node in a synthetic <html>, so its siblings - a
+                // <head> with the page's <title> and <script>s - aren't lost.
+                auto html = std::make_shared<Element>(L"html");
+                for (auto& t : top) {
+                    if (t->type == Node::ELEMENT) static_cast<Element*>(t.get())->parent = html.get();
+                    html->children.push_back(t);
+                }
+                doc->root = html;
+            }
             break;
         }
     }
