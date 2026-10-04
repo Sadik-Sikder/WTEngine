@@ -23,6 +23,7 @@
 #define _WIN32_WINNT 0x0601 // required by Asio on Windows
 #endif
 #include "Fetcher.h"
+#include "CookieJar.h"
 #include <windows.h>
 #include <wininet.h>   // InternetCrackUrlW/InternetCombineUrlW only - see above
 #include <wincrypt.h>  // CryptStringToBinaryA (data: URIs) and the ROOT cert store (CertOpenSystemStoreW etc.)
@@ -170,6 +171,8 @@ struct RawResponse {
     std::string body;
     std::string location;    // Location header, for the redirect loop (followRedirect)
     std::string contentType; // Content-Type header, for fetchHttpAsync
+    std::vector<std::string> setCookies; // every Set-Cookie header, for the CookieJar (see fetch())
+
     std::wstring finalUrl;
     std::wstring error;
 };
@@ -274,6 +277,10 @@ static void fillRawResponse(http::response<http::string_body>& res, RawResponse&
     if (loc != res.end()) out.location.assign(loc->value());
     auto ct = res.find(http::field::content_type);
     if (ct != res.end()) out.contentType.assign(ct->value());
+    // A response can set several cookies, one Set-Cookie header each.
+    auto [first, last] = res.equal_range(http::field::set_cookie);
+    for (auto it = first; it != last; ++it) out.setCookies.emplace_back(it->value());
+
     out.ok = true;
 
     auto ce = res.find(http::field::content_encoding);
@@ -394,6 +401,9 @@ static http::request<http::string_body> buildRequest(const UrlParts& parts, http
 
     req.set(http::field::accept_encoding, "gzip, deflate"); // decompressBody (fillRawResponse) handles both - see its comment
     req.set(http::field::accept_language, acceptLanguage());
+    std::string cookies = CookieJar::instance().cookieHeader(parts.https, parts.host, parts.pathAndQuery);
+    if (!cookies.empty()) req.set(http::field::cookie, cookies);
+
     if (!body.empty()) req.set(http::field::content_type, "application/x-www-form-urlencoded");
     for (const auto& [name, value] : extraHeaders) req.set(name, value);
     if (!body.empty() || method == http::verb::post || method == http::verb::put || method == http::verb::patch) {
@@ -704,6 +714,12 @@ public:
                 failure = e.what(); // can't co_return from inside a catch block
             }
             if (!failure.empty()) { raw = RawResponse{}; raw.error = utf8ToWide(failure); co_return raw; }
+
+            // Store this hop's cookies before following a redirect: a login or
+            // a bot check typically sets its cookie on the redirect response
+            // itself, and expects it back on the very next request.
+            for (const auto& cookie : raw.setCookies)
+                CookieJar::instance().setCookie(cookie, parts.https, parts.host, parts.pathAndQuery);
 
             if (followRedirect(url, spec.method, body, raw)) continue;
             if (!raw.ok) co_return raw; // a redirect with an unusable Location

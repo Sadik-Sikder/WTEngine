@@ -9,6 +9,8 @@
 #include "HTMLParser.h"
 #include "Fetcher.h"
 #include "WebStorage.h"
+#include "CookieJar.h"
+
 #include <windows.h>
 #include <algorithm>
 #include <cwctype>
@@ -1554,7 +1556,48 @@ static JSValue js_get_head(JSContext* ctx, JSValueConst this_val) {
     return JS_NULL;
 }
 
-// --- localStorage / sessionStorage --------------------------------------
+// --- localStorage / sessionStorage 
+// --- document.cookie ---------------------------------------------------------
+// The page's cookies from the same jar requests use (CookieJar), minus
+// HttpOnly ones; assigning one stores it as if the page's server had set it
+// (but can't create or replace an HttpOnly cookie). Only on `document`, and
+// only for an http(s) page - a page from disk has no cookies.
+
+// Splits an http(s) URL into what the jar keys cookies by.
+static bool cookieTarget(const std::wstring& url, bool& https, std::wstring& host, std::wstring& path) {
+    size_t start;
+    if (url.rfind(L"https://", 0) == 0) { https = true; start = 8; }
+    else if (url.rfind(L"http://", 0) == 0) { https = false; start = 7; }
+    else return false;
+    size_t end = url.find_first_of(L"/?#", start);
+    host = url.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+    size_t at = host.rfind(L'@');
+    if (at != std::wstring::npos) host.erase(0, at + 1);                  // user:password@
+    if (!host.empty() && host[0] != L'[') host = host.substr(0, host.find(L':')); // :port
+    path = end == std::wstring::npos ? L"/" : url.substr(end);
+    return !host.empty();
+}
+
+static JSValue js_get_cookie(JSContext* ctx, JSValueConst this_val) {
+    if (!isDocument(ctx, this_val)) return JS_UNDEFINED;
+    bool https;
+    std::wstring host, path;
+    if (!cookieTarget(bindingState(ctx)->pageUrl, https, host, path)) return JS_NewString(ctx, "");
+    std::string header = CookieJar::instance().cookieHeader(https, host, path, true);
+    return JS_NewStringLen(ctx, header.data(), header.size());
+}
+
+static JSValue js_set_cookie(JSContext* ctx, JSValueConst this_val, JSValueConst val) {
+    if (!isDocument(ctx, this_val)) return JS_UNDEFINED;
+    bool https;
+    std::wstring host, path;
+    if (!cookieTarget(bindingState(ctx)->pageUrl, https, host, path)) return JS_UNDEFINED;
+    const char* s = JS_ToCString(ctx, val);
+    if (s) CookieJar::instance().setCookie(s, https, host, path, true);
+    JS_FreeCString(ctx, s);
+    return JS_UNDEFINED;
+}
+
 // The natives behind the Storage objects kBootstrapJS builds. The first
 // argument is the kind: 0 = localStorage, 1 = sessionStorage. The area is
 // looked up from the page's origin on every call (see WebStorage.h).
@@ -1977,6 +2020,7 @@ static const JSCFunctionListEntry js_node_proto_funcs[] = {
     JS_CGETSET_DEF("parentNode", js_get_parentNode, nullptr),
     JS_CGETSET_DEF("parentElement", js_get_parentNode, nullptr),
     JS_CGETSET_DEF("readyState", js_get_readyState, nullptr),
+    JS_CGETSET_DEF("cookie", js_get_cookie, js_set_cookie),
     JS_CGETSET_DEF("body", js_get_body, nullptr),
     JS_CGETSET_DEF("head", js_get_head, nullptr),
     JS_CGETSET_DEF("documentElement", js_get_documentElement, nullptr),

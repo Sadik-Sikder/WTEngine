@@ -32,6 +32,7 @@ add_subdirectory(third_party/quickjs-ng)
 
 add_executable(WTEngine
     src/AddressBar.cpp
+    src/CookieJar.cpp
     src/CSS.cpp
     src/Engine.cpp
     src/EngineForms.cpp
