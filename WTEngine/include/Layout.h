@@ -43,6 +43,14 @@ struct BackgroundLayer {
     bool repeatX = true, repeatY = true;
 };
 
+// A length that may be `auto` - for top/right/bottom/left. `value` is in
+// pixels, or a percentage when `percent` is set.
+struct Len {
+    float value = 0;
+    bool percent = false;
+    bool isAuto = true;
+};
+
 // One box-shadow. Inset shadows are parsed but not drawn.
 struct BoxShadow {
     float x = 0, y = 0, blur = 0, spread = 0;
@@ -93,6 +101,24 @@ struct LayoutBox {
     // box shadows, first on top too.
     std::vector<BackgroundLayer> backgrounds;
     std::vector<BoxShadow> shadows;
+
+    // From positioning and overflow (see LayoutRoot::layoutBlockChild):
+    // - paintKey: boxes are stably sorted by it after layout, so it is the
+    //   paint order (and the reverse hit-test order). 0 = normal flow; a
+    //   positioned element's boxes get 2 * z-index + 1 (z-index auto = 0),
+    //   so they paint above the flow at the same z, as in CSS.
+    // - fixed: position: fixed - `y` is relative to the top of the
+    //   viewport, so the box stays put while the page scrolls.
+    // - sticky: an index into LayoutRoot::stickies, whose shift for the
+    //   current scroll position is added to `y` (see Engine::boxShift).
+    // - clipped: drawn and hit-tested only inside clip* (document
+    //   coordinates) - an ancestor's overflow other than visible.
+    int paintKey = 0;
+    bool fixed = false;
+    int sticky = -1;
+    bool clipped = false;
+    int clipX = 0, clipY = 0, clipW = 0, clipH = 0;
+
     bool rounded() const {
         for (const auto& r : radius) if (r.value > 0) return true;
         return false;
@@ -119,6 +145,21 @@ struct LayoutBox {
 
 struct LayoutRoot {
     int viewportWidth = 800;
+    int viewportHeight = 600; // for vh units, height: %, and the containing block of fixed/root-level absolute boxes
+    // Whether the last layout depended on viewportHeight - so the engine
+    // knows a change of window height needs a relayout (a width change
+    // always does).
+    bool usedViewportHeight = false;
+
+    // position: sticky elements, referred to by LayoutBox::sticky. At a
+    // scroll position, one's boxes shift down by scrollY + top - naturalTop,
+    // kept between 0 and maxShift (where it meets its parent's bottom).
+    struct Sticky {
+        int top = 0;
+        int naturalTop = 0;
+        int maxShift = 0;
+    };
+    std::vector<Sticky> stickies;
     Document* doc = nullptr;
     Node* rootNode = nullptr;
     std::vector<LayoutBox> boxes;
@@ -260,11 +301,10 @@ private:
         int marginTop = 6, marginBottom = 6, marginLeft = 0, marginRight = 0;
         int paddingTop = 6, paddingRight = 6, paddingBottom = 6, paddingLeft = 6;
         int width = -1; // -1 = auto: fill the container, same as if unset (today's only behavior)
-        // Parsed the same way as `width`, but only the exact value 0 has
-        // any effect anywhere in layout (layoutBlockChild collapses a
-        // box to zero content height regardless of its children's
-        // natural size when this is 0) - any other explicit height is
-        // parsed but intentionally ignored, same as before this existed.
+        // The used height in px (content box, or border box with
+        // box-sizing: border-box), or -1 for auto. A percentage resolves
+        // against the containing block's height when that is definite
+        // (LayoutRoot::containingHeight_), else it's auto, as in CSS.
         int height = -1;
         int borderWidth = 0;
         std::wstring borderColor;
@@ -277,6 +317,18 @@ private:
         // page's text colour and font.
         bool colorSet = false;
         bool fontSet = false;
+        // Positioning. top/right/bottom/left as written (percentages of the
+        // containing block); z-index with zAuto when it's `auto`.
+        enum class Position { Static, Relative, Absolute, Fixed, Sticky } position = Position::Static;
+        Len top, right, bottom, left;
+        int zIndex = 0;
+        bool zAuto = true;
+        // overflow other than visible, per axis: the box clips its
+        // descendants along it. (hidden/clip/auto/scroll all clip - there's
+        // no scrolling inside an element yet.)
+        bool clipX = false, clipY = false;
+        // min-/max-height in px, -1 for none/auto (resolved like height).
+        int minHeight = -1, maxHeight = -1;
         BoxSizing boxSizing = BoxSizing::ContentBox;
         int fontSize = 14;
         Display display = Display::Block;
@@ -476,4 +528,44 @@ private:
         std::vector<const CSS::Rule*> universal;
     } ruleIndex;
     void rebuildRuleIndex();
+
+    // --- Height, positioning, overflow ---------------------------------
+    // The content height of the block being laid out into, when it's
+    // definite (an explicit height, or the viewport at the root) - what
+    // height: % resolves against; -1 when it depends on the content.
+    int containingHeight_ = -1;
+    // Lengths that resolve against a height: px, %, vh/vw/vmin/vmax, em.
+    int resolveHeight(const std::wstring& v, int fontSize, int def);
+
+    // Absolute and fixed elements are laid out after their containing
+    // block - the nearest positioned ancestor's padding box, or the
+    // viewport - has its final size, so right/bottom work. Each is
+    // recorded where it's met in the flow (its static position, used when
+    // it gives no top/left) along with the context its own descendants
+    // need: the ancestors their selectors match against, and the
+    // enclosing link/form.
+    struct OutOfFlow {
+        Element* el = nullptr;
+        ComputedStyle style;
+        int staticX = 0, staticY = 0;
+        bool hasStatic = true;
+        std::vector<Element*> ancestors;
+        std::wstring href;
+        Element* form = nullptr;
+    };
+    struct ContainingBlock {
+        std::vector<OutOfFlow> pending;
+    };
+    // Innermost positioned ancestor last; [0] is the viewport.
+    std::vector<ContainingBlock*> positioned_;
+    void deferOutOfFlow(Element* e, ComputedStyle style, int staticX, int staticY, bool hasStatic);
+    void layoutOutOfFlow(ContainingBlock& cb, int cbX, int cbY, int cbW, int cbH, bool isViewport);
+    // Gives the boxes [from, boxes.size()) a positioned element's paint
+    // key (see LayoutBox::paintKey).
+    void applyPaintKey(size_t from, const ComputedStyle& style);
+    // Clips the boxes [from, to) to a rectangle along the clipped axes.
+    void clipBoxes(size_t from, size_t to, int x, int y, int w, int h, bool alongX, bool alongY);
+    // Sticky elements whose parent block is still being laid out, by
+    // level; the parent sets their maxShift when it ends.
+    std::vector<std::vector<int>> openStickies_;
 };

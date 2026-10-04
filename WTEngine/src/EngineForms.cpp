@@ -178,7 +178,7 @@ const LayoutBox* Engine::controlAt(int x, int y) const {
     for (auto it = layoutRoot.boxes.rbegin(); it != layoutRoot.boxes.rend(); ++it) {
         const auto& b = *it;
         if (b.control == LayoutBox::NoControl) continue;
-        if (docX >= b.x && docX < b.x + b.width && docY >= b.y && docY < b.y + b.height) return &b;
+        if (boxContains(b, docX, docY)) return &b;
     }
     return nullptr;
 }
@@ -359,7 +359,7 @@ Element* Engine::elementAt(int x, int y) const {
     for (auto it = layoutRoot.boxes.rbegin(); it != layoutRoot.boxes.rend(); ++it) {
         const auto& b = *it;
         if (!b.el) continue;
-        if (docX >= b.x && docX < b.x + b.width && docY >= b.y && docY < b.y + b.height) return b.el;
+        if (boxContains(b, docX, docY)) return b.el;
     }
     return nullptr;
 }
@@ -514,7 +514,7 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
             if (isPassword(b.el)) shown.assign(shown.size(), (wchar_t)0x2022); // bullet
         }
 
-        r.setClip(fx + 1, fy + 1, fw - 2, fh - 2); // long text scrolls inside the field
+        r.pushClip(fx + 1, fy + 1, fw - 2, fh - 2); // long text scrolls inside the field
         float textX = fx + kInputPad;
 
         if (focused) {
@@ -543,16 +543,16 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
             float caretX = r.measureText(shown.substr(0, editor.cursor()), kFont);
             r.drawRect(fx + kInputPad + caretX - inputScrollX, textY, 1.5f, kFont * 1.33f, ink);
         }
-        r.clearClip();
+        r.popClip();
         break;
     }
     case LayoutBox::Button: {
         drawControlFrame(r, b, fx, fy, fw, fh, kCtlBorder, b.background.empty() ? kButtonFill : parseColor(b.background));
         paintControlBackground(r, b, fx, fy, fw, fh);
-        r.setClip(fx + 1, fy + 1, fw - 2, fh - 2);
+        r.pushClip(fx + 1, fy + 1, fw - 2, fh - 2);
         float tw = r.measureText(b.text, kFont, b.bold, b.italic, b.family);
         r.drawText(fx + std::max((fw - tw) / 2, 4.0f), textY, b.text, kFont, ink, b.bold, b.italic, b.family);
-        r.clearClip();
+        r.popClip();
         break;
     }
     case LayoutBox::Checkbox: {
@@ -568,9 +568,9 @@ void Engine::drawControl(Renderer& r, const LayoutBox& b, int sy, double t) {
         // re-layout.
         drawControlFrame(r, b, fx, fy, fw, fh, openSelect == b.el ? kCtlFocus : kCtlBorder, fill);
         paintControlBackground(r, b, fx, fy, fw, fh);
-        r.setClip(fx + 1, fy + 1, fw - 2, fh - 2);
+        r.pushClip(fx + 1, fy + 1, fw - 2, fh - 2);
         if (Element* opt = selectedOption(b.el)) r.drawText(fx + kInputPad, textY, optionLabel(opt), kFont, ink, b.bold, b.italic, b.family);
-        r.clearClip();
+        r.popClip();
         break;
     }
     default:
@@ -603,8 +603,8 @@ void Engine::drawOpenSelect(Renderer& r) {
     for (size_t i = 0; i < opts.size(); i++) {
         float rowY = fy + (float)i * rowHeight;
         if (opts[i] == selected) r.drawRect(fx, rowY, fw, rowHeight, kSelection);
-        r.setClip(fx + 1, rowY + 1, fw - 2, rowHeight - 2);
+        r.pushClip(fx + 1, rowY + 1, fw - 2, rowHeight - 2);
         r.drawText(fx + kInputPad, rowY + (rowHeight - kFont) / 2, optionLabel(opts[i]), kFont, kInk);
-        r.clearClip();
+        r.popClip();
     }
 }

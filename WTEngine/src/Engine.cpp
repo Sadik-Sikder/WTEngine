@@ -589,10 +589,12 @@ static constexpr int kResizeSettleMs = 150;
 
 void Engine::onResize(int w, int h) {
     if (w == width && h == height) return;
+    // Layout depends on the width; on the height only for a page that used
+    // it (vh units, fixed elements, height: 100% down from the viewport).
     bool widthChanged = w != width;
     width = w;
     height = h;
-    if (!widthChanged) {
+    if (!widthChanged && !layoutRoot.usedViewportHeight) {
         scrollY = std::clamp(scrollY, 0, maxScroll());
         return;
     }
@@ -626,13 +628,18 @@ void Engine::doLayout() {
 
     auto layoutStart = std::chrono::steady_clock::now();
     layoutRoot.boxes.clear();
+    layoutRoot.viewportHeight = viewHeight(); // vh units, height: %, fixed boxes
     layoutRoot.layout();
     lastLayoutMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - layoutStart).count();
 
-    // Calculate document height
+    // Calculate document height. A fixed box doesn't scroll with the page,
+    // so it doesn't make it longer; clipped content only counts as far as
+    // its clip reaches.
     documentHeight = 0;
     for (const auto& b : layoutRoot.boxes) {
+        if (b.fixed) continue;
         int bottom = b.y + b.height;
+        if (b.clipped) bottom = std::min(bottom, b.clipY + b.clipH);
         if (bottom > documentHeight)
             documentHeight = bottom;
     }
@@ -725,9 +732,17 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     renderer.setPageTransform((float)topInset, zoom_);
     const int visibleHeight = viewHeight();
 
+    // Pops a box's overflow clip however its painting below ends.
+    struct ClipScope {
+        Renderer& r;
+        bool on;
+        ~ClipScope() { if (on) r.popClip(); }
+    };
+
     for (const auto& b : layoutRoot.boxes) {
 
-        int screenY = b.y - scrollY; // relative to the top of the page area
+        const int shift = boxShift(b); // fixed/sticky
+        int screenY = b.y + shift - scrollY; // relative to the top of the page area
 
         // Cull boxes outside viewport
         if (screenY + b.height < 0 || screenY > visibleHeight)
@@ -738,6 +753,16 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
         // Click hit-testing (dispatchClick/onClick) is unaffected - a
         // deliberate simplification, see Layout.h's LayoutBox comment.
         if (b.visuallyHidden) continue;
+
+        // An ancestor's overflow clip (see LayoutBox::clipped); a box that's
+        // clipped away entirely isn't drawn at all.
+        if (b.clipped) {
+            if (b.clipW <= 0 || b.clipH <= 0) continue;
+            int clipTop = b.clipY + shift - scrollY;
+            if (clipTop > visibleHeight || clipTop + b.clipH < 0) continue;
+        }
+        ClipScope clip{ renderer, b.clipped };
+        if (b.clipped) renderer.pushClip((float)b.clipX, (float)(b.clipY + shift - scrollY), (float)b.clipW, (float)b.clipH);
 
         // box-shadow, under everything else the box draws (controls too).
         paintShadows(renderer, b, (float)screenY);
@@ -822,6 +847,24 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     drawScrollbar(renderer); // window coordinates: browser UI, not zoomed
 }
 
+int Engine::boxShift(const LayoutBox& b) const {
+    if (b.fixed) return scrollY;
+    if (b.sticky >= 0 && b.sticky < (int)layoutRoot.stickies.size()) {
+        const LayoutRoot::Sticky& s = layoutRoot.stickies[b.sticky];
+        return std::clamp(scrollY + s.top - s.naturalTop, 0, std::max(s.maxShift, 0));
+    }
+    return 0;
+}
+
+bool Engine::boxContains(const LayoutBox& b, int docX, int docY) const {
+    int shift = boxShift(b);
+    int top = b.y + shift;
+    if (docX < b.x || docX >= b.x + b.width || docY < top || docY >= top + b.height) return false;
+    if (!b.clipped) return true;
+    int clipTop = b.clipY + shift;
+    return docX >= b.clipX && docX < b.clipX + b.clipW && docY >= clipTop && docY < clipTop + b.clipH;
+}
+
 // Each shadow is the box's shape moved by its offset and grown by its
 // spread (corners too), with its edge blurred. The last one listed is
 // painted first, so the first ends up on top, as in CSS. Unlike CSS, a
@@ -903,10 +946,10 @@ void Engine::paintBackgroundLayers(Renderer& renderer, const LayoutBox& b, float
         if (layer.repeatY) y0 = ty - std::ceil((ty - y) / th) * th;
         float x1 = layer.repeatX ? x + w : x0 + 1, y1 = layer.repeatY ? y + h : y0 + 1;
         if ((x1 - x0) / tw * (y1 - y0) / th > 4000) continue; // a tiny tile over a huge box: not worth it
-        renderer.setClip(x, y, w, h);
+        renderer.pushClip(x, y, w, h);
         for (float py = y0; py < y1; py += th)
             for (float px = x0; px < x1; px += tw) renderer.drawImage(px, py, tw, th, src);
-        renderer.clearClip();
+        renderer.popClip();
     }
 }
 
@@ -1013,7 +1056,7 @@ std::wstring Engine::linkAt(int x, int y, Renderer& renderer) const {
         if (b.href.empty()) continue;
         if (b.text.empty()) {
             // An image inside a link: its whole box is the link.
-            if (!b.imageSrc.empty() && docX >= b.x && docX < b.x + b.width && docY >= b.y && docY < b.y + b.height)
+            if (!b.imageSrc.empty() && boxContains(b, docX, docY))
                 return b.href;
             continue;
         }
@@ -1022,8 +1065,11 @@ std::wstring Engine::linkAt(int x, int y, Renderer& renderer) const {
         // so hit-test that area rather than the whole row.
         float fontSize = b.fontSize > 0 ? b.fontSize : 14;
         int textW = static_cast<int>(measurePageText(renderer, b.text, fontSize, b.bold, b.italic, b.family));
-        int left = b.x + 4, top = b.y + 4;
-        if (docX >= left && docX < left + textW && docY >= top && docY < top + b.height)
+        int shift = boxShift(b);
+        int left = b.x + 4, top = b.y + shift + 4;
+        bool inClip = !b.clipped || (docX >= b.clipX && docX < b.clipX + b.clipW &&
+                                     docY >= b.clipY + shift && docY < b.clipY + shift + b.clipH);
+        if (docX >= left && docX < left + textW && docY >= top && docY < top + b.height && inClip)
             return b.href;
     }
     return L"";
@@ -1039,6 +1085,7 @@ void Engine::setTopInset(int px) {
 void Engine::setBottomInset(int px) {
     if (px == bottomInset) return;
     bottomInset = px;
+    if (layoutRoot.usedViewportHeight) { doLayout(); return; } // the viewport got shorter (or taller)
     int maxScroll = std::max(documentHeight - viewHeight(), 0);
     scrollY = std::clamp(scrollY, 0, maxScroll);
 }

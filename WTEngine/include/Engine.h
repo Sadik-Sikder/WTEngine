@@ -294,6 +294,13 @@ private:
     void queueSubmit(Element* form, Element* submitter);
     void drawControl(Renderer& renderer, const LayoutBox& box, int screenY, double timeSeconds);
     void drawOpenSelect(Renderer& renderer); // draws openSelect's dropdown rows, if one is open
+    // How far a box is drawn below its layout position at the current
+    // scroll position: scrollY for a position: fixed one (so it stays put
+    // on screen), the current sticking distance for a sticky one, else 0.
+    // Everything that paints or hit-tests a box adds it to `y`.
+    int boxShift(const LayoutBox& b) const;
+    // Whether page point (docX, docY) is inside the box and its clip.
+    bool boxContains(const LayoutBox& b, int docX, int docY) const;
     // A box's box-shadows (outer ones; inset shadows aren't drawn).
     void paintShadows(Renderer& renderer, const LayoutBox& b, float screenY);
     // A box's background-image/gradient layers over the area (x, y, w, h) -

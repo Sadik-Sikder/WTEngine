@@ -10,6 +10,7 @@
 #include <cwctype>
 #include <set>
 #include <utility>
+#include <climits>
 
 std::wstring LayoutRoot::getAttr(Element* el, const std::wstring& key, const std::wstring& def) {
     if (!el) return def;
@@ -53,6 +54,7 @@ static std::wstring trimmed(const std::wstring& s) {
 // resolveLength, which each map `unit` to a pixel value against their own base.
 static bool parseNumberAndUnit(const std::wstring& v, double& value, std::wstring& unit) {
     size_t i = 0;
+    if (i < v.size() && (v[i] == L'-' || v[i] == L'+')) i++; // top: -8px, margin-left: -1rem, ...
     bool sawDigit = false;
     while (i < v.size() && ((v[i] >= L'0' && v[i] <= L'9') || v[i] == L'.')) {
         if (v[i] != L'.') sawDigit = true;
@@ -92,7 +94,24 @@ int LayoutRoot::resolveLength(const std::wstring& s, int base, int def) {
 
     if (unit.empty() || unit == L"px") return (int)std::lround(value);
     if (unit == L"%") return (int)std::lround(value * base / 100.0);
+    if (unit == L"vw") return (int)std::lround(value * viewportWidth / 100.0);
+    if (unit == L"vh" || unit == L"vmin" || unit == L"vmax") usedViewportHeight = true;
+    if (unit == L"vh") return (int)std::lround(value * viewportHeight / 100.0);
+    if (unit == L"vmin") return (int)std::lround(value * std::min(viewportWidth, viewportHeight) / 100.0);
+    if (unit == L"vmax") return (int)std::lround(value * std::max(viewportWidth, viewportHeight) / 100.0);
     return def;
+}
+
+// height/min-height/max-height: like resolveLength, but a percentage is of
+// the containing block's height - auto (`def`) when that isn't definite -
+// and em/rem work too.
+int LayoutRoot::resolveHeight(const std::wstring& s, int fontSize, int def) {
+    std::wstring v = trimmed(s);
+    double value; std::wstring unit;
+    if (!parseNumberAndUnit(v, value, unit)) return def;
+    if (unit == L"%") return containingHeight_ >= 0 ? (int)std::lround(value * containingHeight_ / 100.0) : def;
+    if (unit == L"em" || unit == L"rem") return (int)std::lround(value * fontSize);
+    return resolveLength(v, 0, def);
 }
 
 // See the declaration in Layout.h for the 1/2/3/4-value expansion rule.
@@ -280,6 +299,10 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containin
 
         ComputedStyle sv = computeStyle(e, inheritedFontSize, containingWidth, inheritedVisuallyHidden, inheritedPaint);
         if (sv.display == Display::None) continue;
+        if (sv.position == ComputedStyle::Position::Absolute || sv.position == ComputedStyle::Position::Fixed) {
+            deferOutOfFlow(e, sv, 0, 0, false); // out of the flow; no position in the line is known here
+            continue;
+        }
 
         // An image inside inline content (<a><svg>...</svg> Home</a>) sits
         // in the line like a word - never recursed into, so an <svg>'s
@@ -853,6 +876,20 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
     // the `background` shorthand and its longhands override each other in
     // whichever order they come, so each is kept with its place in the
     // cascade (`seq`) and the later one wins, property by property.
+    // top/right/bottom/left: auto, a percentage (of the containing block,
+    // applied when it's known), or a length (px, em/rem, vh/vw).
+    auto parseOffset = [&](const std::wstring& raw, int fontSize) {
+        Len out;
+        std::wstring v = lowerCase(trimmed(raw));
+        double n; std::wstring unit;
+        if (v == L"auto" || !parseNumberAndUnit(v, n, unit)) return out;
+        out.isAuto = false;
+        if (unit == L"%") { out.percent = true; out.value = (float)n; }
+        else if (unit == L"em" || unit == L"rem") out.value = (float)(n * fontSize);
+        else out.value = (float)resolveLength(v, 0, 0);
+        return out;
+    };
+
     struct Recorded { std::wstring value; int seq = -1; };
     Recorded bgShorthand, bgImage, bgSize, bgPosition, bgRepeat;
     int declSeq = 0;
@@ -999,7 +1036,44 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         else if (k == L"padding-bottom") sv.paddingBottom = resolveLength(v, containingWidth, 6);
         else if (k == L"padding-left") sv.paddingLeft = resolveLength(v, containingWidth, 6);
         else if (k == L"width") sv.width = resolveLength(v, containingWidth, -1);
-        else if (k == L"height") sv.height = resolveLength(v, containingWidth, -1);
+        else if (k == L"height") sv.height = resolveHeight(v, sv.fontSize, -1);
+        else if (k == L"min-height") sv.minHeight = resolveHeight(v, sv.fontSize, -1);
+        else if (k == L"max-height") sv.maxHeight = v == L"none" ? -1 : resolveHeight(v, sv.fontSize, -1);
+        else if (k == L"position") {
+            std::wstring p = lowerCase(trimmed(v));
+            if (p == L"relative") sv.position = ComputedStyle::Position::Relative;
+            else if (p == L"absolute") sv.position = ComputedStyle::Position::Absolute;
+            else if (p == L"fixed") sv.position = ComputedStyle::Position::Fixed;
+            else if (p == L"sticky" || p == L"-webkit-sticky") sv.position = ComputedStyle::Position::Sticky;
+            else if (p == L"static") sv.position = ComputedStyle::Position::Static;
+        }
+        else if (k == L"top" || k == L"right" || k == L"bottom" || k == L"left") {
+            Len& side = k == L"top" ? sv.top : k == L"right" ? sv.right : k == L"bottom" ? sv.bottom : sv.left;
+            side = parseOffset(v, sv.fontSize);
+        }
+        else if (k == L"inset") {
+            // 1-4 values, like margin: top, right, bottom, left.
+            std::vector<std::wstring> t = cssTokens(v);
+            if (!t.empty() && t.size() <= 4) {
+                static const int kPick[4][4] = { { 0, 0, 0, 0 }, { 0, 1, 0, 1 }, { 0, 1, 2, 1 }, { 0, 1, 2, 3 } };
+                Len* sides[4] = { &sv.top, &sv.right, &sv.bottom, &sv.left };
+                for (int i = 0; i < 4; i++) *sides[i] = parseOffset(t[kPick[t.size() - 1][i]], sv.fontSize);
+            }
+        }
+        else if (k == L"z-index") {
+            if (lowerCase(trimmed(v)) == L"auto") sv.zAuto = true;
+            else { try { sv.zIndex = std::stoi(v); sv.zAuto = false; } catch (...) {} }
+        }
+        else if (k == L"overflow" || k == L"overflow-x" || k == L"overflow-y") {
+            // "hidden", or "<x> <y>" for the shorthand. Anything but visible
+            // clips (see ComputedStyle::clipX).
+            std::vector<std::wstring> t = cssTokens(lowerCase(v));
+            if (t.empty()) return;
+            auto clips = [](const std::wstring& o) { return o != L"visible"; };
+            bool cx = clips(t[0]), cy = clips(t.size() > 1 ? t[1] : t[0]);
+            if (k != L"overflow-y") sv.clipX = cx;
+            if (k != L"overflow-x") sv.clipY = k == L"overflow" ? cy : cx;
+        }
         else if (k == L"box-sizing") {
             if (v == L"border-box") sv.boxSizing = BoxSizing::BorderBox;
             else if (v == L"content-box") sv.boxSizing = BoxSizing::ContentBox;
@@ -1641,11 +1715,22 @@ void LayoutRoot::layout() {
     // rules land. They're also on ancestorStack, so selectors like
     // "html .x" see them. (Font size still starts at 14px.)
     auto* root = static_cast<Element*>(rootNode);
+    usedViewportHeight = false;
+    stickies.clear();
+    openStickies_.assign(1, {});
+    // The viewport is the initial containing block: of height: % on <html>,
+    // and of fixed boxes and absolute ones with no positioned ancestor.
+    ContainingBlock viewport;
+    positioned_.assign(1, &viewport);
+    containingHeight_ = viewportHeight;
+
     std::vector<Element*> ancestors;
     for (Element* a = root->parent; a; a = a->parent) ancestors.insert(ancestors.begin(), a);
     TextPaint paint;
     for (Element* a : ancestors) {
-        paint = computeStyle(a, 14, viewportWidth - 20, false, paint).paint;
+        ComputedStyle s = computeStyle(a, 14, viewportWidth - 20, false, paint);
+        paint = s.paint;
+        containingHeight_ = s.height; // html { height: 100% } makes body { height: 100% } mean something
         ancestorStack.push_back(a);
     }
 
@@ -1653,9 +1738,151 @@ void LayoutRoot::layout() {
     // where most pages set their base text style. (Its font-size applies;
     // <html>'s doesn't - the base stays 14px.)
     ComputedStyle bodyStyle = computeStyle(root, 14, viewportWidth - 20, false, paint);
+    containingHeight_ = bodyStyle.height;
+    if (containingHeight_ >= 0) usedViewportHeight = true; // height: % below can come from the viewport
 
     int y = 10;
     layoutElement(root, 10, y, viewportWidth - 20, bodyStyle.fontSize, false, bodyStyle.paint);
+
+    // Sticky children of <body> stick until the end of the page.
+    for (int i : openStickies_.back())
+        stickies[i].maxShift = std::max(y - stickies[i].naturalTop - stickies[i].maxShift, 0);
+    openStickies_.clear();
+
+    containingHeight_ = viewportHeight;
+    layoutOutOfFlow(viewport, 0, 0, viewportWidth, viewportHeight, true);
+    positioned_.clear();
+
+    // A sticky element inside a flex/grid item was laid out at (0, 0) and
+    // then moved, so its recorded top is off; its boxes say where it ended
+    // up. (maxShift is a distance, which moving doesn't change.)
+    std::vector<int> stickyTop(stickies.size(), INT_MAX);
+    for (const auto& b : boxes)
+        if (b.sticky >= 0 && b.sticky < (int)stickies.size()) stickyTop[b.sticky] = std::min(stickyTop[b.sticky], b.y);
+    for (size_t i = 0; i < stickies.size(); i++)
+        if (stickyTop[i] != INT_MAX) stickies[i].naturalTop = stickyTop[i];
+
+    // Paint order: z-index (see LayoutBox::paintKey), document order within it.
+    std::stable_sort(boxes.begin(), boxes.end(),
+                     [](const LayoutBox& a, const LayoutBox& b) { return a.paintKey < b.paintKey; });
+}
+
+// --- Height, positioning, overflow ---------------------------------------------
+
+void LayoutRoot::deferOutOfFlow(Element* e, ComputedStyle style, int staticX, int staticY, bool hasStatic) {
+    if (positioned_.empty()) return; // only meaningful during layout()
+    if (style.display == Display::Inline) style.display = Display::Block; // positioned boxes are blockified
+    ContainingBlock* cb =style.position == ComputedStyle::Position::Fixed ? positioned_.front() : positioned_.back();
+    OutOfFlow item;
+    item.el = e;
+    item.style = std::move(style);
+    item.staticX = staticX;
+    item.staticY = staticY;
+    item.hasStatic = hasStatic;
+    item.ancestors = ancestorStack;
+    item.href = currentHref;
+    item.form = currentForm;
+    // Flex and grid lay an item out more than once (to measure it first);
+    // the last time is where it really is.
+    for (auto& p : cb->pending)
+        if (p.el == e) { p = std::move(item); return; }
+    cb->pending.push_back(std::move(item));
+}
+
+// Lays out the absolute/fixed elements waiting on a containing block whose
+// padding box (cbX, cbY, cbW, cbH) is now final, as CSS's rules for them:
+// - width: its own, or the space between left and right when both are set
+//   (and width is auto), or else shrink-to-fit;
+// - height: its own, or the space between top and bottom when both are set;
+// - x: left, else right (from the right edge), else where it was in the
+//   flow; y the same with top/bottom.
+// Each is laid out at (0, 0) like a flex item and moved into place; its
+// boxes go at the end of the list, painting over the flow.
+void LayoutRoot::layoutOutOfFlow(ContainingBlock& cb, int cbX, int cbY, int cbW, int cbH, bool isViewport) {
+    if (isViewport && !cb.pending.empty()) usedViewportHeight = true; // placed against the viewport's height
+    // By index: laying one out can add more (a fixed element inside it, to
+    // the viewport's list).
+    for (size_t i = 0; i < cb.pending.size(); i++) {
+        OutOfFlow p = cb.pending[i];
+        ComputedStyle& s = p.style;
+        auto resolve = [](const Len& l, int base) { return l.percent ? (int)std::lround(l.value * base / 100.0) : (int)l.value; };
+        int L = resolve(s.left, cbW), R = resolve(s.right, cbW), T = resolve(s.top, cbH), B = resolve(s.bottom, cbH);
+
+        // Its context as it was where it sat in the flow.
+        std::swap(ancestorStack, p.ancestors);
+        std::wstring savedHref = currentHref;
+        Element* savedForm = currentForm;
+        currentHref = p.href;
+        currentForm = p.form;
+        int savedCH = containingHeight_;
+        containingHeight_ = cbH;
+
+        if (s.height < 0 && !s.top.isAuto && !s.bottom.isAuto) {
+            // Stretched between top and bottom: the border box fills what's left.
+            s.boxSizing = BoxSizing::BorderBox;
+            s.height = std::max(cbH - T - B - s.marginTop - s.marginBottom, 0);
+        }
+        int available;
+        if (s.width >= 0) available = cbW;
+        else if (!s.left.isAuto && !s.right.isAuto) available = std::max(cbW - L - R, 0);
+        else available = shrinkToFitWidth(p.el, s, std::max(cbW - (s.left.isAuto ? 0 : L) - (s.right.isAuto ? 0 : R), 0));
+        // Its outer (margin box) width, to place it from the right.
+        int outer = s.width >= 0
+            ? (s.boxSizing == BoxSizing::BorderBox ? s.width : s.width + s.paddingLeft + s.paddingRight + 2 * s.borderWidth) +
+                  s.marginLeft + s.marginRight
+            : available;
+
+        int height = 0;
+        std::vector<LayoutBox> placed = layoutItemDetached(p.el, available, s, height);
+        int x = !s.left.isAuto ? cbX + L : !s.right.isAuto ? cbX + cbW - R - outer : (p.hasStatic ? p.staticX : cbX);
+        int y = !s.top.isAuto ? cbY + T : !s.bottom.isAuto ? cbY + cbH - B - height : (p.hasStatic ? p.staticY : cbY);
+
+        size_t start = boxes.size();
+        for (auto& b : placed) {
+            b.x += x;
+            b.y += y;
+            if (b.clipped) { b.clipX += x; b.clipY += y; }
+            boxes.push_back(std::move(b));
+        }
+        applyPaintKey(start, s); // a control or image has no layoutBlockChild of its own to do it
+        if (s.position == ComputedStyle::Position::Fixed && isViewport)
+            for (size_t j = start; j < boxes.size(); j++) boxes[j].fixed = true;
+
+        containingHeight_ = savedCH;
+        currentHref = savedHref;
+        currentForm = savedForm;
+        std::swap(ancestorStack, p.ancestors);
+    }
+    cb.pending.clear();
+}
+
+void LayoutRoot::applyPaintKey(size_t from, const ComputedStyle& style) {
+    if (style.position == ComputedStyle::Position::Static) return;
+    int key = style.zAuto ? 1 : 2 * style.zIndex + 1;
+    for (size_t i = from; i < boxes.size(); i++) {
+        // Boxes still in the flow take this element's key. A positioned
+        // descendant keeps its own - unless this element has an explicit
+        // z-index, which makes it a stacking context its descendants can't
+        // escape (simplified: they all share its key).
+        if (boxes[i].paintKey == 0 || !style.zAuto) boxes[i].paintKey = key;
+    }
+}
+
+void LayoutRoot::clipBoxes(size_t from, size_t to, int x, int y, int w, int h, bool alongX, bool alongY) {
+    const int kFar = 1 << 28; // "no limit" along an axis that isn't clipped
+    if (!alongX) { x = -kFar; w = 2 * kFar; }
+    if (!alongY) { y = -kFar; h = 2 * kFar; }
+    for (size_t i = from; i < to && i < boxes.size(); i++) {
+        LayoutBox& b = boxes[i];
+        if (!b.clipped) {
+            b.clipped = true;
+            b.clipX = x; b.clipY = y; b.clipW = w; b.clipH = h;
+            continue;
+        }
+        int x1 = std::max(b.clipX, x), y1 = std::max(b.clipY, y);
+        int x2 = std::min(b.clipX + b.clipW, x + w), y2 = std::min(b.clipY + b.clipH, y + h);
+        b.clipX = x1; b.clipY = y1; b.clipW = std::max(x2 - x1, 0); b.clipH = std::max(y2 - y1, 0);
+    }
 }
 
 void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, int inheritedFontSize,
@@ -1705,6 +1932,13 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
 
             ComputedStyle sv = computeStyle(e, inheritedFontSize, containingWidth, inheritedVisuallyHidden, inheritedPaint);
             if (sv.display == Display::None) continue; // this element and its subtree take no space
+
+            // Absolute/fixed: out of the flow - laid out once its containing
+            // block is (see deferOutOfFlow), from where it would have been.
+            if (sv.position == ComputedStyle::Position::Absolute || sv.position == ComputedStyle::Position::Fixed) {
+                deferOutOfFlow(e, sv, x, y, true);
+                continue;
+            }
 
             if (e->tag == L"input" || e->tag == L"button" || e->tag == L"select") {
                 flushInline();
@@ -1774,6 +2008,7 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
 
     y += sv.marginTop;
     int contentStartY = y;
+    const size_t firstBox = boxes.size(); // this element's boxes are [firstBox, end)
 
     // Reserve a background/border box now (before laying out children) so
     // it paints behind them, but only if this element actually declared
@@ -1810,30 +2045,103 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     Element* savedForm = currentForm;
     if (e->tag == L"form") currentForm = e;
 
+    // An explicit height, turned into a content height: what this element's
+    // own children resolve height: % against (definite), and its size
+    // regardless of them. min-/max-height convert the same way.
+    const int chrome = sv.paddingTop + sv.paddingBottom + 2 * sv.borderWidth;
+    auto toContent = [&](int h) { return h < 0 ? -1 : std::max(sv.boxSizing == BoxSizing::BorderBox ? h - chrome : h, 0); };
+    const int fixedHeight = toContent(sv.height);
+    int savedCH = containingHeight_;
+    containingHeight_ = fixedHeight;
+
+    // A positioned element is the containing block of the absolute
+    // elements inside it, laid out below once its own size is final.
+    const bool positioned = sv.position != ComputedStyle::Position::Static;
+    ContainingBlock containing;
+    if (positioned) positioned_.push_back(&containing);
+    openStickies_.emplace_back(); // sticky children: their limit is this element's content box
+
     int childX = boxX + sv.borderWidth + sv.paddingLeft;
+    const int contentTop = y;
     if (sv.display == Display::Grid) layoutGrid(e, childX, y, contentWidth, sv);
     else if (sv.display == Display::Flex) layoutFlex(e, childX, y, contentWidth, sv);
     else layoutElement(e, childX, y, contentWidth, sv.fontSize, sv.visuallyHidden, sv.paint);
 
     currentHref = savedHref;
     currentForm = savedForm;
+    containingHeight_ = savedCH;
 
-    // Explicit height:0 collapses this box regardless of its children's
-    // natural size - real CSS clips them via overflow:hidden; this engine
-    // has no clipping model, so it just doesn't let them push layout past
-    // here. Children's own boxes keep whatever (real, un-collapsed)
-    // positions they were laid out at - harmless as long as they're also
-    // invisible (opacity:0/visibility:hidden), which is the only realistic
-    // reason a page pairs height:0 with content still inside it.
-    if (sv.height == 0) y = contentStartY + sv.borderWidth + sv.paddingTop;
+    // The content height: its own if set, else its children's; then
+    // min-/max-height. Content taller than a set height overflows - drawn
+    // anyway unless overflow clips it (below) - but doesn't push what
+    // follows further down.
+    int contentHeight = fixedHeight >= 0 ? fixedHeight : y - contentTop;
+    if (sv.minHeight >= 0) contentHeight = std::max(contentHeight, toContent(sv.minHeight));
+    if (sv.maxHeight >= 0) contentHeight = std::min(contentHeight, toContent(sv.maxHeight));
+    y = contentTop + contentHeight;
+
+    for (int i : openStickies_.back()) // maxShift held the sticky element's height until now
+        stickies[i].maxShift = std::max(y - stickies[i].naturalTop - stickies[i].maxShift, 0);
+    openStickies_.pop_back();
 
     y += sv.paddingBottom + sv.borderWidth;
+    const int borderHeight = y - contentStartY;
+    if (bgIndex != static_cast<size_t>(-1)) boxes[bgIndex].height = borderHeight;
 
-    if (bgIndex != static_cast<size_t>(-1)) {
-        boxes[bgIndex].height = y - contentStartY;
+    // Its absolute descendants, against its padding box.
+    if (positioned) {
+        positioned_.pop_back();
+        layoutOutOfFlow(containing, boxX + sv.borderWidth, contentStartY + sv.borderWidth,
+                        outerWidth - 2 * sv.borderWidth, borderHeight - 2 * sv.borderWidth, false);
     }
 
+    // overflow: its descendants' boxes (not its own) clipped to its padding box.
+    if (sv.clipX || sv.clipY) {
+        size_t from = bgIndex != static_cast<size_t>(-1) ? bgIndex + 1 : firstBox;
+        clipBoxes(from, boxes.size(), boxX + sv.borderWidth, contentStartY + sv.borderWidth,
+                  outerWidth - 2 * sv.borderWidth, borderHeight - 2 * sv.borderWidth, sv.clipX, sv.clipY);
+    }
+
+    // position: relative - drawn moved by its offsets, but takes up its
+    // place in the flow as if it weren't. (Percentages: of the containing
+    // block's width, and of its height when that's definite.)
+    if (sv.position == ComputedStyle::Position::Relative) {
+        auto resolve = [](const Len& l, int base) { return l.percent ? (int)std::lround(l.value * std::max(base, 0) / 100.0) : (int)l.value; };
+        int dx = !sv.left.isAuto ? resolve(sv.left, containingWidth) : !sv.right.isAuto ? -resolve(sv.right, containingWidth) : 0;
+        int dy = !sv.top.isAuto ? resolve(sv.top, containingHeight_) : !sv.bottom.isAuto ? -resolve(sv.bottom, containingHeight_) : 0;
+        if (dx || dy) {
+            for (size_t i = firstBox; i < boxes.size(); i++) {
+                boxes[i].x += dx; boxes[i].y += dy;
+                if (boxes[i].clipped) { boxes[i].clipX += dx; boxes[i].clipY += dy; }
+            }
+        }
+    }
+
+    // position: sticky - in the flow, but shifted down while scrolling so
+    // its top stays `top` from the viewport's, until it meets the bottom of
+    // its parent (see Engine::boxShift). Only `top` is supported.
+    if (sv.position == ComputedStyle::Position::Sticky && !sv.top.isAuto) {
+        Sticky st;
+        st.top = sv.top.percent ? (int)std::lround(sv.top.value * viewportHeight / 100.0) : (int)sv.top.value;
+        st.naturalTop = contentStartY;
+        st.maxShift = borderHeight; // until the parent ends - see above
+        int index = (int)stickies.size();
+        stickies.push_back(st);
+        if (!openStickies_.empty()) openStickies_.back().push_back(index);
+        for (size_t i = firstBox; i < boxes.size(); i++)
+            if (boxes[i].sticky < 0) boxes[i].sticky = index;
+    }
+
+    applyPaintKey(firstBox, sv);
     y += sv.marginBottom;
+}
+
+// Moves a box laid out somewhere else (a flex/grid item laid out at 0,0)
+// into place - its overflow clip with it.
+static void moveBox(LayoutBox& b, int dx, int dy) {
+    b.x += dx;
+    b.y += dy;
+    if (b.clipped) { b.clipX += dx; b.clipY += dy; }
 }
 
 // Places `el`'s grid items (its direct element children, minus the usual
@@ -1867,6 +2175,10 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
             continue;
         ComputedStyle cs = computeStyle(ce, style.fontSize, containingWidth, style.visuallyHidden, style.paint);
         if (cs.display == Display::None) continue;
+        if (cs.position == ComputedStyle::Position::Absolute || cs.position == ComputedStyle::Position::Fixed) {
+            deferOutOfFlow(ce, cs, x, y, true); // not an item: out of the flow
+            continue;
+        }
 
         ItemPlacement p;
         p.el = ce;
@@ -2039,8 +2351,7 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
     for (size_t idx = 0; idx < placements.size(); idx++) {
         ItemPlacement& p = placements[idx];
         for (LayoutBox b : itemBoxes[idx]) { // copy: translate before appending to the real list
-            b.x += colX[p.colStart];
-            b.y += rowY[p.rowStart];
+            moveBox(b, colX[p.colStart], rowY[p.rowStart]);
             boxes.push_back(std::move(b));
         }
     }
@@ -2095,6 +2406,10 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
             continue;
         ComputedStyle cs = computeStyle(ce, style.fontSize, containingWidth, style.visuallyHidden, style.paint);
         if (cs.display == Display::None) continue;
+        if (cs.position == ComputedStyle::Position::Absolute || cs.position == ComputedStyle::Position::Fixed) {
+            deferOutOfFlow(ce, cs, x, y, true); // not an item: out of the flow
+            continue;
+        }
         if (cs.display == Display::Inline) cs.display = Display::Block; // a flex item is always block-level, like a grid item
         items.push_back(ce);
         itemStyles.push_back(std::move(cs));
@@ -2135,8 +2450,7 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
                 // FlexStart and Stretch: crossOffset stays 0 (stretch already filled the width above)
             }
             for (LayoutBox b : scratch) {
-                b.x += x + crossOffset;
-                b.y += cursorY;
+                moveBox(b, x + crossOffset, cursorY);
                 boxes.push_back(std::move(b));
             }
             cursorY += localY;
@@ -2281,13 +2595,13 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
             // (if it made one) to the line's height, rather than by
             // re-flowing its content into the extra space - a box with no
             // background/border has nothing visible to stretch anyway.
-            if (style.alignItems == AlignItems::Stretch) {
+            // Only an item whose height is auto stretches, as in CSS.
+            if (style.alignItems == AlignItems::Stretch && itemStyles[i].height < 0) {
                 for (auto& box : itemBoxes[k]) if (box.el == items[i]) { box.height = lineHeight; break; }
             }
 
             for (LayoutBox box : itemBoxes[k]) {
-                box.x += cursorX;
-                box.y += lineY + itemY;
+                moveBox(box, cursorX, lineY + itemY);
                 boxes.push_back(std::move(box));
             }
             cursorX += itemWidths[i] + colGap + extraGap;

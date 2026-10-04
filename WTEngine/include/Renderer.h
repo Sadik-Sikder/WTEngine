@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <algorithm>
 
 struct Color {
     float r, g, b, a;
@@ -107,6 +108,26 @@ public:
     virtual void setClip(float x, float y, float w, float h) = 0;
     virtual void clearClip() = 0;
 
+    // Nested clipping: pushClip restricts drawing to a rectangle within the
+    // current one (their intersection), popClip returns to the one before.
+    // Page content uses these, so a control's own clip stays inside an
+    // overflow: hidden ancestor's.
+    void pushClip(float x, float y, float w, float h) {
+        if (!clips_.empty()) {
+            const Clip& c = clips_.back();
+            float x2 = std::min(x + w, c.x + c.w), y2 = std::min(y + h, c.y + c.h);
+            x = std::max(x, c.x); y = std::max(y, c.y);
+            w = std::max(x2 - x, 0.0f); h = std::max(y2 - y, 0.0f);
+        }
+        clips_.push_back({ x, y, w, h });
+        setClip(x, y, w, h);
+    }
+    void popClip() {
+        if (!clips_.empty()) clips_.pop_back();
+        if (clips_.empty()) clearClip();
+        else setClip(clips_.back().x, clips_.back().y, clips_.back().w, clips_.back().h);
+    }
+
     // Page zoom. Until resetTransform(), everything drawn is scaled by
     // `scale` and moved down by `offsetY` window pixels (the space above
     // the page): callers draw in page coordinates. Text is rasterized at
@@ -114,4 +135,8 @@ public:
     // beginFrame() also resets it.
     virtual void setPageTransform(float offsetY, float scale) = 0;
     virtual void resetTransform() = 0;
+
+private:
+    struct Clip { float x, y, w, h; };
+    std::vector<Clip> clips_; // see pushClip
 };
