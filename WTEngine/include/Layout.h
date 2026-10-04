@@ -41,6 +41,14 @@ struct LayoutBox {
     // from computeStyle as a default, so an author rule can override it.
     std::wstring color;
     bool bold = false;
+    bool italic = false;
+    const std::wstring* family = nullptr; // installed font face; nullptr = the default (see TextPaint)
+    // text-decoration, drawn across `decorationWidth` - the word, plus the
+    // space after it when the next word on the line is decorated the same
+    // way, so an underlined phrase gets one continuous line.
+    bool underline = false;
+    bool lineThrough = false;
+    int decorationWidth = 0;
 
     // A border, drawn as a hollow frame (see Engine::render) so an
     // unset `background` still shows whatever's behind the box through
@@ -91,7 +99,7 @@ struct LayoutRoot {
 
     // Returns the pixel width of `text` at `fontSize`. Used to wrap text; a
     // rough per-character estimate is used when unset.
-    std::function<float(const std::wstring&, int, bool bold)> measureText;
+    std::function<float(const std::wstring&, int, bool bold, bool italic, const std::wstring* family)> measureText;
 
     // Resolves an <img>'s raw `src`, fetching/decoding (and caching) it if
     // not already cached, and returns its natural pixel size via (outW,
@@ -107,11 +115,30 @@ private:
     // the same way. `vars` is shared, not copied, between an element and
     // the descendants that don't change any custom property - a new layer
     // is only made where one does.
+    enum class TextAlign { Left, Center, Right };
+    enum class TextTransform { None, Uppercase, Lowercase, Capitalize };
     struct TextPaint {
         std::wstring color;
         bool bold = false;
         std::shared_ptr<const CSSVars> vars;
+        bool italic = false;
+        // The installed font face font-family resolved to (see resolveFontFamily),
+        // or nullptr for the default. Points into a set of interned names, so
+        // copying it per word costs nothing.
+        const std::wstring* family = nullptr;
+        TextAlign align = TextAlign::Left;
+        // line-height: a multiple of the font size (lineHeight >= 0), a fixed
+        // pixel height (lineHeightPx >= 0), or neither for "normal".
+        float lineHeight = -1;
+        int lineHeightPx = -1;
+        // text-decoration. Not inherited in CSS, but an ancestor's decoration
+        // is drawn through its descendants' text, which comes to the same.
+        bool underline = false;
+        bool lineThrough = false;
+        TextTransform transform = TextTransform::None;
     };
+    // The height a line of `fontSize` text needs under this line-height.
+    static int lineBand(const TextPaint& p, int fontSize);
 
     // `inheritedFontSize` is the size to use for `el`'s own direct text, and
     // the default for its children's font-size unless they set their own -
@@ -131,7 +158,11 @@ private:
     // there's no single obviously-right base to multiply), and fall back
     // to `def` like any other unrecognized unit.
     int resolveLength(const std::wstring& s, int base, int def);
-    float textWidth(const std::wstring& text, int fontSize, bool bold = false);
+    float textWidth(const std::wstring& text, int fontSize, bool bold = false, bool italic = false,
+                    const std::wstring* family = nullptr);
+    float textWidth(const std::wstring& text, int fontSize, const TextPaint& p) {
+        return textWidth(text, fontSize, p.bold, p.italic, p.family);
+    }
 
     // One word of flowing inline content (from a text node, or from an
     // inline-level element like <a>/<b> flattened into its container's
@@ -151,6 +182,13 @@ private:
         // `marginRight` add space around it within the line.
         std::shared_ptr<const LayoutBox> image;
         int marginLeft = 0, marginRight = 0;
+        // Whether whitespace separated this item from the one before it in
+        // the HTML - only then does it get a space ("<em>x</em>," has none).
+        bool spaceBefore = true;
+        // A marker for whitespace with no word after it in its text node
+        // ("Hello " or a lone " " between elements): the next item, from
+        // wherever it comes, then gets a space before it.
+        bool isSpace = false;
     };
     // Splits `text` on whitespace, appending one InlineItem per word.
     void appendWords(const std::wstring& text, int fontSize, const std::wstring& href,
@@ -158,7 +196,9 @@ private:
                       const TextPaint& paint);
     void collectInline(Element* el, int inheritedFontSize, int containingWidth, std::vector<InlineItem>& out,
                         bool inheritedVisuallyHidden, const TextPaint& inheritedPaint);
-    void layoutInlineRun(const std::vector<InlineItem>& items, int x, int& y, int containingWidth);
+    // `align` is the text-align of the block the run belongs to.
+    void layoutInlineRun(const std::vector<InlineItem>& items, int x, int& y, int containingWidth,
+                         TextAlign align = TextAlign::Left);
 
     // The subset of an element's cascaded style that layout cares about -
     // computed once per element and shared by both plain elements and form

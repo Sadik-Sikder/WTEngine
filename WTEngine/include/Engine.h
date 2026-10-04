@@ -174,7 +174,8 @@ private:
     // zoomed size the renderer rasterizes it at (see drawText), scaled back
     // by the zoom. Layout wraps with this, so words don't crowd together
     // when the zoomed glyphs come out a little wider than plain scaling.
-    float measurePageText(Renderer& r, const std::wstring& text, float fontSize, bool bold) const;
+    float measurePageText(Renderer& r, const std::wstring& text, float fontSize, bool bold,
+                          bool italic = false, const std::wstring* family = nullptr) const;
     // Window point -> page point (layout coordinates, scroll included).
     // False above the page (over the address bar).
     bool toPage(int x, int y, int& pageX, int& pageY) const;

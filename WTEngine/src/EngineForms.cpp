@@ -65,11 +65,19 @@ namespace {
         return first;
     }
 
+    // An <option>'s text, whitespace collapsed and trimmed - as browsers
+    // show it, and use it as the value when there's no value attribute.
     std::wstring optionLabel(const Element* optionEl) {
+        std::wstring out;
         for (auto& child : optionEl->children) {
-            if (child->type == Node::TEXT) return static_cast<TextNode*>(child.get())->text;
+            if (child->type != Node::TEXT) continue;
+            for (wchar_t c : static_cast<TextNode*>(child.get())->text) {
+                if (!iswspace(c)) out.push_back(c);
+                else if (!out.empty() && out.back() != L' ') out.push_back(L' ');
+            }
         }
-        return L"";
+        if (!out.empty() && out.back() == L' ') out.pop_back();
+        return out;
     }
 
     std::wstring optionValue(const Element* optionEl) {

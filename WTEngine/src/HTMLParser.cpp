@@ -167,9 +167,10 @@ std::shared_ptr<Element> HTMLParser::parseElement() {
         return elem;
     }
 
-    // parse children until </name>
+    // parse children until </name>. Whitespace isn't skipped: it becomes
+    // part of the text nodes (see parseText), since "<b>a</b> <i>b</i>" and
+    // "<b>a</b><i>b</i>" lay out differently.
     while (true) {
-        skipSpace();
         if (pos >= s.size()) break;
         if (skipMarkup()) continue;
         if (startsWith(L"</")) {
@@ -199,11 +200,15 @@ std::wstring HTMLParser::parseText() {
     while (pos < s.size() && s[pos] != L'<') {
         out.push_back(s[pos++]);
     }
-    // trim
+    // Whitespace at either end collapses to one space rather than being
+    // dropped, so layout can tell "<em>x</em>," (no gap) from "<em>x</em> ,"
+    // - and text that's only whitespace becomes " ". (Whitespace between
+    // words is kept as is; layout splits on it anyway.)
     size_t a = 0, b = out.size();
     while (a < b && iswspace(out[a])) a++;
     while (b > a && iswspace(out[b - 1])) b--;
-    return decodeEntities(out.substr(a, b - a));
+    if (a == b) return out.empty() ? L"" : L" ";
+    return (a > 0 ? L" " : L"") + decodeEntities(out.substr(a, b - a)) + (b < out.size() ? L" " : L"");
 }
 
 std::shared_ptr<Node> HTMLParser::parseNode() {
@@ -261,7 +266,6 @@ std::shared_ptr<Document> HTMLParser::parse(const std::wstring& html) {
     // rather than dropped, so e.g. `el.innerHTML = "plain text"` works.
     std::vector<std::shared_ptr<Node>> top;
     while (pos < s.size()) {
-        skipSpace();
         if (skipMarkup()) continue;
         if (pos < s.size() && s[pos] == L'<') {
             if (pos + 1 < s.size() && s[pos + 1] == L'/') { // stray end

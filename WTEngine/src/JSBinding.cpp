@@ -1264,9 +1264,14 @@ static std::vector<Element*> optionsOf(Element* selectEl) {
 static std::wstring optionValueOf(Element* opt) {
     auto it = opt->attrs.find(L"value");
     if (it != opt->attrs.end()) return it->second;
-    std::wstring text;
+    std::wstring text, out;
     gatherText(opt, text);
-    return text;
+    for (wchar_t c : text) { // whitespace collapsed and trimmed, as browsers do
+        if (!iswspace(c)) out.push_back(c);
+        else if (!out.empty() && out.back() != L' ') out.push_back(L' ');
+    }
+    if (!out.empty() && out.back() == L' ') out.pop_back();
+    return out;
 }
 
 static JSValue js_get_value(JSContext* ctx, JSValueConst this_val) {

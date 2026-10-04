@@ -215,8 +215,8 @@ Engine::Engine(int w, int h)
     : width(w), height(h) {
     layoutRoot.viewportWidth = width;
     layoutRoot.hover = &hoverSet;
-    layoutRoot.measureText = [this](const std::wstring& text, int fontSize, bool bold) {
-        return measurer ? measurePageText(*measurer, text, (float)fontSize, bold)
+    layoutRoot.measureText = [this](const std::wstring& text, int fontSize, bool bold, bool italic, const std::wstring* family) {
+        return measurer ? measurePageText(*measurer, text, (float)fontSize, bold, italic, family)
                         : text.size() * fontSize * 0.55f;
     };
     layoutRoot.loadImage = [this](const std::wstring& src, int& w, int& h) {
@@ -756,8 +756,8 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
         if (boxIndex < findHighlights_.size()) {
             float fs = b.fontSize > 0 ? (float)b.fontSize : 14;
             for (const auto& [span, current] : findHighlights_[boxIndex]) {
-                float x0 = measurePageText(renderer, b.text.substr(0, span.start), fs, b.bold);
-                float x1 = measurePageText(renderer, b.text.substr(0, span.end), fs, b.bold);
+                float x0 = measurePageText(renderer, b.text.substr(0, span.start), fs, b.bold, b.italic, b.family);
+                float x1 = measurePageText(renderer, b.text.substr(0, span.end), fs, b.bold, b.italic, b.family);
                 renderer.drawRect(b.x + 4 + x0, (float)screenY + 2, x1 - x0, fs + 6,
                                   current ? Color{ 1.0f, 0.60f, 0.15f, 1 } : Color{ 1.0f, 0.93f, 0.35f, 1 });
             }
@@ -766,14 +766,21 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
         // Draw text. An empty color means black; links arrive already
         // colored blue by layout (computeStyle), unless CSS overrode it.
         if (!b.text.empty()) {
-            renderer.drawText(
-                b.x + 4,
-                screenY + 4,
-                b.text,
-                b.fontSize > 0 ? b.fontSize : 14,
-                b.color.empty() ? Color{ 0, 0, 0, 1 } : parseColor(b.color),
-                b.bold
-            );
+            float fs = b.fontSize > 0 ? (float)b.fontSize : 14;
+            Color ink = b.color.empty() ? Color{ 0, 0, 0, 1 } : parseColor(b.color);
+            float textTop = (float)screenY + 4;
+            renderer.drawText(b.x + 4, textTop, b.text, fs, ink, b.bold, b.italic, b.family);
+
+            // text-decoration, in the text's colour. Text is drawn from the
+            // top of its line cell, where the baseline sits about 1.08 em
+            // down in Segoe UI (close enough for other faces): an underline
+            // just below that, a line-through about a third of an em above.
+            if (b.underline || b.lineThrough) {
+                float thickness = std::max(1.0f, std::round(fs / 14));
+                float w = (float)std::max(b.decorationWidth, 0);
+                if (b.underline) renderer.drawRect(b.x + 4, std::round(textTop + fs * 1.15f), w, thickness, ink);
+                if (b.lineThrough) renderer.drawRect(b.x + 4, std::round(textTop + fs * 0.72f), w, thickness, ink);
+            }
         }
     }
 
@@ -893,7 +900,7 @@ std::wstring Engine::linkAt(int x, int y, Renderer& renderer) const {
         // Text is drawn at (x + 4, y + 4) and is only as wide as its glyphs,
         // so hit-test that area rather than the whole row.
         float fontSize = b.fontSize > 0 ? b.fontSize : 14;
-        int textW = static_cast<int>(measurePageText(renderer, b.text, fontSize, b.bold));
+        int textW = static_cast<int>(measurePageText(renderer, b.text, fontSize, b.bold, b.italic, b.family));
         int left = b.x + 4, top = b.y + 4;
         if (docX >= left && docX < left + textW && docY >= top && docY < top + b.height)
             return b.href;
@@ -1086,10 +1093,11 @@ void Engine::clearFind() {
     findHighlights_.clear();
 }
 
-float Engine::measurePageText(Renderer& r, const std::wstring& text, float fontSize, bool bold) const {
-    if (zoom_ == 1.0f) return r.measureText(text, fontSize, bold);
+float Engine::measurePageText(Renderer& r, const std::wstring& text, float fontSize, bool bold,
+                               bool italic, const std::wstring* family) const {
+    if (zoom_ == 1.0f) return r.measureText(text, fontSize, bold, italic, family);
     float pixelSize = std::max(std::round(fontSize * zoom_), 1.0f); // the size OpenGLRenderer::drawText rasterizes at
-    return r.measureText(text, pixelSize, bold) / zoom_;
+    return r.measureText(text, pixelSize, bold, italic, family) / zoom_;
 }
 
 bool Engine::toPage(int x, int y, int& pageX, int& pageY) const {

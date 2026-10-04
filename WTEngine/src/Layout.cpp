@@ -122,9 +122,82 @@ void LayoutRoot::parseBoxShorthand(const std::wstring& v, int containingWidth, i
     }
 }
 
-float LayoutRoot::textWidth(const std::wstring& text, int fontSize, bool bold) {
-    if (measureText) return measureText(text, fontSize, bold);
+float LayoutRoot::textWidth(const std::wstring& text, int fontSize, bool bold, bool italic, const std::wstring* family) {
+    if (measureText) return measureText(text, fontSize, bold, italic, family);
     return text.size() * fontSize * 0.55f; // rough fallback
+}
+
+int LayoutRoot::lineBand(const TextPaint& p, int fontSize) {
+    if (p.lineHeightPx >= 0) return p.lineHeightPx;
+    if (p.lineHeight >= 0) return (int)std::lround(p.lineHeight * fontSize);
+    return fontSize + 8; // "normal"
+}
+
+// --- font-family --------------------------------------------------------
+
+// Every font family installed on this machine, lowercased - read once.
+static const std::set<std::wstring>& installedFonts() {
+    static const std::set<std::wstring> fonts = [] {
+        std::set<std::wstring> out;
+        HDC dc = GetDC(nullptr);
+        LOGFONTW lf{};
+        lf.lfCharSet = DEFAULT_CHARSET;
+        EnumFontFamiliesExW(dc, &lf, [](const LOGFONTW* f, const TEXTMETRICW*, DWORD, LPARAM param) -> int {
+            std::wstring name = f->lfFaceName;
+            if (!name.empty() && name[0] != L'@') { // '@' = vertical-writing variant
+                for (auto& c : name) c = (wchar_t)towlower(c);
+                reinterpret_cast<std::set<std::wstring>*>(param)->insert(name);
+            }
+            return 1;
+        }, reinterpret_cast<LPARAM>(&out), 0);
+        ReleaseDC(nullptr, dc);
+        return out;
+    }();
+    return fonts;
+}
+
+// A pointer that stays valid (and equal) for every use of the same name.
+static const std::wstring* internFont(const std::wstring& face) {
+    static std::set<std::wstring> pool;
+    return &*pool.insert(face).first;
+}
+
+// The face to draw a CSS font-family list with: the first entry that's
+// installed, with the generic families mapped to Windows' usual choices.
+// Web fonts (@font-face) aren't loaded, so a page's own font falls through
+// to the next entry, which is what browsers show while it downloads.
+// nullptr means the default (Segoe UI) - also for "sans-serif".
+static const std::wstring* resolveFontFamily(const std::wstring& list, bool& recognized) {
+    static const std::pair<const wchar_t*, const wchar_t*> kGeneric[] = {
+        { L"sans-serif", nullptr }, { L"system-ui", nullptr }, { L"-apple-system", nullptr },
+        { L"blinkmacsystemfont", nullptr }, { L"ui-sans-serif", nullptr },
+        { L"serif", L"Times New Roman" }, { L"ui-serif", L"Georgia" },
+        { L"monospace", L"Consolas" }, { L"ui-monospace", L"Consolas" },
+        { L"cursive", L"Comic Sans MS" }, { L"fantasy", L"Impact" },
+    };
+    recognized = false;
+    std::wstring name;
+    auto tryName = [&](std::wstring n) -> const std::wstring* {
+        n = trimmed(n);
+        if (n.size() >= 2 && (n[0] == L'"' || n[0] == L'\'')) n = n.substr(1, n.size() - 2);
+        std::wstring lower = n;
+        for (auto& c : lower) c = (wchar_t)towlower(c);
+        for (const auto& [generic, face] : kGeneric) {
+            if (lower == generic) { recognized = true; return face ? internFont(face) : nullptr; }
+        }
+        if (lower == L"segoe ui") { recognized = true; return nullptr; }
+        if (installedFonts().count(lower)) { recognized = true; return internFont(n); }
+        return nullptr;
+    };
+    size_t start = 0;
+    while (start <= list.size()) {
+        size_t comma = list.find(L',', start);
+        if (comma == std::wstring::npos) comma = list.size();
+        const std::wstring* face = tryName(list.substr(start, comma - start));
+        if (recognized) return face;
+        start = comma + 1;
+    }
+    return nullptr;
 }
 
 // Tags treated as inline-level by default: their text/content flows onto
@@ -134,7 +207,9 @@ float LayoutRoot::textWidth(const std::wstring& text, int fontSize, bool bold) {
 static bool isInlineTag(const std::wstring& tag) {
     static const std::wstring kInline[] = {
         L"a", L"span", L"b", L"strong", L"i", L"em", L"u", L"small", L"code",
-        L"sub", L"sup", L"mark", L"label", L"abbr", L"cite", L"q", L"img", L"svg"
+        L"sub", L"sup", L"mark", L"label", L"abbr", L"cite", L"q", L"img", L"svg",
+        L"del", L"ins", L"s", L"strike", L"kbd", L"samp", L"var", L"dfn", L"tt", L"time",
+        L"bdi", L"bdo", L"big", L"font", L"data", L"output"
     };
     for (const auto& t : kInline) if (tag == t) return true;
     return false;
@@ -148,11 +223,29 @@ void LayoutRoot::appendWords(const std::wstring& text, int fontSize, const std::
                               const TextPaint& paint) {
     size_t i = 0;
     while (i < text.size()) {
-        while (i < text.size() && iswspace(text[i])) i++;
+        bool space = false;
+        while (i < text.size() && iswspace(text[i])) { i++; space = true; }
         size_t start = i;
         while (i < text.size() && !iswspace(text[i])) i++;
-        if (start == i) break;
-        out.push_back({ text.substr(start, i - start), fontSize, href, owner, false, visuallyHidden, paint });
+        if (start == i) {
+            // Trailing whitespace: carried to whatever item comes next.
+            if (space) {
+                InlineItem marker{ L"", fontSize, href, owner, false, visuallyHidden, paint };
+                marker.isSpace = true;
+                out.push_back(std::move(marker));
+            }
+            break;
+        }
+        std::wstring word = text.substr(start, i - start);
+        switch (paint.transform) { // text-transform changes what's drawn (and measured), not the DOM
+        case TextTransform::Uppercase: for (auto& c : word) c = (wchar_t)towupper(c); break;
+        case TextTransform::Lowercase: for (auto& c : word) c = (wchar_t)towlower(c); break;
+        case TextTransform::Capitalize: word[0] = (wchar_t)towupper(word[0]); break;
+        case TextTransform::None: break;
+        }
+        InlineItem item{ std::move(word), fontSize, href, owner, false, visuallyHidden, paint };
+        item.spaceBefore = space; // false for the first word of text glued to what precedes it
+        out.push_back(std::move(item));
     }
 }
 
@@ -213,18 +306,20 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containin
 // items on the same line can differ in font size, href, or owning element
 // (e.g. a link in the middle of a sentence). Generalizes what layoutText
 // used to do for a single homogeneously-styled string.
-void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, int& y, int containingWidth) {
+void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, int& y, int containingWidth,
+                                 TextAlign align) {
     const int textInset = 4; // Engine::render draws text 4px inside its box
     const int paraGap = 6;
     const float maxWidth = (float)std::max(containingWidth - 2 * textInset, 40);
 
-    struct Placed { InlineItem item; float offset; };
+    struct Placed { InlineItem item; float offset; float width; };
     std::vector<Placed> line;
     float lineWidth = 0;
 
     auto emitLine = [&]() {
         if (line.empty()) return;
-        // Text sits in a band as tall as its largest font plus 8px. An image
+        // Text sits in a band as tall as the line-height of its largest font
+        // (fontSize + 8 for "normal"), each word centred in it. An image
         // taller than that makes the line taller, and the text then sits at
         // the line's bottom - roughly where a browser puts an image on the
         // baseline. An image shorter than the text is centred on it, the
@@ -232,31 +327,54 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
         int textBand = 0, imageHeight = 0;
         for (auto& p : line) {
             if (p.item.image) imageHeight = std::max(imageHeight, p.item.image->height);
-            else textBand = std::max(textBand, p.item.fontSize + 8);
+            else textBand = std::max(textBand, lineBand(p.item.paint, p.item.fontSize));
         }
         int lineHeight = std::max(textBand, imageHeight);
         int textTop = y + lineHeight - textBand;
-        for (auto& p : line) {
+
+        // text-align: the whole line moves by its leftover width.
+        float shift = 0;
+        if (align == TextAlign::Center) shift = std::max(maxWidth - lineWidth, 0.0f) / 2;
+        else if (align == TextAlign::Right) shift = std::max(maxWidth - lineWidth, 0.0f);
+
+        for (size_t i = 0; i < line.size(); i++) {
+            const Placed& p = line[i];
+            int left = x + (int)std::lround(p.offset + shift);
             if (p.item.image) {
                 LayoutBox box = *p.item.image;
                 // + textInset: offsets are measured where text is drawn, 4px
                 // inside its box - without it an image hugs the word before it.
-                box.x = x + (int)std::lround(p.offset) + textInset + p.item.marginLeft;
+                box.x = left + textInset + p.item.marginLeft;
                 box.y = textBand > box.height ? textTop + (textBand - box.height) / 2 : y + lineHeight - box.height;
                 box.href = p.item.href;
                 boxes.push_back(box);
                 continue;
             }
+            const TextPaint& paint = p.item.paint;
+            int natural = p.item.fontSize + 8; // the box Engine::render draws text 4px into
             LayoutBox box;
-            box.x = x + (int)std::lround(p.offset);
-            box.y = textTop;
-            box.width = (int)std::lround(textWidth(p.item.word, p.item.fontSize, p.item.paint.bold));
-            box.height = textBand;
+            box.x = left;
+            box.y = textTop + (textBand - natural) / 2;
+            box.width = (int)std::lround(p.width);
+            box.height = natural;
             box.text = p.item.word;
             box.href = p.item.href;
             box.fontSize = p.item.fontSize;
-            box.color = p.item.paint.color;
-            box.bold = p.item.paint.bold;
+            box.color = paint.color;
+            box.bold = paint.bold;
+            box.italic = paint.italic;
+            box.family = paint.family;
+            box.underline = paint.underline;
+            box.lineThrough = paint.lineThrough;
+            // A decoration runs on through the space to the next word when
+            // that word is decorated the same way, so a phrase gets one line.
+            box.decorationWidth = box.width;
+            if ((paint.underline || paint.lineThrough) && i + 1 < line.size()) {
+                const Placed& next = line[i + 1];
+                if (!next.item.image && next.item.paint.underline == paint.underline &&
+                    next.item.paint.lineThrough == paint.lineThrough && next.item.paint.color == paint.color)
+                    box.decorationWidth = (int)std::lround(next.offset - p.offset);
+            }
             box.el = p.item.owner;
             box.visuallyHidden = p.item.visuallyHidden;
             boxes.push_back(box);
@@ -266,23 +384,35 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
         lineWidth = 0;
     };
 
+    // A run of nothing but whitespace (between two blocks, say) takes no space.
+    if (std::all_of(items.begin(), items.end(), [](const InlineItem& i) { return i.isSpace; })) return;
+
+    // Whether the HTML had whitespace before the next item (see InlineItem).
+    bool pendingSpace = false;
+    auto gapBefore = [&](const InlineItem& item) {
+        bool gap = !line.empty() && (item.spaceBefore || pendingSpace);
+        pendingSpace = false;
+        return gap ? textWidth(L" ", item.fontSize, item.paint) : 0.0f;
+    };
+
     for (const auto& raw : items) {
-        if (raw.isBreak) { emitLine(); continue; }
+        if (raw.isSpace) { pendingSpace = true; continue; }
+        if (raw.isBreak) { emitLine(); pendingSpace = false; continue; }
 
         if (raw.image) {
-            // Wraps like a word, with the same gap before it; never split.
+            // Wraps like a word; never split.
             float w = (float)(raw.marginLeft + raw.image->width + raw.marginRight);
-            float spaceWidth = line.empty() ? 0 : textWidth(L" ", raw.fontSize, raw.paint.bold);
+            float spaceWidth = gapBefore(raw);
             if (!line.empty() && lineWidth + spaceWidth + w > maxWidth) emitLine();
             float offset = line.empty() ? 0 : lineWidth + spaceWidth;
             lineWidth = offset + w;
-            line.push_back({ raw, offset });
+            line.push_back({ raw, offset, w });
             continue;
         }
         if (raw.word.empty()) continue;
 
         InlineItem item = raw;
-        float wordWidth = textWidth(item.word, item.fontSize, item.paint.bold);
+        float wordWidth = textWidth(item.word, item.fontSize, item.paint);
 
         // A word wider than the line on its own gets broken by characters,
         // one fragment per line, before whatever's left of it (now short
@@ -290,22 +420,24 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
         while (wordWidth > maxWidth && item.word.size() > 1) {
             if (!line.empty()) emitLine();
             size_t n = 1;
-            while (n < item.word.size() && textWidth(item.word.substr(0, n + 1), item.fontSize, item.paint.bold) <= maxWidth) n++;
+            while (n < item.word.size() && textWidth(item.word.substr(0, n + 1), item.fontSize, item.paint) <= maxWidth) n++;
             InlineItem fragment = item;
             fragment.word = item.word.substr(0, n);
-            line.push_back({ fragment, 0 });
+            float fragmentWidth = textWidth(fragment.word, fragment.fontSize, fragment.paint);
+            line.push_back({ fragment, 0, fragmentWidth });
+            lineWidth = fragmentWidth;
             emitLine();
             item.word.erase(0, n);
-            wordWidth = textWidth(item.word, item.fontSize, item.paint.bold);
+            wordWidth = textWidth(item.word, item.fontSize, item.paint);
         }
         if (item.word.empty()) continue;
 
-        float spaceWidth = line.empty() ? 0 : textWidth(L" ", item.fontSize, item.paint.bold);
+        float spaceWidth = gapBefore(item);
         if (!line.empty() && lineWidth + spaceWidth + wordWidth > maxWidth) emitLine();
 
         float offset = line.empty() ? 0 : lineWidth + spaceWidth;
         lineWidth = offset + wordWidth;
-        line.push_back({ item, offset });
+        line.push_back({ item, offset, wordWidth });
     }
     emitLine();
 
@@ -339,9 +471,14 @@ static std::vector<std::wstring> cssTokens(const std::wstring& v) {
 }
 
 // First piece of text inside an element (used for <button> labels).
+// (Trimmed; whitespace-only text is skipped.)
 static std::wstring firstText(Element* el) {
     for (auto& child : el->children) {
-        if (child->type == Node::TEXT) return static_cast<TextNode*>(child.get())->text;
+        if (child->type == Node::TEXT) {
+            std::wstring t = trimmed(static_cast<TextNode*>(child.get())->text);
+            if (!t.empty()) return t;
+            continue;
+        }
         std::wstring t = firstText(static_cast<Element*>(child.get()));
         if (!t.empty()) return t;
     }
@@ -428,10 +565,32 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
     // color/font-weight: inherited, then the tag's own default (what a
     // browser's built-in stylesheet would give it), then author rules.
     sv.paint = inheritedPaint;
-    if (e->tag == L"a" && e->attrs.count(L"href")) sv.paint.color = L"#0033cc";
-    if (e->tag == L"b" || e->tag == L"strong" || e->tag == L"th" ||
-        (e->tag.size() == 2 && e->tag[0] == L'h' && e->tag[1] >= L'1' && e->tag[1] <= L'6'))
+    const std::wstring& tag = e->tag;
+    if (tag == L"a" && e->attrs.count(L"href")) { sv.paint.color = L"#0033cc"; sv.paint.underline = true; }
+    if (tag == L"b" || tag == L"strong" || tag == L"th" ||
+        (tag.size() == 2 && tag[0] == L'h' && tag[1] >= L'1' && tag[1] <= L'6'))
         sv.paint.bold = true;
+    if (tag == L"em" || tag == L"i" || tag == L"cite" || tag == L"var" || tag == L"dfn" || tag == L"address")
+        sv.paint.italic = true;
+    if (tag == L"code" || tag == L"pre" || tag == L"kbd" || tag == L"samp" || tag == L"tt") {
+        static const std::wstring* mono = internFont(L"Consolas");
+        sv.paint.family = mono;
+    }
+    if (tag == L"u" || tag == L"ins") sv.paint.underline = true;
+    if (tag == L"s" || tag == L"strike" || tag == L"del") sv.paint.lineThrough = true;
+    if (tag == L"center" || tag == L"th") sv.paint.align = TextAlign::Center;
+
+    // line-height as written; resolved once the cascade is done, since a
+    // percentage or em is of this element's final font size.
+    std::wstring lineHeightRaw;
+
+    // Sets font-family from a CSS family list; a list naming nothing
+    // installed (only web fonts, say) leaves the inherited face.
+    auto applyFamily = [&](const std::wstring& list) {
+        bool recognized;
+        const std::wstring* face = resolveFontFamily(list, recognized);
+        if (recognized) sv.paint.family = face;
+    };
 
     auto applyDecl = [&](const std::wstring& k, const std::wstring& v) {
         if (k == L"background-color") {
@@ -455,6 +614,83 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             Color unused;
             if (v == L"initial" || v == L"unset") sv.paint.color.clear();
             else if (tryParseColor(v, unused)) sv.paint.color = v;
+        }
+        else if (k == L"font-style") {
+            if (v == L"italic" || v.rfind(L"oblique", 0) == 0) sv.paint.italic = true;
+            else if (v == L"normal" || v == L"initial" || v == L"unset") sv.paint.italic = false;
+        }
+        else if (k == L"font-family") {
+            if (v != L"inherit") applyFamily(v);
+        }
+        else if (k == L"text-align") {
+            std::wstring a = lowerCase(trimmed(v));
+            if (a == L"center" || a == L"-webkit-center") sv.paint.align = TextAlign::Center;
+            else if (a == L"right" || a == L"end" || a == L"-webkit-right") sv.paint.align = TextAlign::Right;
+            else if (a == L"left" || a == L"start" || a == L"justify" || a == L"-webkit-left") sv.paint.align = TextAlign::Left;
+        }
+        else if (k == L"line-height") lineHeightRaw = trimmed(v);
+        else if (k == L"text-decoration" || k == L"text-decoration-line") {
+            // Only the line part matters here; a value naming no line
+            // (just a color or style) leaves it alone.
+            bool any = false, underline = false, through = false;
+            for (const auto& tok : cssTokens(lowerCase(v))) {
+                if (tok == L"underline") { underline = true; any = true; }
+                else if (tok == L"line-through") { through = true; any = true; }
+                else if (tok == L"none" || tok == L"overline") any = true;
+            }
+            if (any) { sv.paint.underline = underline; sv.paint.lineThrough = through; }
+        }
+        else if (k == L"text-transform") {
+            std::wstring t = lowerCase(trimmed(v));
+            if (t == L"uppercase") sv.paint.transform = TextTransform::Uppercase;
+            else if (t == L"lowercase") sv.paint.transform = TextTransform::Lowercase;
+            else if (t == L"capitalize") sv.paint.transform = TextTransform::Capitalize;
+            else if (t == L"none") sv.paint.transform = TextTransform::None;
+        }
+        else if (k == L"font") {
+            // [style] [variant] [weight] <size>[/<line-height>] <family list>.
+            // Everything not given resets to normal, as the shorthand does.
+            static const wchar_t* kSizeWords[] = { L"xx-small", L"x-small", L"small", L"medium", L"large",
+                                                   L"x-large", L"xx-large", L"smaller", L"larger" };
+            std::wstring s = trimmed(v);
+            size_t i = 0;
+            bool italic = false, bold = false, found = false;
+            while (i < s.size()) {
+                while (i < s.size() && iswspace(s[i])) i++;
+                size_t start = i;
+                while (i < s.size() && !iswspace(s[i])) i++;
+                std::wstring tok = s.substr(start, i - start);
+                std::wstring size = tok.substr(0, tok.find(L'/'));
+                double num; std::wstring unit;
+                bool isSize = (parseNumberAndUnit(size, num, unit) && !unit.empty()) ||
+                              std::any_of(std::begin(kSizeWords), std::end(kSizeWords), [&](const wchar_t* w) { return size == w; });
+                if (isSize) {
+                    found = true;
+                    sv.fontSize = resolveFontSize(size, inheritedFontSize, sv.fontSize);
+                    size_t slash = tok.find(L'/');
+                    if (slash == std::wstring::npos) {
+                        // "16px / 1.5": the line height can follow after spaces.
+                        size_t j = i;
+                        while (j < s.size() && iswspace(s[j])) j++;
+                        if (j < s.size() && s[j] == L'/') {
+                            j++;
+                            while (j < s.size() && iswspace(s[j])) j++;
+                            size_t lhStart = j;
+                            while (j < s.size() && !iswspace(s[j])) j++;
+                            lineHeightRaw = s.substr(lhStart, j - lhStart);
+                            i = j;
+                        }
+                        else lineHeightRaw = L"normal";
+                    }
+                    else lineHeightRaw = tok.substr(slash + 1);
+                    applyFamily(s.substr(i));
+                    break;
+                }
+                if (tok == L"italic" || tok.rfind(L"oblique", 0) == 0) italic = true;
+                else if (tok == L"bold" || tok == L"bolder") bold = true;
+                else { try { if (std::stoi(tok) >= 600) bold = true; } catch (...) {} }
+            }
+            if (found) { sv.paint.italic = italic; sv.paint.bold = bold; }
         }
         else if (k == L"font-weight") {
             if (v == L"bold" || v == L"bolder") sv.paint.bold = true;
@@ -724,6 +960,22 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         if (decl->second.find(L"var(") == std::wstring::npos) { applyDecl(k, decl->second); continue; }
         std::wstring value;
         if (substituteVars(decl->second, sv.paint.vars.get(), value)) applyDecl(k, value);
+    }
+
+    if (!lineHeightRaw.empty()) {
+        // A plain number is inherited as a multiple (each descendant applies
+        // it to its own font size); px, em and % become a fixed pixel height
+        // here, which is what descendants then inherit - as in CSS.
+        double n; std::wstring unit;
+        if (lineHeightRaw == L"normal" || lineHeightRaw == L"initial") {
+            sv.paint.lineHeight = -1; sv.paint.lineHeightPx = -1;
+        }
+        else if (parseNumberAndUnit(lineHeightRaw, n, unit) && n >= 0) {
+            if (unit.empty()) { sv.paint.lineHeight = (float)n; sv.paint.lineHeightPx = -1; }
+            else if (unit == L"px") { sv.paint.lineHeightPx = (int)std::lround(n); sv.paint.lineHeight = -1; }
+            else if (unit == L"em" || unit == L"rem") { sv.paint.lineHeightPx = (int)std::lround(n * sv.fontSize); sv.paint.lineHeight = -1; }
+            else if (unit == L"%") { sv.paint.lineHeightPx = (int)std::lround(n * sv.fontSize / 100); sv.paint.lineHeight = -1; }
+        }
     }
 
     sv.visuallyHidden = inheritedVisuallyHidden || sv.opacity <= 0.0f || sv.visibilityHidden;
@@ -1012,6 +1264,7 @@ void LayoutRoot::appendImage(Element* e, int containingWidth, const ComputedStyl
     // element gets by default (ComputedStyle) is for blocks, not this.
     item.marginLeft = style.marginLeft;
     item.marginRight = style.marginRight;
+    item.spaceBefore = false; // a gap before it comes only from whitespace in the HTML (an isSpace marker)
     out.push_back(std::move(item));
 }
 
@@ -1058,8 +1311,13 @@ void LayoutRoot::layout() {
         ancestorStack.push_back(a);
     }
 
+    // <body>'s own rules too - body { font-family: ...; color: ...; } is
+    // where most pages set their base text style. (Its font-size applies;
+    // <html>'s doesn't - the base stays 14px.)
+    ComputedStyle bodyStyle = computeStyle(root, 14, viewportWidth - 20, false, paint);
+
     int y = 10;
-    layoutElement(root, 10, y, viewportWidth - 20, 14, false, paint);
+    layoutElement(root, 10, y, viewportWidth - 20, bodyStyle.fontSize, false, bodyStyle.paint);
 }
 
 void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, int inheritedFontSize,
@@ -1074,7 +1332,7 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
     std::vector<InlineItem> pendingInline;
     auto flushInline = [&]() {
         if (!pendingInline.empty()) {
-            layoutInlineRun(pendingInline, x, y, containingWidth);
+            layoutInlineRun(pendingInline, x, y, containingWidth, inheritedPaint.align);
             pendingInline.clear();
         }
     };

@@ -7,6 +7,7 @@
 #include <GLFW/glfw3.h>
 #include <string>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <vector>
 #include <deque>
@@ -63,8 +64,10 @@ public:
 
     void drawRect(float x, float y, float w, float h, Color color) override;
     void drawText(float x, float y, const std::wstring& text,
-        float fontSize, Color color, bool bold = false) override;
-    float measureText(const std::wstring& text, float fontSize, bool bold = false) override;
+        float fontSize, Color color, bool bold = false, bool italic = false,
+        const std::wstring* family = nullptr) override;
+    float measureText(const std::wstring& text, float fontSize, bool bold = false,
+        bool italic = false, const std::wstring* family = nullptr) override;
     void drawRoundedRect(float x, float y, float w, float h, const float radii[4], Color color) override;
     void drawRoundedFrame(float x, float y, float w, float h, const float radii[4],
                           float thickness, Color color) override;
@@ -89,9 +92,11 @@ private:
     float transformOffsetY = 0; // see setPageTransform
     float transformScale = 1;
     HDC measureDC = nullptr;
-    std::map<std::pair<int, bool>, HFONT> measureFonts; // (font size, bold) -> font, for measureText
+    // (size, bold, italic, face) -> font, for measureText
+    std::map<std::tuple<int, bool, bool, std::wstring>, HFONT> measureFonts;
     bool comInitialized = false; // whether we own COM's lifetime (needed for WIC image decoding)
-    const TextTexture& getOrCreateTextTexture(const std::wstring& text, float fontSize, bool bold);
+    const TextTexture& getOrCreateTextTexture(const std::wstring& text, float fontSize, bool bold,
+                                              bool italic, const std::wstring* family);
     void evictStaleTextTextures();
 
     // --- Background image loading -------------------------------------

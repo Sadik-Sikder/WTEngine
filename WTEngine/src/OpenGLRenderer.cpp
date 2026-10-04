@@ -98,7 +98,7 @@ OpenGLRenderer::~OpenGLRenderer() {
     decodeQueue->cv.notify_all();
     for (auto& t : decodeThreads) if (t.joinable()) t.join();
 
-    for (auto& [size, font] : measureFonts) DeleteObject(font);
+    for (auto& [key, font] : measureFonts) DeleteObject(font);
     if (measureDC) DeleteDC(measureDC);
     for (auto& [key, tex] : textCache) {
         glDeleteTextures(1, &tex.id);
@@ -114,8 +114,18 @@ OpenGLRenderer::~OpenGLRenderer() {
 // brightness becomes its alpha. Drawing that texture with glColor4f(color)
 // then tints the (already anti-aliased) glyph shapes to any color we want,
 // without baking a color into the cached texture itself.
-const TextTexture& OpenGLRenderer::getOrCreateTextTexture(const std::wstring& text, float fontSize, bool bold) {
-    std::wstring key = text + L"@" + std::to_wstring((int)fontSize) + (bold ? L"b" : L"");
+// The GDI font for a size/weight/style/face (nullptr or empty face = Segoe UI).
+static HFONT createFont(int size, bool bold, bool italic, const std::wstring* family) {
+    const wchar_t* face = family && !family->empty() ? family->c_str() : L"Segoe UI";
+    return CreateFontW(-size, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL, italic ? TRUE : FALSE, FALSE, FALSE,
+                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
+}
+
+const TextTexture& OpenGLRenderer::getOrCreateTextTexture(const std::wstring& text, float fontSize, bool bold,
+                                                          bool italic, const std::wstring* family) {
+    std::wstring key = text + L"@" + std::to_wstring((int)fontSize) + (bold ? L"b" : L"") + (italic ? L"i" : L"");
+    if (family && !family->empty()) key += L"|" + *family;
     auto it = textCache.find(key);
     if (it != textCache.end()) {
         it->second.lastUsedFrame = frameNumber;
@@ -125,14 +135,14 @@ const TextTexture& OpenGLRenderer::getOrCreateTextTexture(const std::wstring& te
     HDC screenDC = GetDC(nullptr);
     HDC memDC = CreateCompatibleDC(screenDC);
 
-    HFONT font = CreateFontW(
-        -(int)fontSize, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HFONT font = createFont((int)fontSize, bold, italic, family);
     HFONT oldFont = (HFONT)SelectObject(memDC, font);
 
     SIZE sz{ 1, 1 };
     GetTextExtentPoint32W(memDC, text.c_str(), (int)text.size(), &sz);
+    // Italic glyphs lean past their advance width, which is all the extent
+    // measures - leave room on the right so the last one isn't clipped.
+    if (italic) sz.cx += (LONG)std::ceil(fontSize / 4);
     int texW = std::max(1, (int)sz.cx);
     int texH = std::max(1, (int)sz.cy);
 
@@ -254,7 +264,7 @@ void OpenGLRenderer::drawRect(float x, float y, float w, float h, Color color) {
 }
 
 void OpenGLRenderer::drawText(float x, float y, const std::wstring& text,
-    float fontSize, Color color, bool bold) {
+    float fontSize, Color color, bool bold, bool italic, const std::wstring* family) {
     if (text.empty()) return;
 
     // Under a zoom (setPageTransform), rasterize at the size the text will
@@ -262,7 +272,7 @@ void OpenGLRenderer::drawText(float x, float y, const std::wstring& text,
     // coordinates - the transform scales it back up 1:1 - so zoomed text
     // is sharp instead of a stretched texture.
     float pixelSize = std::round(fontSize * transformScale);
-    const TextTexture& tex = getOrCreateTextTexture(text, std::max(pixelSize, 1.0f), bold);
+    const TextTexture& tex = getOrCreateTextTexture(text, std::max(pixelSize, 1.0f), bold, italic, family);
     float w = tex.width / transformScale;
     float h = tex.height / transformScale;
     if (transformScale != 1.0f) {
@@ -564,20 +574,16 @@ bool OpenGLRenderer::preloadImage(const std::wstring& url, int& outWidth, int& o
 
 // Measures with the same font the textures are rasterized with, but without
 // creating a texture (layout measures many strings that are never drawn).
-float OpenGLRenderer::measureText(const std::wstring& text, float fontSize, bool bold) {
+float OpenGLRenderer::measureText(const std::wstring& text, float fontSize, bool bold,
+                                  bool italic, const std::wstring* family) {
     if (text.empty()) return 0;
 
     if (!measureDC) measureDC = CreateCompatibleDC(nullptr);
 
     int size = (int)fontSize;
-    auto it = measureFonts.find({ size, bold });
-    if (it == measureFonts.end()) {
-        HFONT font = CreateFontW(
-            -size, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        it = measureFonts.emplace(std::make_pair(size, bold), font).first;
-    }
+    auto key = std::make_tuple(size, bold, italic, family ? *family : std::wstring());
+    auto it = measureFonts.find(key);
+    if (it == measureFonts.end()) it = measureFonts.emplace(key, createFont(size, bold, italic, family)).first;
 
     HFONT old = (HFONT)SelectObject(measureDC, it->second);
     SIZE sz{ 0, 0 };

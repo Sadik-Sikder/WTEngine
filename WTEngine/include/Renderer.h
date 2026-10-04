@@ -22,12 +22,15 @@ public:
     virtual void endFrame() = 0;
 
     virtual void drawRect(float x, float y, float w, float h, Color color) = 0;
-    // `bold` selects the bold weight of the same face; measureText must be
-    // given the same flag the text will be drawn with, since bold glyphs
-    // are wider.
+    // `bold`/`italic` select the weight and style; `family` is an installed
+    // font's face name (nullptr or empty = Segoe UI, the default). measureText
+    // must be given the same font the text will be drawn with, since glyph
+    // widths differ between them.
     virtual void drawText(float x, float y, const std::wstring& text,
-        float fontSize, Color color, bool bold = false) = 0;
-    virtual float measureText(const std::wstring& text, float fontSize, bool bold = false) = 0;
+        float fontSize, Color color, bool bold = false, bool italic = false,
+        const std::wstring* family = nullptr) = 0;
+    virtual float measureText(const std::wstring& text, float fontSize, bool bold = false,
+        bool italic = false, const std::wstring* family = nullptr) = 0;
 
     // A filled rectangle with rounded corners, and a rounded border ring
     // `thickness` wide just inside the rectangle's edge. `radii` are the
