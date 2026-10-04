@@ -53,6 +53,10 @@ public:
     // away (never blocks) while still loading, or if it failed.
     virtual bool preloadImage(const std::wstring& url, int& outWidth, int& outHeight) = 0;
 
+    // The page now being shown, sent as the referrer of the images it
+    // loads (sites that block hotlinking check it). Set on each page load.
+    virtual void setPageUrl(const std::wstring& /*url*/) {}
+
     // Bumped each time a background image load finishes and is uploaded.
     // The caller polls this to know when to re-layout so a box sized from
     // an image's natural size (preloadImage returned false at layout time)

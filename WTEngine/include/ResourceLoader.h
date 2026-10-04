@@ -17,8 +17,10 @@ public:
     // Starts fetching every URL in `urls`, replacing any previous batch:
     // the old batch's requests are skipped if they hadn't been sent yet,
     // and otherwise their results are simply never read (the same
-    // abandon-in-place pattern as PageLoader).
-    void start(std::vector<std::wstring> urls);
+    // abandon-in-place pattern as PageLoader). `dest` (script or style) and
+    // `referrer` (the page) set the request headers - see FetchOptions.
+    void start(std::vector<std::wstring> urls, FetchDest dest = FetchDest::Script,
+               const std::wstring& referrer = L"");
 
     size_t count() const { return slots_.size(); }
 

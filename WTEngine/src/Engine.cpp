@@ -235,6 +235,7 @@ void Engine::setRenderer(Renderer* r) {
 
 void Engine::loadHTML(const std::wstring& html, const std::wstring& baseUrl) {
     pageBaseUrl = baseUrl;
+    if (measurer) measurer->setPageUrl(baseUrl); // the referrer for this page's images
     parseAndBuild(html);
     beginScripts();
     doLayout(); // first paint: DOM + inline <style> rules + whatever beginScripts ran synchronously (see its comment) - external resources fill in over the next few frames via pollResources
@@ -324,7 +325,7 @@ void Engine::beginScripts() {
             scriptTasks_.push_back(std::move(task));
         }
     }
-    scriptLoader_.start(std::move(urls));
+    scriptLoader_.start(std::move(urls), FetchDest::Script, pageBaseUrl);
     advanceScripts();
 }
 
@@ -516,7 +517,7 @@ void Engine::parseAndBuild(const std::wstring& html) {
             styleTasks_.push_back(task);
             urls.push_back(resolved);
         }
-        styleLoader_.start(std::move(urls));
+        styleLoader_.start(std::move(urls), FetchDest::Style, pageBaseUrl);
     }
     else {
         styleLoader_.start({});

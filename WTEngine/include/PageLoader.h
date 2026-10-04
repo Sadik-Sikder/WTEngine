@@ -29,7 +29,10 @@ public:
     // - the same "a new load wins" behavior a real browser has for
     // navigating away mid-load. `kind` is carried through unchanged to
     // poll()'s result.
-    void start(const std::wstring& url, const std::string* postBody, NavigationKind kind);
+    // `referrer`: the page a link or form on it led here from (empty for a
+    // typed URL, Reload, ...) - sent as Referer, as browsers do.
+    void start(const std::wstring& url, const std::string* postBody, NavigationKind kind,
+               const std::wstring& referrer = L"");
 
     // Abandons whatever's in flight without starting a new one - for a
     // navigation that bypasses this loader entirely (Back/Forward, which

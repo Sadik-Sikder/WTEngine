@@ -23,8 +23,23 @@ enum class FetchPriority {
     Image = 3,
 };
 
+// What a request is for. Sets the Accept and Sec-Fetch-* headers a browser
+// would send for it - servers that block bots look for them.
+enum class FetchDest {
+    Document, // a page the user navigates to
+    Script,
+    Style,
+    Image,
+    Empty,    // JS fetch()
+};
+
 struct FetchOptions {
     FetchPriority priority = FetchPriority::Fetch;
+    FetchDest dest = FetchDest::Empty;
+    // The page that asked for it: sent as Referer (trimmed as browsers do)
+    // and used for Sec-Fetch-Site. Empty for a navigation with no page
+    // behind it, like a typed URL.
+    std::wstring referrer;
     // If set, called (on the network thread - so it must be thread-safe,
     // e.g. checking a weak_ptr) right before the request is sent. Returning
     // false skips it; `onDone` then gets a failure ("Cancelled"). Lets a
@@ -59,6 +74,7 @@ struct HttpRequest {
     std::string method = "GET";
     std::vector<std::pair<std::string, std::string>> headers;
     std::string body;
+    std::wstring referrer; // the page making the request - see FetchOptions::referrer
 };
 struct HttpResponse {
     bool ok = false;         // false = network error (see `error`); true even for a 404

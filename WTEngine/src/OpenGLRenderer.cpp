@@ -318,6 +318,8 @@ void OpenGLRenderer::startLoadingImage(const std::wstring& url) {
     std::weak_ptr<DecodeQueue> weak = decodeQueue;
     FetchOptions options;
     options.priority = FetchPriority::Image; // behind the page's own scripts/stylesheets on a busy host
+    options.dest = FetchDest::Image;
+    options.referrer = pageUrl_;
     fetchBytesAsync(url, std::move(options), [weak, url](bool ok, std::vector<unsigned char> bytes) {
         std::shared_ptr<DecodeQueue> queue = weak.lock();
         if (!queue) return; // the renderer is gone

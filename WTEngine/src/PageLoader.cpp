@@ -1,7 +1,8 @@
 // PageLoader.cpp
 #include "PageLoader.h"
 
-void PageLoader::start(const std::wstring& url, const std::string* postBody, NavigationKind kind) {
+void PageLoader::start(const std::wstring& url, const std::string* postBody, NavigationKind kind,
+                       const std::wstring& referrer) {
     auto pending = std::make_shared<Pending>();
     pending->url = url;
     pending->kind = kind;
@@ -16,6 +17,8 @@ void PageLoader::start(const std::wstring& url, const std::string* postBody, Nav
     std::weak_ptr<Pending> weak = pending;
     FetchOptions options;
     options.priority = FetchPriority::Page;
+    options.dest = FetchDest::Document;
+    options.referrer = referrer;
     options.stillWanted = [weak] { return !weak.expired(); };
     fetchPageAsync(url, postBody, std::move(options), [weak](FetchResult res) {
         std::shared_ptr<Pending> p = weak.lock();

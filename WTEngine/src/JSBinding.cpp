@@ -1452,6 +1452,7 @@ static JSValue js_native_fetch(JSContext* ctx, JSValueConst /*this_val*/, int ar
         }
     }
     req.body = wideToUtf8(argStr(ctx, argc, argv, 3));
+    req.referrer = state->pageUrl;
 
     if (req.url.empty())
         return JS_ThrowTypeError(ctx, "Failed to fetch: unsupported or invalid URL");

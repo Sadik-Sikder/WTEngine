@@ -75,6 +75,7 @@ public:
                    const float* radii = nullptr) override;
     bool preloadImage(const std::wstring& url, int& outWidth, int& outHeight) override;
     int imageGeneration() const override { return imageGen; }
+    void setPageUrl(const std::wstring& url) override { pageUrl_ = url; }
     void setClip(float x, float y, float w, float h) override;
     void clearClip() override;
     void setPageTransform(float offsetY, float scale) override;
@@ -131,6 +132,7 @@ private:
     std::mutex uploadMutex;
     std::vector<PendingImageUpload> pendingUploads; // guarded by uploadMutex
     int imageGen = 0; // bumped each time an upload completes; lets Engine know to re-layout
+    std::wstring pageUrl_; // the referrer for image requests - see setPageUrl
 
     const ImageTexture& getOrCreateImageTexture(const std::wstring& url);
     void startLoadingImage(const std::wstring& url);

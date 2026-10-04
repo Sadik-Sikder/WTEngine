@@ -1,7 +1,7 @@
 // ResourceLoader.cpp
 #include "ResourceLoader.h"
 
-void ResourceLoader::start(std::vector<std::wstring> urls) {
+void ResourceLoader::start(std::vector<std::wstring> urls, FetchDest dest, const std::wstring& referrer) {
     // Dropping the old slots is what abandons the previous batch.
     slots_.clear();
     slots_.reserve(urls.size());
@@ -14,6 +14,8 @@ void ResourceLoader::start(std::vector<std::wstring> urls) {
         std::weak_ptr<Slot> weak = slot;
         FetchOptions options;
         options.priority = FetchPriority::Blocking;
+        options.dest = dest;
+        options.referrer = referrer;
         options.stillWanted = [weak] { return !weak.expired(); };
         fetchPageAsync(std::move(url), nullptr, std::move(options), [weak](FetchResult res) {
             std::shared_ptr<Slot> s = weak.lock();

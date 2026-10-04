@@ -290,17 +290,110 @@ static void fillRawResponse(http::response<http::string_body>& res, RawResponse&
 // entry here overrides a default of the same name (e.g. Content-Type).
 using HeaderList = std::vector<std::pair<std::string, std::string>>;
 
+// --- Browser-like request headers ---------------------------------------------
+// Many sites (and the firewalls in front of them) answer requests that
+// don't look like a browser's with 403 Forbidden. What makes the
+// difference is the set of headers every browser sends - an Accept and
+// Sec-Fetch-* that match what the request is for, Accept-Language, a
+// Referer - so requests carry those. (Measured: with them, Best Buy,
+// Medium and Quora load where they didn't before.)
+//
+// The User-Agent stays WTEngine's own, deliberately. Claiming to be Chrome
+// was tried and made things worse: the TLS handshake still isn't Chrome's,
+// and firewalls that compare the two (AWS WAF on Amazon) then serve a JS
+// challenge instead of the page, while it unblocked nothing the headers
+// above hadn't. (Accept-Encoding stays "gzip, deflate" - Brotli isn't
+// decoded. Pages behind Cloudflare/DataDome bot checks - Etsy, Stack
+// Overflow - still refuse: those need a real browser's TLS and JS.)
+
+static const char* kUserAgent = "WTEngine/0.1";
+
+// The Windows display language as an Accept-Language list, e.g.
+// "bn-BD,bn;q=0.9,en-US;q=0.8,en;q=0.7" - English always comes last, as a
+// fallback most sites have.
+static const std::string& acceptLanguage() {
+    static const std::string value = [] {
+        wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
+        std::string locale = GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH) ? wideToUtf8(name) : "en-US";
+        std::string lang = locale.substr(0, locale.find('-'));
+        if (lang == "en") return locale == "en-US" ? std::string("en-US,en;q=0.9") : locale + ",en;q=0.9,en-US;q=0.8";
+        return locale + "," + lang + ";q=0.9,en-US;q=0.8,en;q=0.7";
+    }();
+    return value;
+}
+
+// The registrable part of a host, roughly: its last two labels, or three
+// when the last two look like a country's second level ("bbc.co.uk").
+// Good enough to tell same-site from cross-site for Sec-Fetch-Site.
+static std::wstring siteOf(const std::wstring& host) {
+    size_t last = host.rfind(L'.');
+    if (last == std::wstring::npos) return host;
+    size_t second = host.rfind(L'.', last - 1);
+    if (second == std::wstring::npos) return host;
+    bool countrySecondLevel = host.size() - last - 1 == 2 && last - second - 1 <= 3;
+    if (countrySecondLevel) {
+        size_t third = host.rfind(L'.', second - 1);
+        return third == std::wstring::npos ? host : host.substr(third + 1);
+    }
+    return host.substr(second + 1);
+}
+
+static std::wstring originOf(const UrlParts& p) {
+    bool defaultPort = p.port == (p.https ? 443 : 80);
+    return std::wstring(p.https ? L"https://" : L"http://") + p.host + (defaultPort ? L"" : L":" + std::to_wstring(p.port));
+}
+
 // Builds the request for one hop. `keepAlive` false sends "Connection:
 // close", for a connection that won't be pooled.
 static http::request<http::string_body> buildRequest(const UrlParts& parts, http::verb method,
-                                                     const std::string& body, const char* accept,
+                                                     const std::string& body, FetchDest dest,
+                                                     const std::wstring& referrer,
                                                      const HeaderList& extraHeaders, bool keepAlive) {
     http::request<http::string_body> req{method, wideToUtf8(parts.pathAndQuery), 11};
     req.set(http::field::host, wideToUtf8(parts.host));
-    req.set(http::field::user_agent, "WTEngine/0.1");
-    if (accept) req.set(http::field::accept, accept); // "text/html" for a page, unset for an image
-    req.set(http::field::accept_encoding, "gzip, deflate"); // decompressBody (fillRawResponse) handles both - see its comment
     req.set(http::field::connection, keepAlive ? "keep-alive" : "close"); // keep-alive: see ConnectionPool above
+    req.set(http::field::user_agent, kUserAgent);
+    if (dest == FetchDest::Document) req.set("Upgrade-Insecure-Requests", "1");
+
+    const char* accept = "*/*";
+    const char* destName = "empty";
+    const char* mode = "cors";
+    switch (dest) {
+    case FetchDest::Document:
+        accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8";
+        destName = "document"; mode = "navigate"; break;
+    case FetchDest::Script: destName = "script"; mode = "no-cors"; break;
+    case FetchDest::Style: accept = "text/css,*/*;q=0.1"; destName = "style"; mode = "no-cors"; break;
+    case FetchDest::Image:
+        accept = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8";
+        destName = "image"; mode = "no-cors"; break;
+    case FetchDest::Empty: break;
+    }
+    req.set(http::field::accept, accept);
+
+    // Sec-Fetch-Site and Referer, from the page that made the request. The
+    // Referer follows Chrome's default policy (strict-origin-when-cross-
+    // origin): the full URL to the same origin, just the origin elsewhere,
+    // nothing from https to http.
+    UrlParts from;
+    bool hasReferrer = !referrer.empty() && crackUrl(referrer, from);
+    const char* site = "none";
+    if (hasReferrer) {
+        if (originOf(from) == originOf(parts)) site = "same-origin";
+        else if (from.https == parts.https && siteOf(from.host) == siteOf(parts.host)) site = "same-site";
+        else site = "cross-site";
+    }
+    req.set("Sec-Fetch-Site", site);
+    req.set("Sec-Fetch-Mode", mode);
+    if (dest == FetchDest::Document) req.set("Sec-Fetch-User", "?1");
+    req.set("Sec-Fetch-Dest", destName);
+    if (hasReferrer && !(from.https && !parts.https)) {
+        std::wstring value = std::string(site) == "same-origin" ? referrer.substr(0, referrer.find(L'#')) : originOf(from) + L"/";
+        req.set(http::field::referer, wideToUtf8(value));
+    }
+
+    req.set(http::field::accept_encoding, "gzip, deflate"); // decompressBody (fillRawResponse) handles both - see its comment
+    req.set(http::field::accept_language, acceptLanguage());
     if (!body.empty()) req.set(http::field::content_type, "application/x-www-form-urlencoded");
     for (const auto& [name, value] : extraHeaders) req.set(name, value);
     if (!body.empty() || method == http::verb::post || method == http::verb::put || method == http::verb::patch) {
@@ -562,7 +655,8 @@ net::awaitable<std::unique_ptr<Connection>> openConnection(const UrlParts& parts
 // What a request needs besides its URL and body.
 struct RequestSpec {
     http::verb method = http::verb::get;
-    const char* accept = nullptr;
+    FetchDest dest = FetchDest::Empty; // what it's for - see buildRequest
+    std::wstring referrer;             // the page that asked for it
     HeaderList headers;
     bool errorOnHttpStatus = true; // 4xx/5xx is a failure (pages, resources, images) vs a normal response (fetch())
     FetchPriority priority = FetchPriority::Fetch;
@@ -648,7 +742,7 @@ private:
         // fetch() may legitimately wait on a slow API; everything else
         // keeps the original page-load deadline.
         auto deadline = std::chrono::seconds(spec.priority == FetchPriority::Fetch ? 30 : 10);
-        http::request<http::string_body> req = buildRequest(parts, spec.method, body, spec.accept, spec.headers, true);
+        http::request<http::string_body> req = buildRequest(parts, spec.method, body, spec.dest, spec.referrer, spec.headers, true);
         RawResponse out;
         bool keepAlive = false;
         std::chrono::seconds keepAliveTimeout{};
@@ -699,7 +793,8 @@ net::awaitable<void> runPage(std::wstring url, std::string body, bool isPost, Fe
         RequestSpec spec;
         spec.method = isPost ? http::verb::post : http::verb::get;
         // "text/html" for a top-level page; a script/stylesheet is whatever it is.
-        spec.accept = options.priority == FetchPriority::Page ? "text/html" : "*/*";
+        spec.dest = options.dest;
+        spec.referrer = std::move(options.referrer);
         spec.priority = options.priority;
         spec.stillWanted = std::move(options.stillWanted);
         RawResponse raw = co_await NetworkThread::instance().fetch(url, std::move(body), std::move(spec));
@@ -726,6 +821,8 @@ net::awaitable<void> runBytes(std::wstring url, FetchOptions options,
     } else {
         RequestSpec spec;
         spec.priority = options.priority;
+        spec.dest = options.dest;
+        spec.referrer = std::move(options.referrer);
         spec.stillWanted = std::move(options.stillWanted);
         RawResponse raw = co_await NetworkThread::instance().fetch(url, std::string(), std::move(spec));
         if (raw.ok) {
@@ -759,7 +856,8 @@ net::awaitable<void> runHttp(HttpRequest request, std::function<void(HttpRespons
     } else {
         RequestSpec spec;
         spec.method = method;
-        spec.accept = "*/*";
+        spec.dest = FetchDest::Empty;
+        spec.referrer = std::move(request.referrer);
         spec.headers = std::move(request.headers);
         spec.errorOnHttpStatus = false;
         spec.priority = FetchPriority::Fetch;

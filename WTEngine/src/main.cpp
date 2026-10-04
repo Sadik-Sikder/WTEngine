@@ -59,6 +59,7 @@ struct App {
     AddressBar bar;
     std::wstring currentUrl;
     std::wstring pendingUrl; // set by input callbacks, handled in the main loop
+    std::wstring pendingReferrer; // the page a link click in pendingUrl came from (empty for a typed URL)
     int pendingHistory = 0;  // -1 = go back, +1 = go forward (also handled in the main loop)
     bool pendingReload = false; // Reload button / F5 / Ctrl+R (also handled in the main loop)
     bool pendingStop = false;   // Stop button / Esc while loading (also handled in the main loop)
@@ -160,8 +161,8 @@ static void reloadPage(App& app, const std::wstring& url, const std::wstring& ht
 // expected; nothing shows until applyFinishedNavigation picks up a result.
 // `kind` says how the result updates the history.
 static void navigate(App& app, const std::wstring& url, const std::string* postBody = nullptr,
-                     NavigationKind kind = NavigationKind::Visit) {
-    app.pageLoader.start(url, postBody, kind);
+                     NavigationKind kind = NavigationKind::Visit, const std::wstring& referrer = L"") {
+    app.pageLoader.start(url, postBody, kind, referrer);
 }
 
 // Re-fetches the page being shown (Reload button, F5, Ctrl+R) - from the
@@ -223,8 +224,9 @@ static void submitForm(App& app, const FormSubmission& form) {
     if (target.rfind(L"http://", 0) != 0 && target.rfind(L"https://", 0) != 0)
         return; // forms need a web page to send to (not a local file)
 
-    if (form.post) navigate(app, target, &form.body);
-    else navigate(app, withQuery(target, form.body));
+    // The page the form is on is the referrer, as in browsers.
+    if (form.post) navigate(app, target, &form.body, NavigationKind::Visit, app.currentUrl);
+    else navigate(app, withQuery(target, form.body), nullptr, NavigationKind::Visit, app.currentUrl);
 }
 
 // Carries out what a key or click in the find bar asked for.
@@ -346,7 +348,7 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
     if (href.empty() || prevented) return;
 
     std::wstring target = resolveUrl(app->currentUrl, href);
-    if (!target.empty()) app->pendingUrl = target;
+    if (!target.empty()) { app->pendingUrl = target; app->pendingReferrer = app->currentUrl; }
 }
 
 static void onChar(GLFWwindow* window, unsigned int codepoint) {
@@ -660,7 +662,7 @@ static void onKey(GLFWwindow* window, int key, int scancode, int action, int mod
         if (inBar) {
             std::wstring target = AddressBar::normalizeInput(bar.text());
             bar.blur();
-            if (!target.empty()) app->pendingUrl = target;
+            if (!target.empty()) { app->pendingUrl = target; app->pendingReferrer.clear(); } // typed: no referrer
         }
         else {
             engine.submitFocused(); // queues the form; the main loop sends it
@@ -869,7 +871,8 @@ int wmain(int argc, wchar_t** argv) {
         if (!app.pendingUrl.empty()) {
             std::wstring url = std::move(app.pendingUrl);
             app.pendingUrl.clear();
-            navigate(app, url);
+            navigate(app, url, nullptr, NavigationKind::Visit, app.pendingReferrer);
+            app.pendingReferrer.clear();
         }
 
         FormSubmission form;
@@ -878,7 +881,7 @@ int wmain(int argc, wchar_t** argv) {
         std::wstring navUrl;
         bool navReplace = false;
         if (engine.takeNavigation(navUrl, navReplace))
-            navigate(app, navUrl, nullptr, navReplace ? NavigationKind::Replace : NavigationKind::Visit);
+            navigate(app, navUrl, nullptr, navReplace ? NavigationKind::Replace : NavigationKind::Visit, app.currentUrl);
 
         applyFinishedNavigation(app); // shows a navigate()-started fetch's result once it's ready
 
