@@ -4,6 +4,8 @@
 #include <vector>
 #include <memory>
 #include <functional>
+#include <map>
+#include <climits>
 #include "DOM.h"
 #include "CSS.h"
 #include "Renderer.h" // Color, Gradient
@@ -167,6 +169,9 @@ struct LayoutRoot {
     Element* currentForm = nullptr; // the enclosing <form>, set during layout
     const std::vector<CSS::Rule>* rules = nullptr; // from <style> blocks on the page
     const CSS::HoverSet* hover = nullptr; // what :hover matches this pass; null = nothing hovered
+    // The page is in quirks mode (Document::quirks): a table then doesn't
+    // inherit text-align or font styling from outside it.
+    bool quirks = false;
 
     // Returns the pixel width of `text` at `fontSize`. Used to wrap text; a
     // rough per-character estimate is used when unset.
@@ -198,6 +203,10 @@ private:
         // copying it per word costs nothing.
         const std::wstring* family = nullptr;
         TextAlign align = TextAlign::Left;
+        // <center>, or align=center on a <div> or table part (CSS's
+        // -webkit-center): block children narrower than the line are centred
+        // too, not just text.
+        bool centerBlocks = false;
         // line-height: a multiple of the font size (lineHeight >= 0), a fixed
         // pixel height (lineHeightPx >= 0), or neither for "normal".
         float lineHeight = -1;
@@ -274,7 +283,14 @@ private:
     // The subset of an element's cascaded style that layout cares about -
     // computed once per element and shared by both plain elements and form
     // controls, so both respond to the same CSS/inline styling.
-    enum class Display { Block, Inline, None, Grid, Flex };
+    // The Table* values are the parts of a table (display: table-row etc.,
+    // or the default for <tr>, <td>, ...). Outside a table they're laid out
+    // as plain blocks - no anonymous table is made around them.
+    enum class Display { Block, Inline, None, Grid, Flex, Table, TableRowGroup, TableHeaderGroup,
+                         TableFooterGroup, TableRow, TableCell, TableCaption };
+    // vertical-align, as table cells use it (baseline is treated as top).
+    // Unset: a cell takes its row's, then its row group's, else middle.
+    enum class VAlign { Unset, Top, Middle, Bottom };
     enum class FlexDirection { Row, Column };
     enum class FlexWrap { NoWrap, Wrap, WrapReverse };
     enum class JustifyContent { FlexStart, Center, FlexEnd, SpaceBetween, SpaceAround };
@@ -307,6 +323,7 @@ private:
         // margin-left/-right: auto - a block narrower than its container
         // takes the leftover space there (both: centred).
         bool marginLeftAuto = false, marginRightAuto = false;
+        bool centeredByParent = false; // the parent's text-align centres blocks (TextPaint::centerBlocks)
         // The used height in px (content box, or border box with
         // box-sizing: border-box), or -1 for auto. A percentage resolves
         // against the containing block's height when that is definite
@@ -390,6 +407,11 @@ private:
         int flexBasis = -1;
         // Only meaningful with display:flex, on the container.
         FlexWrap flexWrap = FlexWrap::NoWrap;
+        // Tables: border-collapse and border-spacing (horizontal, vertical)
+        // on the table; vertical-align on a cell, row or row group.
+        bool borderCollapse = false;
+        int borderSpacingX = 2, borderSpacingY = 2;
+        VAlign verticalAlign = VAlign::Unset;
         // Raw `opacity`/`visibility` as authored, plus the resolved,
         // inheritance-aware flag layout code actually checks (own opacity
         // <= 0, own visibility:hidden, or an ancestor already hidden this
@@ -512,6 +534,60 @@ private:
     // margin. Stands in for the max-content size this engine otherwise has
     // no notion of; capped at `available`.
     int shrinkToFitWidth(Element* item, const ComputedStyle& style, int available);
+
+    // --- Tables (layoutTable) ------------------------------------------
+    // A table's rows and cells, read from the DOM, with each column's
+    // min/max widths measured. Built by buildTable before the table's own
+    // width is settled (an auto-width table is as wide as its columns
+    // want), then used by layoutTable to place everything.
+    struct TableCell {
+        Element* el = nullptr;
+        ComputedStyle style; // margins zeroed, width/height turned into column/row hints
+        std::vector<Element*> ancestors; // ancestorStack to lay it out with
+        Element* form = nullptr; // a <form> sitting between table parts, if any
+        int row = 0, col = 0, rowSpan = 1, colSpan = 1;
+        int minWidth = 0, maxWidth = 0; // border box
+        int fixedWidth = -1; // an explicit width (border box), or -1 - the column's preferred width, not a minimum
+        VAlign valign = VAlign::Middle;
+    };
+    struct TableRow {
+        Element* el = nullptr; // nullptr for an anonymous row (cells with no <tr>)
+        ComputedStyle style;
+        int group = -1;     // index into TableModel::groups
+        int section = 0;    // rowspan doesn't cross from one section into another
+        int minHeight = 0;
+    };
+    struct TableModel {
+        std::vector<std::pair<Element*, ComputedStyle>> captions;
+        std::vector<std::pair<Element*, ComputedStyle>> groups; // row groups (<tbody>...), by TableRow::group
+        std::vector<TableRow> rows;
+        std::vector<TableCell> cells; // in row order
+        int numCols = 0;
+        std::vector<int> colMin, colMax;
+        std::vector<bool> colFixed;
+        // Gaps between columns/rows, and from the table's content edge to the
+        // outer cells. border-collapse makes them negative: neighbouring
+        // cell borders overlap instead of sitting side by side.
+        int gapX = 0, gapY = 0, edgeX = 0, edgeY = 0;
+        int minWidth = 0, maxWidth = 0; // of the cell grid, gaps included
+    };
+    std::unique_ptr<TableModel> buildTable(Element* table, const ComputedStyle& style, int available);
+    void layoutTable(Element* el, int x, int& y, int contentWidth, const ComputedStyle& style, const TableModel& t);
+    // A table cell laid out at local (0, 0) and `width`: its boxes and its
+    // border-box height. While measuring_, results are memoized per element
+    // and width for the rest of this layout() pass - each cell is measured
+    // at two widths, and the measuring layouts of nested tables would
+    // otherwise multiply level by level. A real (non-measuring) layout is
+    // never cached, so its side effects (absolute descendants registering
+    // with their containing block, sticky elements) always happen.
+    std::pair<std::vector<LayoutBox>, int> layoutCell(const TableCell& cell, int width);
+    std::map<std::pair<const Element*, int>, std::pair<std::vector<LayoutBox>, int>> cellCache_;
+    // Set while measuring a table cell's min/max-content width: text isn't
+    // aligned or broken mid-word, and lines can be as narrow as one word.
+    bool measuring_ = false;
+    // Where the last inline run left `y`, its trailing paragraph gap
+    // included - so a table cell can drop that gap below its last line.
+    int inlineRunEnd_ = INT_MIN;
 
     // Ancestors of the element layoutElement is currently iterating the
     // children of (root first); used to match descendant selectors ("a b").

@@ -329,11 +329,14 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containin
 // items on the same line can differ in font size, href, or owning element
 // (e.g. a link in the middle of a sentence). Generalizes what layoutText
 // used to do for a single homogeneously-styled string.
+static constexpr int kParaGap = 6; // space below each run of text
+
 void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, int& y, int containingWidth,
                                  TextAlign align) {
     const int textInset = 4; // Engine::render draws text 4px inside its box
-    const int paraGap = 6;
-    const float maxWidth = (float)std::max(containingWidth - 2 * textInset, 40);
+    // While measuring a table cell's min-content width, a line can be as
+    // narrow as one word (see measuring_).
+    const float maxWidth = (float)std::max(containingWidth - 2 * textInset, measuring_ ? 0 : 40);
 
     struct Placed { InlineItem item; float offset; float width; };
     std::vector<Placed> line;
@@ -355,10 +358,14 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
         int lineHeight = std::max(textBand, imageHeight);
         int textTop = y + lineHeight - textBand;
 
-        // text-align: the whole line moves by its leftover width.
+        // text-align: the whole line moves by its leftover width - of the
+        // real width, not the 40px lines wrap at in narrower ones (a narrow
+        // table column's right-aligned text would otherwise end past it).
+        const float alignWidth = (float)std::max(containingWidth - 2 * textInset, 0);
         float shift = 0;
-        if (align == TextAlign::Center) shift = std::max(maxWidth - lineWidth, 0.0f) / 2;
-        else if (align == TextAlign::Right) shift = std::max(maxWidth - lineWidth, 0.0f);
+        if (measuring_) {} // measured from the left edge
+        else if (align == TextAlign::Center) shift = std::max(alignWidth - lineWidth, 0.0f) / 2;
+        else if (align == TextAlign::Right) shift = std::max(alignWidth - lineWidth, 0.0f);
 
         for (size_t i = 0; i < line.size(); i++) {
             const Placed& p = line[i];
@@ -440,7 +447,7 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
         // A word wider than the line on its own gets broken by characters,
         // one fragment per line, before whatever's left of it (now short
         // enough) falls through to the normal wrapping below.
-        while (wordWidth > maxWidth && item.word.size() > 1) {
+        while (!measuring_ && wordWidth > maxWidth && item.word.size() > 1) {
             if (!line.empty()) emitLine();
             size_t n = 1;
             while (n < item.word.size() && textWidth(item.word.substr(0, n + 1), item.fontSize, item.paint) <= maxWidth) n++;
@@ -464,7 +471,8 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
     }
     emitLine();
 
-    y += paraGap;
+    y += kParaGap;
+    inlineRunEnd_ = y;
 }
 
 static std::wstring lowerCase(std::wstring s) {
@@ -844,16 +852,101 @@ static std::vector<BoxShadow> parseBoxShadows(const std::wstring& v, int fontSiz
 // elements and form controls: stylesheet rules first (least to most
 // specific, source order breaking ties), then inline style="" - which, per
 // CSS, always wins regardless of specificity.
+// The CSS that a table part's old presentational attributes stand for, as a
+// browser maps them: width/height, bgcolor, align (text-align - centring
+// nested blocks too, as <center> does - or for the table itself, centring
+// it), valign, and on cells, the enclosing table's cellpadding and border
+// (any border on the table gives each cell a 1px one). Also a <div>'s
+// align. Empty for every other element.
+static std::vector<std::pair<std::wstring, std::wstring>> tableHints(Element* e) {
+    std::vector<std::pair<std::wstring, std::wstring>> out;
+    const std::wstring& tag = e->tag;
+    const bool cell = tag == L"td" || tag == L"th";
+    if (tag == L"div") {
+        auto a = e->attrs.find(L"align");
+        if (a != e->attrs.end()) {
+            std::wstring v = lowerCase(trimmed(a->second));
+            if (v == L"center") out.push_back({ L"text-align", L"-webkit-center" });
+            else if (v == L"left" || v == L"right") out.push_back({ L"text-align", v });
+        }
+        return out;
+    }
+    if (!cell && tag != L"table" && tag != L"tr" && tag != L"thead" && tag != L"tbody" && tag != L"tfoot" &&
+        tag != L"col" && tag != L"colgroup")
+        return out;
+    auto attr = [&](Element* el, const wchar_t* name) -> const std::wstring* {
+        auto it = el->attrs.find(name);
+        return it != el->attrs.end() ? &it->second : nullptr;
+    };
+    // border="" and border="1" both mean 1px; border="0" means none.
+    auto borderWidth = [&](Element* el) {
+        const std::wstring* b = attr(el, L"border");
+        if (!b) return -1;
+        try { return b->empty() ? 1 : std::max(std::stoi(*b), 0); } catch (...) { return 1; }
+    };
+
+    if (auto* w = attr(e, L"width")) if (tag != L"tr" && !w->empty()) out.push_back({ L"width", *w });
+    if (auto* h = attr(e, L"height")) if (tag != L"col" && tag != L"colgroup" && !h->empty()) out.push_back({ L"height", *h });
+    if (auto* bg = attr(e, L"bgcolor")) if (!bg->empty()) out.push_back({ L"background-color", *bg });
+    if (auto* a = attr(e, L"align")) {
+        std::wstring v = lowerCase(trimmed(*a));
+        if (tag == L"table") {
+            if (v == L"center") { out.push_back({ L"margin-left", L"auto" }); out.push_back({ L"margin-right", L"auto" }); }
+        }
+        else if (v == L"center") out.push_back({ L"text-align", L"-webkit-center" });
+        else if (v == L"left" || v == L"right") out.push_back({ L"text-align", v });
+    }
+    if (auto* va = attr(e, L"valign")) if (!va->empty()) out.push_back({ L"vertical-align", lowerCase(trimmed(*va)) });
+
+    if (tag == L"table") {
+        int bw = borderWidth(e);
+        if (bw > 0) out.push_back({ L"border", std::to_wstring(bw) + L"px solid #808080" });
+        if (auto* cs = attr(e, L"cellspacing")) if (!cs->empty()) out.push_back({ L"border-spacing", *cs + L"px" });
+    }
+    if (cell) {
+        Element* table = e->parent;
+        while (table && table->tag != L"table") table = table->parent;
+        if (table) {
+            if (auto* cp = attr(table, L"cellpadding")) if (!cp->empty()) out.push_back({ L"padding", *cp + L"px" });
+            if (borderWidth(table) > 0) out.push_back({ L"border", L"1px solid #808080" });
+        }
+    }
+    return out;
+}
+
 LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFontSize, int containingWidth,
                                                      bool inheritedVisuallyHidden, const TextPaint& inheritedPaint) {
     ComputedStyle sv;
     sv.fontSize = inheritedFontSize; // inherited unless a rule below overrides it
     sv.display = isInlineTag(e->tag) ? Display::Inline : Display::Block;
+    const std::wstring& tag = e->tag;
+
+    // Table parts: their display, and browser-like spacing - cells get 1px
+    // of padding (the table's border-spacing separates them), rows and row
+    // groups take none, as margins and padding don't apply to them.
+    if (tag == L"table") { sv.display = Display::Table; sv.paddingTop = sv.paddingRight = sv.paddingBottom = sv.paddingLeft = 0; }
+    else if (tag == L"td" || tag == L"th" || tag == L"tr" || tag == L"tbody" || tag == L"thead" ||
+             tag == L"tfoot" || tag == L"caption") {
+        sv.display = tag == L"td" || tag == L"th" ? Display::TableCell : tag == L"tr" ? Display::TableRow
+                   : tag == L"thead" ? Display::TableHeaderGroup : tag == L"tfoot" ? Display::TableFooterGroup
+                   : tag == L"tbody" ? Display::TableRowGroup : Display::TableCaption;
+        int pad = tag == L"td" || tag == L"th" ? 1 : tag == L"caption" ? 2 : 0;
+        sv.marginTop = sv.marginBottom = 0;
+        sv.paddingTop = sv.paddingRight = sv.paddingBottom = sv.paddingLeft = pad;
+    }
+    else if (tag == L"col" || tag == L"colgroup") sv.display = Display::None; // read by buildTable for widths only
 
     // color/font-weight: inherited, then the tag's own default (what a
     // browser's built-in stylesheet would give it), then author rules.
     sv.paint = inheritedPaint;
-    const std::wstring& tag = e->tag;
+    sv.centeredByParent = inheritedPaint.centerBlocks;
+    if (tag == L"table" && quirks) {
+        // Quirks mode: a table starts its text styling afresh.
+        sv.fontSize = 14;
+        sv.paint.align = TextAlign::Left;
+        sv.paint.centerBlocks = false;
+        sv.paint.bold = sv.paint.italic = false;
+    }
     if (tag == L"a" && e->attrs.count(L"href")) { sv.paint.color = L"#0033cc"; sv.paint.underline = true; }
     if (tag == L"b" || tag == L"strong" || tag == L"th" ||
         (tag.size() == 2 && tag[0] == L'h' && tag[1] >= L'1' && tag[1] <= L'6'))
@@ -867,6 +960,8 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
     if (tag == L"u" || tag == L"ins") sv.paint.underline = true;
     if (tag == L"s" || tag == L"strike" || tag == L"del") sv.paint.lineThrough = true;
     if (tag == L"center" || tag == L"th") sv.paint.align = TextAlign::Center;
+    if (tag == L"center") sv.paint.centerBlocks = true;
+    else if (tag == L"th") sv.paint.centerBlocks = false;
 
     // line-height as written; resolved once the cascade is done, since a
     // percentage or em is of this element's final font size.
@@ -944,9 +1039,12 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         }
         else if (k == L"text-align") {
             std::wstring a = lowerCase(trimmed(v));
+            bool known = true;
             if (a == L"center" || a == L"-webkit-center") sv.paint.align = TextAlign::Center;
             else if (a == L"right" || a == L"end" || a == L"-webkit-right") sv.paint.align = TextAlign::Right;
             else if (a == L"left" || a == L"start" || a == L"justify" || a == L"-webkit-left") sv.paint.align = TextAlign::Left;
+            else known = false;
+            if (known) sv.paint.centerBlocks = a == L"-webkit-center";
         }
         else if (k == L"line-height") lineHeightRaw = trimmed(v);
         else if (k == L"text-decoration" || k == L"text-decoration-line") {
@@ -1185,6 +1283,33 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             else if (v == L"block") sv.display = Display::Block;
             else if (v == L"grid") sv.display = Display::Grid;
             else if (v == L"flex") sv.display = Display::Flex;
+            else if (v == L"table" || v == L"inline-table") sv.display = Display::Table;
+            else if (v == L"table-row") sv.display = Display::TableRow;
+            else if (v == L"table-cell") sv.display = Display::TableCell;
+            else if (v == L"table-row-group") sv.display = Display::TableRowGroup;
+            else if (v == L"table-header-group") sv.display = Display::TableHeaderGroup;
+            else if (v == L"table-footer-group") sv.display = Display::TableFooterGroup;
+            else if (v == L"table-caption") sv.display = Display::TableCaption;
+            else if (v == L"table-column" || v == L"table-column-group") sv.display = Display::None;
+        }
+        else if (k == L"vertical-align") {
+            std::wstring a = lowerCase(trimmed(v));
+            if (a == L"top" || a == L"text-top" || a == L"baseline") sv.verticalAlign = VAlign::Top;
+            else if (a == L"middle") sv.verticalAlign = VAlign::Middle;
+            else if (a == L"bottom" || a == L"text-bottom") sv.verticalAlign = VAlign::Bottom;
+        }
+        else if (k == L"border-collapse") {
+            std::wstring a = lowerCase(trimmed(v));
+            if (a == L"collapse") sv.borderCollapse = true;
+            else if (a == L"separate") sv.borderCollapse = false;
+        }
+        else if (k == L"border-spacing") {
+            // One length for both directions, or horizontal then vertical.
+            std::vector<std::wstring> t = cssTokens(v);
+            if (!t.empty() && t.size() <= 2) {
+                sv.borderSpacingX = std::max(resolveLength(t[0], 0, sv.borderSpacingX), 0);
+                sv.borderSpacingY = t.size() > 1 ? std::max(resolveLength(t[1], 0, sv.borderSpacingY), 0) : sv.borderSpacingX;
+            }
         }
         else if (k == L"flex-direction") {
             // The -reverse variants are laid out unreversed; anything
@@ -1259,6 +1384,10 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
     // Every declaration that applies, in cascade order: matched rules (least
     // to most specific), then inline style.
     std::vector<const std::pair<std::wstring, std::wstring>*> cascade;
+    // Presentational attributes (<table border=1 cellpadding=4>, <td
+    // bgcolor valign width>) come first, so any author rule beats them.
+    std::vector<std::pair<std::wstring, std::wstring>> hints = tableHints(e);
+    for (const auto& decl : hints) cascade.push_back(&decl);
     if (rules) {
         std::vector<const CSS::Rule*> matched;
         auto consider = [&](const std::vector<const CSS::Rule*>& bucket) {
@@ -1750,6 +1879,9 @@ void LayoutRoot::layout() {
     boxes.clear();
     ancestorStack.clear();
     classCache.clear(); // safe to reuse within this pass only - see its declaration in Layout.h
+    cellCache_.clear(); // likewise
+    measuring_ = false;
+    inlineRunEnd_ = INT_MIN;
     rebuildRuleIndex();
     if (!rootNode) return;
 
@@ -2045,13 +2177,31 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     // `width` (and min-/max-width) name the content box, or the border box
     // with box-sizing: border-box; `chromeX` converts between that and the
     // outer (border-box) width.
-    const int chromeX = sv.boxSizing == BoxSizing::BorderBox ? 0 : sv.paddingLeft + sv.paddingRight + 2 * sv.borderWidth;
+    // A table's width always includes its border and padding, as in browsers.
+    const bool borderBox = sv.boxSizing == BoxSizing::BorderBox || sv.display == Display::Table;
+    const int chromeX = borderBox ? 0 : sv.paddingLeft + sv.paddingRight + 2 * sv.borderWidth;
     int widthValue = sv.width >= 0 ? sv.width
                                    : std::max(containingWidth - sv.marginLeft - sv.marginRight - chromeX, 0); // auto: fill the container
+
+    // A table with no width is as wide as its columns want, up to what's
+    // available - and never narrower than they need.
+    const int chromeFull = sv.paddingLeft + sv.paddingRight + 2 * sv.borderWidth;
+    std::unique_ptr<TableModel> table;
+    if (sv.display == Display::Table) {
+        int available = std::max(containingWidth - sv.marginLeft - sv.marginRight - chromeFull, 0);
+        table = buildTable(e, sv, available);
+        if (sv.width < 0)
+            widthValue = std::max(std::min(table->maxWidth, available), table->minWidth) + chromeFull - chromeX;
+    }
+
     if (sv.maxWidth >= 0) widthValue = std::min(widthValue, sv.maxWidth);
     if (sv.minWidth >= 0) widthValue = std::max(widthValue, sv.minWidth);
     int outerWidth = widthValue + chromeX;
     int contentWidth = std::max(outerWidth - sv.paddingLeft - sv.paddingRight - 2 * sv.borderWidth, 0);
+    if (table && contentWidth < table->minWidth) {
+        contentWidth = table->minWidth;
+        outerWidth = contentWidth + chromeFull;
+    }
 
     // margin: auto - what's left of the container goes to the auto margin(s):
     // both centres the box (margin: 0 auto), one pushes it to the other side.
@@ -2062,9 +2212,18 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
         if (sv.marginLeftAuto && sv.marginRightAuto) marginLeft = free / 2;
         else if (sv.marginLeftAuto) marginLeft = free;
     }
+    else if (sv.centeredByParent) // inside <center> or align=center
+        marginLeft += std::max(containingWidth - outerWidth - sv.marginLeft - sv.marginRight, 0) / 2;
     int boxX = x + marginLeft;
 
     y += sv.marginTop;
+    // A table's captions sit above it, outside its border.
+    if (table && !table->captions.empty()) {
+        ancestorStack.push_back(e);
+        for (const auto& [caption, captionStyle] : table->captions)
+            layoutBlockChild(caption, boxX, y, outerWidth, captionStyle);
+        ancestorStack.pop_back();
+    }
     int contentStartY = y;
     const size_t firstBox = boxes.size(); // this element's boxes are [firstBox, end)
 
@@ -2123,7 +2282,12 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     const int contentTop = y;
     if (sv.display == Display::Grid) layoutGrid(e, childX, y, contentWidth, sv);
     else if (sv.display == Display::Flex) layoutFlex(e, childX, y, contentWidth, sv);
+    else if (table) layoutTable(e, childX, y, contentWidth, sv, *table);
     else layoutElement(e, childX, y, contentWidth, sv.fontSize, sv.visuallyHidden, sv.paint);
+    // A table cell ends at its last line of text, without the gap a
+    // paragraph leaves below it.
+    if (sv.display == Display::TableCell && y == inlineRunEnd_ && y - contentTop >= kParaGap) y -= kParaGap;
+    inlineRunEnd_ = INT_MIN;
 
     currentHref = savedHref;
     currentForm = savedForm;
@@ -2783,4 +2947,454 @@ int LayoutRoot::shrinkToFitWidth(Element* item, const ComputedStyle& style, int 
     }
     int width = right + style.paddingRight + style.borderWidth + style.marginRight + 1; // +1: rounding in text measurement
     return std::min(std::max(width, 0), available);
+}
+
+// --- Tables ----------------------------------------------------------------------
+//
+// The automatic table layout browsers use, simplified:
+// 1. buildTable reads the table's rows and cells (row groups, a <thead>
+//    first and a <tfoot> last, anonymous rows for cells with no <tr>) and
+//    places each cell in the grid, honouring colspan/rowspan.
+// 2. It measures every cell twice: laid out as narrow as it goes (its
+//    min-content width - the widest word, image or fixed-width box) and
+//    with as much room as the table has (its max-content width). A
+//    column's min/max is the largest of its cells'; a spanning cell's
+//    shortfall is shared among the columns it spans. An explicit width on
+//    a cell or <col> replaces the max-content width.
+// 3. An auto-width table is as wide as the sum of its columns' max widths,
+//    if that fits, else as wide as is available (but never below the sum
+//    of their min widths) - see layoutBlockChild.
+// 4. layoutTable shares that width out (columnWidths), lays each cell out
+//    at its column width, makes each row as tall as its tallest cell,
+//    stretches every cell's background to its row and places its content
+//    by vertical-align.
+// Not done: table-layout: fixed, percentage columns as such (a % width is
+// resolved against the space available and treated like a fixed one),
+// collapsed borders of different widths/colours (cells simply overlap
+// their neighbours' borders), caption-side: bottom, and text that sits
+// directly between table parts (dropped).
+
+// Adds `excess` px to columns [from, from + count), in proportion to
+// `weights` (equally when they're all 0), rounding so the parts add up.
+static void shareOut(std::vector<int>& cols, int from, int count, int excess, std::vector<int> weights) {
+    long long total = 0;
+    for (int i = from; i < from + count; i++) total += std::max(weights[i], 0);
+    double exact = 0;
+    int given = 0;
+    for (int i = from; i < from + count; i++) {
+        exact += total > 0 ? (double)excess * std::max(weights[i], 0) / (double)total : (double)excess / count;
+        int share = (int)std::lround(exact) - given;
+        cols[i] += share;
+        given += share;
+    }
+}
+
+// Splits `target` px among columns: each gets at least its min; up to the
+// sum of the maxes, every column moves the same fraction of the way from
+// its min to its max; past that, the extra goes to the columns without an
+// explicit width, in proportion to their max widths.
+static std::vector<int> columnWidths(int target, const std::vector<int>& mins, const std::vector<int>& maxs,
+                                     const std::vector<bool>& fixed) {
+    const int n = (int)mins.size();
+    long long sumMin = 0, sumMax = 0;
+    for (int i = 0; i < n; i++) { sumMin += mins[i]; sumMax += maxs[i]; }
+    std::vector<int> out = mins;
+    if (target <= sumMin) return out;
+    if (target <= sumMax) {
+        std::vector<int> room(n);
+        for (int i = 0; i < n; i++) room[i] = maxs[i] - mins[i];
+        shareOut(out, 0, n, (int)(target - sumMin), room);
+        return out;
+    }
+    out = maxs;
+    bool anyFlexible = false, anyFlexibleWidth = false;
+    for (int i = 0; i < n; i++)
+        if (!fixed[i]) { anyFlexible = true; if (maxs[i] > 0) anyFlexibleWidth = true; }
+    std::vector<int> weights(n);
+    for (int i = 0; i < n; i++)
+        weights[i] = !anyFlexible ? maxs[i] : fixed[i] ? 0 : anyFlexibleWidth ? maxs[i] : 1;
+    shareOut(out, 0, n, (int)(target - sumMax), weights);
+    return out;
+}
+
+std::unique_ptr<LayoutRoot::TableModel> LayoutRoot::buildTable(Element* table, const ComputedStyle& style, int available) {
+    auto model = std::make_unique<TableModel>();
+    TableModel& m = *model;
+    ancestorStack.push_back(table);
+
+    // Calls `visit` for each element child of `parent` that takes part in
+    // the table, with its computed style. A <form> between table parts
+    // (<table><form><tr>...) is looked through: its children count as
+    // `parent`'s own, and it's the form their controls belong to.
+    using Visit = std::function<void(Element*, ComputedStyle&, Element*)>;
+    std::function<void(Element*, const ComputedStyle&, Element*, const Visit&)> eachPart =
+        [&](Element* parent, const ComputedStyle& ps, Element* form, const Visit& visit) {
+        for (auto& child : parent->children) {
+            if (child->type != Node::ELEMENT) continue; // text between table parts isn't shown
+            auto* e = static_cast<Element*>(child.get());
+            if (e->tag == L"head" || e->tag == L"script" || e->tag == L"style" || e->tag == L"title" ||
+                e->tag == L"meta" || e->tag == L"link" || e->tag == L"base" || e->tag == L"template")
+                continue;
+            if (e->tag == L"input" && lowerCase(getAttr(e, L"type")) == L"hidden") continue;
+            ComputedStyle cs = computeStyle(e, ps.fontSize, available, ps.visuallyHidden, ps.paint);
+            if (e->tag == L"form" && cs.display == Display::Block) {
+                ancestorStack.push_back(e);
+                eachPart(e, cs, e, visit);
+                ancestorStack.pop_back();
+                continue;
+            }
+            if (cs.position == ComputedStyle::Position::Absolute || cs.position == ComputedStyle::Position::Fixed) {
+                if (cs.display != Display::None) deferOutOfFlow(e, cs, 0, 0, false);
+                continue;
+            }
+            visit(e, cs, form);
+        }
+    };
+
+    // The table's own children: captions, column widths, and the parts
+    // rows come from - header groups first, then the body in document
+    // order, then footer groups.
+    struct Part {
+        Element* el;
+        ComputedStyle style;
+        Element* form;
+        std::vector<Element*> ancestors;
+    };
+    std::vector<Part> sections[3];
+    std::vector<int> colWidths; // from <col>/<colgroup>; -1 where none is given
+    auto addCols = [&](Element* e, const ComputedStyle& cs) {
+        int span = 1;
+        try { span = std::clamp(std::stoi(getAttr(e, L"span", L"1")), 1, 1000); } catch (...) {}
+        int w = cs.width < 0 ? -1 : cs.boxSizing == BoxSizing::BorderBox ? cs.width
+                                  : cs.width + cs.paddingLeft + cs.paddingRight + 2 * cs.borderWidth;
+        colWidths.insert(colWidths.end(), span, w);
+    };
+    eachPart(table, style, nullptr, [&](Element* e, ComputedStyle& cs, Element* form) {
+        if (e->tag == L"col") { addCols(e, cs); return; }
+        if (e->tag == L"colgroup") {
+            bool any = false;
+            ancestorStack.push_back(e);
+            for (auto& child : e->children) {
+                if (child->type != Node::ELEMENT) continue;
+                auto* col = static_cast<Element*>(child.get());
+                if (col->tag != L"col") continue;
+                any = true;
+                addCols(col, computeStyle(col, cs.fontSize, available, cs.visuallyHidden, cs.paint));
+            }
+            ancestorStack.pop_back();
+            if (!any) addCols(e, cs);
+            return;
+        }
+        if (cs.display == Display::None) return;
+        if (cs.display == Display::TableCaption) { m.captions.push_back({ e, cs }); return; }
+        int s = cs.display == Display::TableHeaderGroup ? 0 : cs.display == Display::TableFooterGroup ? 2 : 1;
+        sections[s].push_back({ e, cs, form, ancestorStack });
+    });
+
+    // Rows and cells. Each row group is a section of its own, and so is
+    // each run of rows directly in the table; rowspan stops at its end.
+    int section = 0;
+    int anonRow = -1; // the open anonymous row that loose cells go into
+    auto addRow = [&](Element* el, const ComputedStyle& rs, int group) {
+        TableRow row;
+        row.el = el;
+        row.style = rs;
+        row.group = group;
+        row.section = section;
+        if (el) row.minHeight = std::max(rs.height, rs.minHeight);
+        m.rows.push_back(std::move(row));
+        return (int)m.rows.size() - 1;
+    };
+    auto addCell = [&](Element* e, ComputedStyle cs, Element* form, int row) {
+        TableCell c;
+        c.el = e;
+        c.form = form;
+        c.row = row;
+        c.ancestors = ancestorStack;
+        auto spanAttr = [&](const wchar_t* name, int lo, int hi) {
+            auto it = e->attrs.find(name);
+            if (it == e->attrs.end()) return 1;
+            try { return std::clamp(std::stoi(it->second), lo, hi); } catch (...) { return 1; }
+        };
+        c.colSpan = spanAttr(L"colspan", 1, 1000);
+        c.rowSpan = spanAttr(L"rowspan", 0, 65534); // 0: to the end of its section
+        if (cs.width >= 0)
+            c.fixedWidth = cs.boxSizing == BoxSizing::BorderBox ? cs.width
+                         : cs.width + cs.paddingLeft + cs.paddingRight + 2 * cs.borderWidth;
+        c.valign = cs.verticalAlign;
+        // The table decides the cell's size; its own width and height only
+        // feed into its column's and row's.
+        cs.width = cs.minWidth = cs.maxWidth = -1;
+        if (cs.height >= 0) cs.minHeight = std::max(cs.minHeight, cs.height);
+        cs.height = -1;
+        cs.marginTop = cs.marginBottom = cs.marginLeft = cs.marginRight = 0;
+        cs.marginLeftAuto = cs.marginRightAuto = false;
+        if (cs.display != Display::Grid && cs.display != Display::Flex && cs.display != Display::Table)
+            cs.display = Display::TableCell;
+        c.style = std::move(cs);
+        m.cells.push_back(std::move(c));
+    };
+    // One row, or a cell (or anything else) outside a row, which joins an
+    // anonymous row with the loose cells next to it.
+    auto addPart = [&](Element* e, ComputedStyle& cs, Element* form, int group, const ComputedStyle& parentStyle) {
+        if (cs.display == Display::TableRow) {
+            anonRow = -1;
+            int row = addRow(e, cs, group);
+            ancestorStack.push_back(e);
+            eachPart(e, cs, form, [&](Element* cell, ComputedStyle& cellStyle, Element* f) {
+                if (cellStyle.display != Display::None) addCell(cell, cellStyle, f, row);
+            });
+            ancestorStack.pop_back();
+        }
+        else {
+            if (anonRow < 0) anonRow = addRow(nullptr, parentStyle, group);
+            addCell(e, cs, form, anonRow);
+        }
+    };
+    bool inLooseRun = false;
+    for (auto& parts : sections) {
+        for (Part& p : parts) {
+            std::swap(ancestorStack, p.ancestors);
+            if (p.style.display == Display::TableRowGroup || p.style.display == Display::TableHeaderGroup ||
+                p.style.display == Display::TableFooterGroup) {
+                section++;
+                anonRow = -1;
+                inLooseRun = false;
+                m.groups.push_back({ p.el, p.style });
+                int group = (int)m.groups.size() - 1;
+                ancestorStack.push_back(p.el);
+                eachPart(p.el, p.style, p.form, [&](Element* e, ComputedStyle& cs, Element* form) {
+                    if (cs.display != Display::None) addPart(e, cs, form, group, p.style);
+                });
+                ancestorStack.pop_back();
+                anonRow = -1;
+            }
+            else {
+                if (!inLooseRun) { section++; anonRow = -1; inLooseRun = true; }
+                addPart(p.el, p.style, p.form, -1, style);
+            }
+            std::swap(ancestorStack, p.ancestors);
+        }
+    }
+
+    // Grid placement: each cell takes the next column in its row that a
+    // rowspan from above hasn't already filled.
+    std::vector<std::vector<char>> taken(m.rows.size());
+    int lastRow = -1, cursor = 0;
+    for (TableCell& c : m.cells) {
+        if (c.row != lastRow) { lastRow = c.row; cursor = 0; }
+        while (cursor < (int)taken[c.row].size() && taken[c.row][cursor]) cursor++;
+        c.col = cursor;
+        int want = c.rowSpan == 0 ? INT_MAX : c.rowSpan;
+        int end = c.row;
+        while (end + 1 < (int)m.rows.size() && m.rows[end + 1].section == m.rows[c.row].section && end + 1 - c.row < want) end++;
+        c.rowSpan = end - c.row + 1;
+        for (int r = c.row; r <= end; r++) {
+            if ((int)taken[r].size() < cursor + c.colSpan) taken[r].resize(cursor + c.colSpan, 0);
+            std::fill(taken[r].begin() + cursor, taken[r].begin() + cursor + c.colSpan, 1);
+        }
+        cursor += c.colSpan;
+        m.numCols = std::max(m.numCols, cursor);
+    }
+
+    // Spacing: border-spacing, or for border-collapse, neighbouring cells
+    // overlapping by their border (and the outer ones overlapping the
+    // table's own border).
+    if (style.borderCollapse) {
+        int cellBorder = 0;
+        for (const TableCell& c : m.cells) cellBorder = std::max(cellBorder, c.style.borderWidth);
+        m.gapX = m.gapY = -cellBorder;
+        m.edgeX = m.edgeY = -std::min(style.borderWidth, cellBorder);
+    }
+    else {
+        m.gapX = m.edgeX = style.borderSpacingX;
+        m.gapY = m.edgeY = style.borderSpacingY;
+    }
+
+    // Measure every cell (see the overview above). How far right a
+    // measuring layout's content reaches: text, images and controls; when
+    // laid out narrow, every box (an auto-width block is then only as wide
+    // as its own content); when wide, only nested tables and cells besides
+    // content, since other blocks just fill the width they're given.
+    auto rightEdge = [](const std::vector<LayoutBox>& laid, const TableCell& c, bool narrow) {
+        int right = 0;
+        for (const auto& b : laid) {
+            bool text = !b.text.empty() && b.control == LayoutBox::NoControl;
+            bool content = text || !b.imageSrc.empty() || b.control != LayoutBox::NoControl;
+            if (!content) {
+                if (b.el == c.el) continue; // the cell's own background
+                if (!narrow && !(b.el && (b.el->tag == L"table" || b.el->tag == L"td" || b.el->tag == L"th"))) continue;
+            }
+            // Text is drawn 4px into its box and wraps 4px short of the right edge.
+            right = std::max(right, b.x + b.width + (text ? 8 : !b.imageSrc.empty() ? 4 : 0));
+        }
+        const ComputedStyle& s = c.style;
+        return std::max(right + s.paddingRight + s.borderWidth, s.paddingLeft + s.paddingRight + 2 * s.borderWidth);
+    };
+    // Absolute elements met while measuring go into a throwaway containing
+    // block - they're registered for real when the cells are laid out at
+    // their final size.
+    ContainingBlock scratch;
+    positioned_.push_back(&scratch);
+    const bool wasMeasuring = measuring_;
+    measuring_ = true;
+    for (TableCell& c : m.cells) {
+        c.minWidth = rightEdge(layoutCell(c, 0).first, c, true);
+        if (c.fixedWidth >= 0) c.maxWidth = std::max(c.minWidth, c.fixedWidth);
+        else c.maxWidth = std::max(rightEdge(layoutCell(c, available).first, c, false), c.minWidth);
+    }
+    measuring_ = wasMeasuring;
+    positioned_.pop_back();
+
+    // Column min/max widths: single-column cells and <col> widths first,
+    // then whatever spanning cells need beyond that, narrowest span first.
+    m.colMin.assign(m.numCols, 0);
+    m.colMax.assign(m.numCols, 0);
+    m.colFixed.assign(m.numCols, false);
+    for (int i = 0; i < std::min((int)colWidths.size(), m.numCols); i++)
+        if (colWidths[i] >= 0) { m.colMax[i] = colWidths[i]; m.colFixed[i] = true; }
+    std::vector<const TableCell*> spanning;
+    for (const TableCell& c : m.cells) {
+        if (c.colSpan > 1) { spanning.push_back(&c); continue; }
+        m.colMin[c.col] = std::max(m.colMin[c.col], c.minWidth);
+        m.colMax[c.col] = std::max(m.colMax[c.col], c.maxWidth);
+        if (c.fixedWidth >= 0) m.colFixed[c.col] = true;
+    }
+    for (int i = 0; i < m.numCols; i++) m.colMax[i] = std::max(m.colMax[i], m.colMin[i]);
+    std::stable_sort(spanning.begin(), spanning.end(), [](const TableCell* a, const TableCell* b) { return a->colSpan < b->colSpan; });
+    for (const TableCell* c : spanning) {
+        int haveMin = m.gapX * (c->colSpan - 1), haveMax = haveMin;
+        for (int k = c->col; k < c->col + c->colSpan; k++) { haveMin += m.colMin[k]; haveMax += m.colMax[k]; }
+        if (c->minWidth > haveMin) shareOut(m.colMin, c->col, c->colSpan, c->minWidth - haveMin, m.colMax);
+        if (c->maxWidth > haveMax) shareOut(m.colMax, c->col, c->colSpan, c->maxWidth - haveMax, m.colMax);
+        for (int k = c->col; k < c->col + c->colSpan; k++) m.colMax[k] = std::max(m.colMax[k], m.colMin[k]);
+    }
+    if (m.numCols > 0) {
+        long long sumMin = 0, sumMax = 0;
+        for (int i = 0; i < m.numCols; i++) { sumMin += m.colMin[i]; sumMax += m.colMax[i]; }
+        int spacing = m.gapX * (m.numCols - 1) + 2 * m.edgeX;
+        m.minWidth = (int)std::max(sumMin + spacing, 0LL);
+        m.maxWidth = (int)std::max(sumMax + spacing, 0LL);
+    }
+
+    ancestorStack.pop_back();
+    return model;
+}
+
+std::pair<std::vector<LayoutBox>, int> LayoutRoot::layoutCell(const TableCell& cell, int width) {
+    const bool cache = measuring_;
+    if (cache) {
+        auto it = cellCache_.find({ cell.el, width });
+        if (it != cellCache_.end()) return it->second;
+    }
+    // Laid out in its own context: its ancestors (for selectors), its
+    // form, and no definite height for height: % to resolve against.
+    std::vector<Element*> ancestors = cell.ancestors;
+    std::swap(ancestorStack, ancestors);
+    Element* savedForm = currentForm;
+    if (cell.form) currentForm = cell.form;
+    int savedCH = containingHeight_;
+    containingHeight_ = -1;
+
+    std::pair<std::vector<LayoutBox>, int> result;
+    result.first = layoutItemDetached(cell.el, width, cell.style, result.second);
+
+    containingHeight_ = savedCH;
+    currentForm = savedForm;
+    std::swap(ancestorStack, ancestors);
+    if (cache) cellCache_.emplace(std::make_pair((const Element*)cell.el, width), result);
+    return result;
+}
+
+void LayoutRoot::layoutTable(Element* el, int x, int& y, int contentWidth, const ComputedStyle& style, const TableModel& t) {
+    (void)el;
+    (void)style;
+    if (t.numCols == 0 || t.rows.empty()) return;
+
+    const int n = t.numCols;
+    std::vector<int> colW = columnWidths(contentWidth - t.gapX * (n - 1) - 2 * t.edgeX, t.colMin, t.colMax, t.colFixed);
+    std::vector<int> colX(n);
+    int cx = x + t.edgeX;
+    for (int i = 0; i < n; i++) { colX[i] = cx; cx += colW[i] + t.gapX; }
+
+    // Every cell at the width of the columns it spans.
+    std::vector<std::pair<std::vector<LayoutBox>, int>> laid;
+    laid.reserve(t.cells.size());
+    for (const TableCell& c : t.cells) {
+        int w = t.gapX * (c.colSpan - 1);
+        for (int k = c.col; k < c.col + c.colSpan; k++) w += colW[k];
+        laid.push_back(layoutCell(c, std::max(w, 0)));
+    }
+
+    // Row heights: the tallest cell in the row (or the row's own height);
+    // a cell spanning rows that are too short for it adds the difference
+    // to the last of them.
+    const int numRows = (int)t.rows.size();
+    std::vector<int> rowH(numRows);
+    for (int r = 0; r < numRows; r++) rowH[r] = std::max(t.rows[r].minHeight, 0);
+    for (size_t i = 0; i < t.cells.size(); i++)
+        if (t.cells[i].rowSpan == 1) rowH[t.cells[i].row] = std::max(rowH[t.cells[i].row], laid[i].second);
+    auto spanHeight = [&](int row, int span) {
+        int h = t.gapY * (span - 1);
+        for (int r = row; r < row + span; r++) h += rowH[r];
+        return h;
+    };
+    for (size_t i = 0; i < t.cells.size(); i++) {
+        const TableCell& c = t.cells[i];
+        if (c.rowSpan == 1) continue;
+        int have = spanHeight(c.row, c.rowSpan);
+        if (laid[i].second > have) rowH[c.row + c.rowSpan - 1] += laid[i].second - have;
+    }
+    std::vector<int> rowY(numRows);
+    int ry = y + t.edgeY;
+    for (int r = 0; r < numRows; r++) { rowY[r] = ry; ry += rowH[r] + t.gapY; }
+
+    // Row group and row backgrounds, under the cells, across every column.
+    const int gridLeft = colX[0], gridWidth = colX[n - 1] + colW[n - 1] - colX[0];
+    auto paintBand = [&](Element* e, const ComputedStyle& s, int top, int height) {
+        if (s.background.empty() && s.backgrounds.empty()) return;
+        LayoutBox box;
+        box.x = gridLeft;
+        box.y = top;
+        box.width = gridWidth;
+        box.height = height;
+        box.background = s.background;
+        box.backgrounds = s.backgrounds;
+        box.el = e;
+        box.visuallyHidden = s.visuallyHidden;
+        boxes.push_back(std::move(box));
+    };
+    for (int g = 0; g < (int)t.groups.size(); g++) {
+        int first = -1, last = -1;
+        for (int r = 0; r < numRows; r++)
+            if (t.rows[r].group == g) { if (first < 0) first = r; last = r; }
+        if (first >= 0) paintBand(t.groups[g].first, t.groups[g].second, rowY[first], rowY[last] + rowH[last] - rowY[first]);
+    }
+    for (int r = 0; r < numRows; r++)
+        if (t.rows[r].el) paintBand(t.rows[r].el, t.rows[r].style, rowY[r], rowH[r]);
+
+    // The cells: background stretched to the rows they span, content
+    // placed by vertical-align (the cell's own, else its row's, else its
+    // row group's, else middle).
+    for (size_t i = 0; i < t.cells.size(); i++) {
+        const TableCell& c = t.cells[i];
+        const TableRow& row = t.rows[c.row];
+        VAlign va = c.valign;
+        if (va == VAlign::Unset) va = row.style.verticalAlign;
+        if (va == VAlign::Unset && row.group >= 0) va = t.groups[row.group].second.verticalAlign;
+        int height = spanHeight(c.row, c.rowSpan);
+        int free = std::max(height - laid[i].second, 0);
+        int shift = va == VAlign::Bottom ? free : va == VAlign::Top ? 0 : free / 2;
+        bool first = true;
+        for (LayoutBox& b : laid[i].first) {
+            // layoutBlockChild puts a cell's own background box first.
+            bool own = first && b.el == c.el && b.text.empty() && b.imageSrc.empty() && b.control == LayoutBox::NoControl;
+            first = false;
+            if (own) b.height = height;
+            moveBox(b, colX[c.col], rowY[c.row] + (own ? 0 : shift));
+            boxes.push_back(std::move(b));
+        }
+    }
+
+    y = rowY[numRows - 1] + rowH[numRows - 1] + t.edgeY;
 }

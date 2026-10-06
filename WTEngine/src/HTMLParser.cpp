@@ -3,6 +3,8 @@
 #include "CSS.h"
 #include <cwctype>
 #include <set>
+#include <algorithm>
+#include <initializer_list>
 
 // Tags that never have children or a closing tag.
 static bool isVoidTag(const std::wstring& t) {
@@ -15,6 +17,24 @@ static bool isVoidTag(const std::wstring& t) {
 // Tags whose content is raw text (not markup) up to the matching end tag.
 static bool isRawTextTag(const std::wstring& t) {
     return t == L"script" || t == L"style" || t == L"title" || t == L"textarea";
+}
+
+// Whether the start tag `next` implicitly ends an open `current` element,
+// as HTML's optional end tags allow: a cell ends at the next cell or row, a
+// row at the next row, a row group at the next group; likewise <li>,
+// <dt>/<dd> and <option>.
+static bool closedByStartTag(const std::wstring& current, const std::wstring& next) {
+    auto any = [&](std::initializer_list<const wchar_t*> tags) {
+        for (const wchar_t* t : tags) if (next == t) return true;
+        return false;
+    };
+    if (current == L"td" || current == L"th") return any({ L"td", L"th", L"tr", L"tbody", L"thead", L"tfoot" });
+    if (current == L"tr") return any({ L"tr", L"tbody", L"thead", L"tfoot" });
+    if (current == L"tbody" || current == L"thead" || current == L"tfoot") return any({ L"tbody", L"thead", L"tfoot" });
+    if (current == L"li") return next == L"li";
+    if (current == L"dt" || current == L"dd") return any({ L"dt", L"dd" });
+    if (current == L"option") return any({ L"option", L"optgroup" });
+    return false;
 }
 
 static std::wstring decodeEntities(const std::wstring& in) {
@@ -170,19 +190,29 @@ std::shared_ptr<Element> HTMLParser::parseElement() {
     // parse children until </name>. Whitespace isn't skipped: it becomes
     // part of the text nodes (see parseText), since "<b>a</b> <i>b</i>" and
     // "<b>a</b><i>b</i>" lay out differently.
+    open_.push_back(name);
     while (true) {
         if (pos >= s.size()) break;
         if (skipMarkup()) continue;
         if (startsWith(L"</")) {
-            // read end tag
+            // An end tag: our own closes us. One for an element we're
+            // inside (</tr> in an unclosed <td>, </ul> in an unclosed <li>)
+            // closes us too, and is left for that element to consume. Any
+            // other is a stray, and is ignored - as browsers do.
+            auto endName = peekTagName(pos + 2);
+            bool ours = endName == name;
+            bool outer = !ours && std::find(open_.begin(), open_.end() - 1, endName) != open_.end() - 1;
+            if (outer) break;
             pos += 2;
-            auto endName = parseTagName();
+            parseTagName();
             while (pos < s.size() && s[pos] != L'>') pos++;
             if (pos < s.size() && s[pos] == L'>') pos++;
-            break;
+            if (ours) break;
+            continue;
         }
         if (s[pos] == L'<') {
             if (pos + 1 < s.size() && s[pos + 1] == L'/') continue;
+            if (closedByStartTag(name, peekTagName(pos + 1))) break; // e.g. <td>a<td>b: the second <td> ends the first
             auto child = parseElement();
             if (child) { child->parent = elem.get(); elem->children.push_back(child); }
             else { pos++; }
@@ -192,7 +222,16 @@ std::shared_ptr<Element> HTMLParser::parseElement() {
             if (!text.empty()) elem->children.push_back(std::make_shared<TextNode>(text));
         }
     }
+    open_.pop_back();
     return elem;
+}
+
+std::wstring HTMLParser::peekTagName(size_t at) {
+    size_t saved = pos;
+    pos = at;
+    std::wstring name = parseTagName();
+    pos = saved;
+    return name;
 }
 
 std::wstring HTMLParser::parseText() {
@@ -257,6 +296,7 @@ static std::shared_ptr<Element> findBody(const std::shared_ptr<Element>& el) {
 
 std::shared_ptr<Document> HTMLParser::parse(const std::wstring& html) {
     s = html; pos = 0;
+    open_.clear();
     auto doc = std::make_shared<Document>();
     // find <body> element and set it as body; we'll create a fake root if needed
     // simple strategy: parse top-level nodes and search for body. Bare text
@@ -266,6 +306,17 @@ std::shared_ptr<Document> HTMLParser::parse(const std::wstring& html) {
     // rather than dropped, so e.g. `el.innerHTML = "plain text"` works.
     std::vector<std::shared_ptr<Node>> top;
     while (pos < s.size()) {
+        if (pos + 9 <= s.size() && s[pos] == L'<' && s[pos + 1] == L'!') {
+            std::wstring decl = s.substr(pos, std::min<size_t>(s.find(L'>', pos), s.size()) - pos);
+            for (auto& c : decl) c = (wchar_t)towlower(c);
+            if (decl.rfind(L"<!doctype", 0) == 0) {
+                // <!DOCTYPE html> means standards mode, as does any doctype
+                // but an HTML 4 transitional/frameset one without a system
+                // identifier (the URL) - those, and no doctype, are quirks.
+                bool legacy = decl.find(L"transitional") != std::wstring::npos || decl.find(L"frameset") != std::wstring::npos;
+                doc->quirks = legacy && decl.find(L"http") == std::wstring::npos;
+            }
+        }
         if (skipMarkup()) continue;
         if (pos < s.size() && s[pos] == L'<') {
             if (pos + 1 < s.size() && s[pos + 1] == L'/') { // stray end

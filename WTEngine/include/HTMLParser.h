@@ -9,6 +9,10 @@ public:
 private:
     size_t pos;
     std::wstring s;
+    // Tag names of the elements being parsed, outermost first: an end tag
+    // naming one of them closes everything opened inside it.
+    std::vector<std::wstring> open_;
+    std::wstring peekTagName(size_t at);
     void skipSpace();
     bool skipMarkup();
     bool startsWith(const std::wstring& token);

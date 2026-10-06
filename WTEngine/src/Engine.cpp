@@ -565,6 +565,7 @@ void Engine::parseAndBuild(const std::wstring& html) {
     if (document && document->body) {
         layoutRoot.rootNode = document->body.get();
         layoutRoot.rules = &document->styles;
+        layoutRoot.quirks = document->quirks;
     }
     else {
         layoutRoot.rules = nullptr;

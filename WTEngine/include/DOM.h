@@ -35,4 +35,7 @@ struct Document {
     std::shared_ptr<Element> root;
     std::shared_ptr<Element> body;
     std::vector<CSS::Rule> styles; // from every <style> block on the page
+    // Quirks mode: no <!DOCTYPE html> (or an old transitional one). Only a
+    // few layout rules differ - see LayoutRoot::quirks.
+    bool quirks = true;
 };
