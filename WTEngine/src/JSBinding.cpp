@@ -17,6 +17,8 @@
 #include <map>
 #include <set>
 #include <mutex>
+#include <deque>
+#include <chrono>
 
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
 
@@ -115,14 +117,34 @@ struct Timer {
     double nextFire;      // absolute engine-clock time this timer is next due
     bool repeating;
 };
+// A requestAnimationFrame callback. Its id is in a separate space from
+// timer ids, as in browsers.
+struct FrameCallback {
+    int id;
+    JSValue callback;
+};
 struct TimerStorage {
     std::vector<Timer> timers;
     int nextId = 1;
-    double now = 0; // last time seen via fireDueTimers; baseline new timers schedule against
+    // requestAnimationFrame: callbacks for the next frame, and the batch
+    // runAnimationFrames is running now (cancelAnimationFrame can still
+    // cancel one of those - its callback becomes undefined).
+    std::vector<FrameCallback> frameCallbacks, runningFrame;
+    int nextFrameId = 1;
+    // Tasks queued from JS (__wtQueueTask - postMessage deliveries), run in
+    // order by runQueuedTasks.
+    std::deque<JSValue> tasks;
+    // The page's clock - for timers and performance.now() alike: seconds
+    // since this page's bindings were installed.
+    std::chrono::steady_clock::time_point origin = std::chrono::steady_clock::now();
+    double seconds() const { return std::chrono::duration<double>(std::chrono::steady_clock::now() - origin).count(); }
     JSContext* ctx = nullptr;
     ~TimerStorage() {
         if (!ctx) return;
         for (auto& t : timers) JS_FreeValue(ctx, t.callback);
+        for (auto& f : frameCallbacks) JS_FreeValue(ctx, f.callback);
+        for (auto& f : runningFrame) JS_FreeValue(ctx, f.callback);
+        for (auto& t : tasks) JS_FreeValue(ctx, t);
     }
 };
 
@@ -1092,7 +1114,7 @@ static JSValue js_setTimer(JSContext* ctx, JSValueConst /*this_val*/, int argc, 
 
     TimerStorage& ts = *state->timers;
     int id = ts.nextId++;
-    ts.timers.push_back({ id, JS_DupValue(ctx, argv[0]), delaySeconds, ts.now + delaySeconds, magic == 1 });
+    ts.timers.push_back({ id, JS_DupValue(ctx, argv[0]), delaySeconds, ts.seconds() + delaySeconds, magic == 1 });
     return JS_NewInt32(ctx, id);
 }
 
@@ -1111,11 +1133,11 @@ static JSValue js_clearTimer(JSContext* ctx, JSValueConst /*this_val*/, int argc
     return JS_UNDEFINED;
 }
 
-void fireDueTimers(JSContext* ctx, double nowSeconds) {
+void fireDueTimers(JSContext* ctx) {
     DOMBindingState* state = bindingState(ctx);
     if (!state) return;
     TimerStorage& ts = *state->timers;
-    ts.now = nowSeconds;
+    const double nowSeconds = ts.seconds();
 
     // Snapshot which timers are due first, then re-look-up each by id right
     // before calling it - same iterate-a-copy defense event dispatch uses
@@ -1162,6 +1184,114 @@ void fireDueTimers(JSContext* ctx, double nowSeconds) {
             JS_FreeValue(ctx, it->callback);
             ts.timers.erase(it);
         }
+    }
+}
+
+// --- requestAnimationFrame, queued tasks, performance.now ---------------
+
+// Calls `fn` the way every engine-driven callback is called: a fresh
+// watchdog budget, an exception reported to the console under `source`,
+// then a microtask checkpoint.
+static void callCallback(JSContext* ctx, JSValueConst fn, int argc, JSValueConst* argv, const wchar_t* source) {
+    ArmScriptWatchdog(ctx);
+    JSValue result = JS_Call(ctx, fn, JS_UNDEFINED, argc, argv);
+    if (JS_IsException(result)) reportException(ctx, JS_GetException(ctx), source);
+    JS_FreeValue(ctx, result);
+    runPendingJobs(ctx);
+}
+
+static double performanceNow(const TimerStorage& ts) {
+    return ts.seconds() * 1000.0;
+}
+
+static JSValue js_requestAnimationFrame(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state) return JS_NewInt32(ctx, 0);
+    if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
+        return JS_ThrowTypeError(ctx, "Failed to execute 'requestAnimationFrame' on 'Window': The callback provided as parameter 1 is not a function.");
+    TimerStorage& ts = *state->timers;
+    int id = ts.nextFrameId++;
+    ts.frameCallbacks.push_back({ id, JS_DupValue(ctx, argv[0]) });
+    return JS_NewInt32(ctx, id);
+}
+
+static JSValue js_cancelAnimationFrame(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state || argc < 1) return JS_UNDEFINED;
+    int32_t id = 0;
+    JS_ToInt32(ctx, &id, argv[0]);
+    TimerStorage& ts = *state->timers;
+    auto it = std::find_if(ts.frameCallbacks.begin(), ts.frameCallbacks.end(), [&](const FrameCallback& f) { return f.id == id; });
+    if (it != ts.frameCallbacks.end()) {
+        JS_FreeValue(ctx, it->callback);
+        ts.frameCallbacks.erase(it);
+    }
+    // One still waiting its turn in the batch running now.
+    for (auto& f : ts.runningFrame)
+        if (f.id == id) { JS_FreeValue(ctx, f.callback); f.callback = JS_UNDEFINED; }
+    return JS_UNDEFINED;
+}
+
+// __wtQueueTask(fn): runs fn as a task of its own, after the current one
+// and its microtasks - what postMessage deliveries go through.
+static JSValue js_native_queueTask(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    DOMBindingState* state = bindingState(ctx);
+    if (state && argc >= 1 && JS_IsFunction(ctx, argv[0])) state->timers->tasks.push_back(JS_DupValue(ctx, argv[0]));
+    return JS_UNDEFINED;
+}
+
+// __wtNow(): performance.now() - milliseconds since the page started, with
+// sub-millisecond precision.
+static JSValue js_native_now(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
+    DOMBindingState* state = bindingState(ctx);
+    return JS_NewFloat64(ctx, state ? performanceNow(*state->timers) : 0.0);
+}
+
+// __wtReportError(error, source): reports an error the page didn't catch -
+// one thrown by a queueMicrotask callback, say - to the developer console.
+static JSValue js_native_reportError(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    std::wstring source = L"script";
+    if (argc >= 2) {
+        const char* s = JS_ToCString(ctx, argv[1]);
+        if (s) { source = std::wstring(s, s + strlen(s)); JS_FreeCString(ctx, s); }
+    }
+    reportException(ctx, JS_DupValue(ctx, argc >= 1 ? argv[0] : JS_UNDEFINED), source.c_str());
+    return JS_UNDEFINED;
+}
+
+void runAnimationFrames(JSContext* ctx) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state) return;
+    TimerStorage& ts = *state->timers;
+    if (ts.frameCallbacks.empty()) return;
+    // This frame's batch: anything requested while it runs waits for the
+    // next frame, as in browsers. Every callback gets the same timestamp.
+    ts.runningFrame.swap(ts.frameCallbacks);
+    JSValue now = JS_NewFloat64(ctx, performanceNow(ts));
+    for (size_t i = 0; i < ts.runningFrame.size(); i++) {
+        JSValue fn = ts.runningFrame[i].callback;
+        if (JS_IsUndefined(fn)) continue; // cancelled earlier in this batch
+        ts.runningFrame[i].callback = JS_UNDEFINED;
+        callCallback(ctx, fn, 1, &now, L"animation frame");
+        JS_FreeValue(ctx, fn);
+    }
+    ts.runningFrame.clear();
+}
+
+void runQueuedTasks(JSContext* ctx, double budgetSeconds) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state) return;
+    TimerStorage& ts = *state->timers;
+    // Tasks queued while these run (a scheduler posting itself its next
+    // slice of work) run in the same frame, until the budget is spent -
+    // then the rest wait for the next frame, so the page keeps painting.
+    auto start = std::chrono::steady_clock::now();
+    while (!ts.tasks.empty()) {
+        JSValue fn = ts.tasks.front();
+        ts.tasks.pop_front();
+        callCallback(ctx, fn, 0, nullptr, L"message");
+        JS_FreeValue(ctx, fn);
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= budgetSeconds) break;
     }
 }
 
@@ -1835,6 +1965,122 @@ static const char kBootstrapJS[] = R"JS(
     return e;
   };
 
+  // --- Scheduling: performance.now(), queueMicrotask, postMessage and
+  // MessageChannel. Tasks go through the native __wtQueueTask, which the
+  // engine runs each frame (runQueuedTasks) - not setTimeout, whose
+  // one-frame wait is what pages use MessageChannel to avoid.
+  const timeOrigin = Date.now();
+  g.performance = {
+    now: () => __wtNow(),
+    timeOrigin,
+    toJSON() { return { timeOrigin }; },
+  };
+
+  g.queueMicrotask = cb => {
+    if (typeof cb !== 'function')
+      throw new TypeError("Failed to execute 'queueMicrotask' on 'Window': The callback provided as parameter 1 is not a function.");
+    Promise.resolve().then(() => {
+      try { cb(); } catch (e) { __wtReportError(e, 'microtask'); }
+    });
+  };
+
+  class MessageEvent extends Event {
+    constructor(type, init) {
+      super(type, init);
+      init = init || {};
+      this.data = init.data === undefined ? null : init.data;
+      this.origin = init.origin === undefined ? '' : String(init.origin);
+      this.lastEventId = init.lastEventId === undefined ? '' : String(init.lastEventId);
+      this.source = init.source || null;
+      this.ports = init.ports || [];
+    }
+  }
+  g.MessageEvent = eventClasses.MessageEvent = MessageEvent;
+
+  // One end of a MessageChannel. Messages are delivered as tasks, in order,
+  // once the port is started - by start(), or by setting onmessage.
+  // Simplified: data isn't cloned (the receiver gets the same object) and
+  // ports can't be transferred.
+  class MessagePort {
+    constructor() {
+      hidden(this, '_other', null);
+      hidden(this, '_started', false);
+      hidden(this, '_closed', false);
+      hidden(this, '_queue', []);
+      hidden(this, '_listeners', []);
+      hidden(this, '_onmessage', null);
+      this.onmessageerror = null;
+    }
+    get onmessage() { return this._onmessage; }
+    set onmessage(fn) { this._onmessage = typeof fn === 'function' ? fn : null; this.start(); }
+    postMessage(data) {
+      const to = this._other;
+      if (this._closed || !to || to._closed) return;
+      __wtQueueTask(() => to._receive(data));
+    }
+    start() {
+      if (this._started) return;
+      this._started = true;
+      const queued = this._queue.splice(0);
+      for (const data of queued) __wtQueueTask(() => this._deliver(data));
+    }
+    close() { this._closed = true; }
+    addEventListener(type, fn, options) {
+      if (!fn || this._listeners.some(l => l.type === type && l.fn === fn)) return;
+      const once = !!(options && typeof options === 'object' && options.once);
+      this._listeners.push({ type: String(type), fn, once });
+    }
+    removeEventListener(type, fn) {
+      const i = this._listeners.findIndex(l => l.type === type && l.fn === fn);
+      if (i >= 0) this._listeners.splice(i, 1);
+    }
+    dispatchEvent(event) {
+      event.target = event.currentTarget = this;
+      event.eventPhase = 2;
+      const call = fn => {
+        try { typeof fn === 'function' ? fn.call(this, event) : fn.handleEvent(event); }
+        catch (e) { __wtReportError(e, event.type + ' listener'); }
+      };
+      if (event.type === 'message' && this._onmessage) call(this._onmessage);
+      for (const l of this._listeners.slice()) {
+        if (l.type !== event.type || !this._listeners.includes(l)) continue;
+        if (l.once) this.removeEventListener(l.type, l.fn);
+        call(l.fn);
+        if (event.__wtStopImmediate) break;
+      }
+      event.currentTarget = null;
+      event.eventPhase = 0;
+      return !event.defaultPrevented;
+    }
+    _receive(data) {
+      if (this._closed) return;
+      if (this._started) this._deliver(data);
+      else this._queue.push(data);
+    }
+    _deliver(data) {
+      if (!this._closed) this.dispatchEvent(new MessageEvent('message', { data }));
+    }
+  }
+  class MessageChannel {
+    constructor() {
+      this.port1 = new MessagePort();
+      this.port2 = new MessagePort();
+      this.port1._other = this.port2;
+      this.port2._other = this.port1;
+    }
+  }
+  g.MessagePort = MessagePort;
+  g.MessageChannel = MessageChannel;
+
+  // window.postMessage: a 'message' event at window, as a task. Every page
+  // is its own top-level window here, so the target origin only has to be
+  // valid; the data isn't cloned.
+  g.postMessage = (data, targetOrigin) => {
+    const m = /^(https?:\/\/[^\/?#]*)/i.exec(String(location.href));
+    const origin = m ? m[1].toLowerCase() : 'null'; // a file: page's origin is opaque
+    __wtQueueTask(() => g.dispatchEvent(new MessageEvent('message', { data, origin, source: g })));
+  };
+
   // --- localStorage / sessionStorage: a Proxy, so storage.foo and
   // storage['foo'] read and write items as well as getItem/setItem do.
   class Storage { constructor() { throw new TypeError('Illegal constructor'); } }
@@ -2059,6 +2305,11 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_MAGIC_DEF("setInterval", 2, js_setTimer, 1),
     JS_CFUNC_DEF("clearTimeout", 1, js_clearTimer),
     JS_CFUNC_DEF("clearInterval", 1, js_clearTimer),
+    JS_CFUNC_DEF("requestAnimationFrame", 1, js_requestAnimationFrame),
+    JS_CFUNC_DEF("cancelAnimationFrame", 1, js_cancelAnimationFrame),
+    JS_CFUNC_DEF("__wtQueueTask", 1, js_native_queueTask), // behind postMessage - see kBootstrapJS
+    JS_CFUNC_DEF("__wtNow", 0, js_native_now),             // behind performance.now()
+    JS_CFUNC_DEF("__wtReportError", 2, js_native_reportError),
     JS_CGETSET_DEF("location", js_get_location, js_set_location),
     JS_CFUNC_DEF("addEventListener", 2, js_window_addEventListener),
     JS_CFUNC_DEF("removeEventListener", 2, js_window_removeEventListener),

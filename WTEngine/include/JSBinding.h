@@ -128,11 +128,23 @@ bool fireSubmitEvent(JSContext* ctx, Element* form, Element* submitter);
 // "readystatechange" at document.
 void advanceReadyState(JSContext* ctx, const wchar_t* state);
 
-// Fires any setTimeout/setInterval callback due by `nowSeconds` - the same
-// clock Engine::render's `timeSeconds` parameter already uses (glfwGetTime()
-// via main.cpp). Called once per frame from Engine::render, the same
-// per-frame polling pattern already used for domDirty/imageGeneration.
-void fireDueTimers(JSContext* ctx, double nowSeconds);
+// Fires any setTimeout/setInterval callback that's due, by the page's own
+// clock (the one performance.now() reads - a timer set while a page loads
+// counts from when it was set, not from the last frame). Called once per
+// frame from Engine::render, the same per-frame polling pattern already
+// used for domDirty/imageGeneration.
+void fireDueTimers(JSContext* ctx);
+
+// Runs the requestAnimationFrame callbacks queued before this frame, each
+// with the same performance.now() timestamp; ones requested meanwhile wait
+// for the next frame. Called once per frame from Engine::render, right
+// before the relayout check, so what they change is painted this frame.
+void runAnimationFrames(JSContext* ctx);
+
+// Runs tasks queued from JS (postMessage deliveries, for window and
+// MessageChannel), each followed by its microtasks. Tasks they queue run
+// too, until `budgetSeconds` is spent; the rest wait for the next frame.
+void runQueuedTasks(JSContext* ctx, double budgetSeconds);
 
 // Settles the promise of every fetch() whose background request has
 // finished since the last call (resolving with a Response, or rejecting

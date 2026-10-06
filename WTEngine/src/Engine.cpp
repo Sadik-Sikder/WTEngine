@@ -685,7 +685,12 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
 
     // A setTimeout/setInterval callback may mutate the DOM below (sets
     // domDirty, same as any other script), so this runs before that check.
-    if (jsEngine) fireDueTimers(jsEngine->context(), timeSeconds);
+    if (jsEngine) fireDueTimers(jsEngine->context());
+
+    // postMessage deliveries (window and MessageChannel) - tasks a page
+    // queues to run "as soon as possible", without setTimeout's one-frame
+    // wait. Given up to 8 ms of the frame; the rest wait for the next.
+    if (jsEngine) runQueuedTasks(jsEngine->context(), 0.008);
 
     // Same for fetch() promises whose request has finished since last frame.
     if (jsEngine) pollFetches(jsEngine->context());
@@ -694,6 +699,10 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     // may have just landed - apply whatever's newly ready (also sets
     // domDirty on anything that changes; see pollResources).
     pollResources();
+
+    // requestAnimationFrame callbacks: last before the relayout check, so
+    // the DOM changes they make are laid out and painted this frame.
+    if (jsEngine) runAnimationFrames(jsEngine->context());
 
     // A script mutated the DOM (appendChild, textContent=, setAttribute,
     // innerHTML=, ...) since the last layout - re-layout to pick it up.
