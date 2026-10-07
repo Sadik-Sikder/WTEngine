@@ -346,6 +346,12 @@ private:
     struct GridTrack {
         bool isFr;
         float value;
+        // A content-sized track (auto, min-content, max-content,
+        // fit-content()): as wide as the widest item that sits in it alone.
+        bool isAuto = false;
+        // An upper bound in px, or -1: fit-content(<cap>), or the max of
+        // minmax(<min>, <cap>) on an fr-like track that grows up to it.
+        float cap = -1;
     };
     struct ComputedStyle {
         std::wstring background;
@@ -479,11 +485,12 @@ private:
                             int& top, int& right, int& bottom, int& left);
     // Parses a grid-template-columns/grid-template-rows value (the track
     // grammar is identical for both axes, so one parser serves both - see
-    // the .cpp for exactly what's supported: px/%/fr tracks and
-    // repeat(N, <track>); an unsupported keyword like auto or minmax()
-    // becomes 1fr, so the track *count* an author wrote is always honored
-    // even where the sizing isn't).
-    std::vector<GridTrack> parseGridTemplateTracks(const std::wstring& v, int containingWidth);
+    // the .cpp for exactly what's supported: px/%/em/rem/vw/fr tracks,
+    // auto/min-content/max-content/fit-content(), minmax() and
+    // repeat(N, <track>); anything else becomes 1fr, so the track *count*
+    // an author wrote is always honored even where the sizing isn't).
+    // `fontSize` is what em resolves against.
+    std::vector<GridTrack> parseGridTemplateTracks(const std::wstring& v, int containingWidth, int fontSize);
     // Parses one side of a grid-column/grid-row - "auto", a line number
     // "N" (negative counts from the end), or "span N" - into `line`
     // (0 = auto) or `span` (0 = none). Named lines aren't supported.
@@ -493,24 +500,23 @@ private:
     // into start/end lines and a span (see parseGridLine). Returns false
     // (leaving the outputs untouched) for anything else.
     bool parseGridLinePlacement(const std::wstring& v, int& start, int& end, int& span);
-    // Parses a grid-template-areas value - one or more quoted strings, each
-    // one grid row, each whitespace-separated token in it one column's area
-    // name ("." means no area). Returns an empty grid (not a partial one)
+    // Parses a grid-template-areas value - one or more quoted strings (single
+    // or double quotes), each one grid row, each whitespace-separated token
+    // in it one column's area name ("." means no area). Returns an empty grid (not a partial one)
     // for anything malformed: an unterminated quoted string, or rows with
     // different column counts - real CSS requires every row to name the
     // same number of columns, and this engine does too, just by rejecting
     // the whole thing rather than trying to reconcile mismatched rows.
     std::vector<std::vector<std::wstring>> parseGridTemplateAreas(const std::wstring& v);
-    // Parses the grid-template shorthand's area-string form - e.g.
+    // Parses the grid-template shorthand: either the area-string form - e.g.
     // `"header header" 40px "sidebar main" 1fr / 100px 1fr` - into areas
     // (via parseGridTemplateAreas), row tracks (one per area-row, an
     // optional track size token right after its closing quote - see the
     // .cpp for how "no size given" is distinguished from "explicit 0"),
     // and column tracks (the part after the top-level '/', via
-    // parseGridTemplateTracks). Only this form is supported, not the
-    // plainer "<rows> / <columns>" form with no area strings at all - use
-    // the grid-template-rows/columns longhands for that instead.
-    void parseGridTemplateShorthand(const std::wstring& v, int containingWidth,
+    // parseGridTemplateTracks); or the plain `<rows> / <columns>` form,
+    // track lists on both sides.
+    void parseGridTemplateShorthand(const std::wstring& v, int containingWidth, int fontSize,
                                      std::vector<std::vector<std::wstring>>& areas,
                                      std::vector<GridTrack>& rowTracks, std::vector<GridTrack>& colTracks);
     void layoutControl(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);

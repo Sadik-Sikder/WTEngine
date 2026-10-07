@@ -1358,13 +1358,13 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
                 }
             }
         }
-        else if (prop == P_grid_template_columns) sv.gridTemplateColumns = parseGridTemplateTracks(v, containingWidth);
-        else if (prop == P_grid_template_rows) sv.gridTemplateRows = parseGridTemplateTracks(v, containingWidth);
+        else if (prop == P_grid_template_columns) sv.gridTemplateColumns = parseGridTemplateTracks(v, containingWidth, sv.fontSize);
+        else if (prop == P_grid_template_rows) sv.gridTemplateRows = parseGridTemplateTracks(v, containingWidth, sv.fontSize);
         else if (prop == P_grid_template_areas) sv.gridTemplateAreas = parseGridTemplateAreas(v);
         else if (prop == P_grid_template) {
             std::vector<std::vector<std::wstring>> areas;
             std::vector<GridTrack> rowTracks, colTracks;
-            parseGridTemplateShorthand(v, containingWidth, areas, rowTracks, colTracks);
+            parseGridTemplateShorthand(v, containingWidth, sv.fontSize, areas, rowTracks, colTracks);
             if (!areas.empty()) sv.gridTemplateAreas = std::move(areas);
             if (!rowTracks.empty()) sv.gridTemplateRows = std::move(rowTracks);
             if (!colTracks.empty()) sv.gridTemplateColumns = std::move(colTracks);
@@ -1668,15 +1668,21 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
 
 // See the declaration in Layout.h for what's supported. repeat(N, <track>)
 // is expanded textually first (e.g. "repeat(3, 1fr)" -> "1fr 1fr 1fr"),
-// then the result is just a space-separated list of px/%/fr tokens.
-std::vector<LayoutRoot::GridTrack> LayoutRoot::parseGridTemplateTracks(const std::wstring& v, int containingWidth) {
+// then the result is a space-separated list of tracks (minmax(a, b) and
+// fit-content(x) kept whole).
+std::vector<LayoutRoot::GridTrack> LayoutRoot::parseGridTemplateTracks(const std::wstring& v, int containingWidth, int fontSize) {
     std::wstring expanded;
     size_t i = 0;
     while (i < v.size()) {
         size_t rep = v.find(L"repeat(", i);
         if (rep == std::wstring::npos) { expanded += v.substr(i); break; }
         expanded += v.substr(i, rep - i);
-        size_t close = v.find(L')', rep);
+        // The matching ")" - the track inside can have its own (minmax(...)).
+        size_t close = std::wstring::npos;
+        for (size_t j = rep + 7, depth = 1; j < v.size(); j++) {
+            if (v[j] == L'(') depth++;
+            else if (v[j] == L')' && --depth == 0) { close = j; break; }
+        }
         if (close == std::wstring::npos) break; // unterminated repeat(; stop, keep what we have so far
 
         std::wstring args = v.substr(rep + 7, close - rep - 7); // between "repeat(" and ")"
@@ -1691,20 +1697,55 @@ std::vector<LayoutRoot::GridTrack> LayoutRoot::parseGridTemplateTracks(const std
         i = close + 1;
     }
 
-    std::vector<GridTrack> tracks;
-    std::wistringstream ss(expanded);
-    std::wstring tok;
-    while (ss >> tok) {
-        if (tok.size() > 2 && tok.compare(tok.size() - 2, 2, L"fr") == 0) {
-            try { tracks.push_back({ true, (float)std::stod(tok.substr(0, tok.size() - 2)) }); }
-            catch (...) { tracks.push_back({ true, 1.0f }); }
-            continue;
+    // A length: px, %, vw/vh, or em/rem (rem against the 14px base - see
+    // LayoutRoot::layout - em against the element's font size).
+    auto length = [&](const std::wstring& t, float& out) {
+        double n; std::wstring unit;
+        if (!parseNumberAndUnit(t, n, unit)) return false;
+        if (unit == L"em") { out = (float)(n * fontSize); return true; }
+        if (unit == L"rem") { out = (float)(n * 14); return true; }
+        int px = resolveLength(t, containingWidth, -1);
+        if (px < 0) return false;
+        out = (float)px;
+        return true;
+    };
+    auto isFr = [](const std::wstring& t, float& out) {
+        if (t.size() < 3 || t.compare(t.size() - 2, 2, L"fr") != 0) return false;
+        try { out = (float)std::stod(t.substr(0, t.size() - 2)); } catch (...) { out = 1.0f; }
+        return true;
+    };
+    auto isContentKeyword = [](const std::wstring& t) {
+        return t == L"auto" || t == L"min-content" || t == L"max-content";
+    };
+    auto track = [&](std::wstring t) -> GridTrack {
+        t = lowerCase(trimmed(t));
+        float n;
+        if (isFr(t, n)) return { true, n };
+        if (isContentKeyword(t)) return { false, 0, true };
+        if (t.rfind(L"fit-content(", 0) == 0 && t.back() == L')') {
+            GridTrack g{ false, 0, true };
+            if (length(t.substr(12, t.size() - 13), n)) g.cap = n;
+            return g;
         }
-        int px = resolveLength(tok, containingWidth, -1);
-        // A keyword this doesn't understand (auto, minmax(...), fit-content(...),
-        // ...) becomes 1fr - see the Layout.h comment on why.
-        tracks.push_back(px >= 0 ? GridTrack{ false, (float)px } : GridTrack{ true, 1.0f });
-    }
+        if (t.rfind(L"minmax(", 0) == 0 && t.back() == L')') {
+            // minmax(<min>, <max>): sized by its max - an fr share, the
+            // content, or growing (like 1fr) up to a length. The min isn't
+            // enforced.
+            std::wstring inner = t.substr(7, t.size() - 8);
+            size_t comma = inner.find(L',');
+            std::wstring mx = trimmed(comma == std::wstring::npos ? inner : inner.substr(comma + 1));
+            if (isFr(mx, n)) return { true, n };
+            if (isContentKeyword(mx)) return { false, 0, true };
+            GridTrack g{ true, 1.0f };
+            if (length(mx, n)) g.cap = n;
+            return g;
+        }
+        if (length(t, n)) return { false, n };
+        return { true, 1.0f }; // not understood: 1fr - see the Layout.h comment on why
+    };
+
+    std::vector<GridTrack> tracks;
+    for (const auto& tok : cssTokens(expanded)) tracks.push_back(track(tok));
     return tracks;
 }
 
@@ -1746,14 +1787,20 @@ bool LayoutRoot::parseGridLinePlacement(const std::wstring& v, int& start, int& 
     return true;
 }
 
+// The next quote (either kind) at or after `from`, or npos. A string ends at
+// the next quote of the same kind.
+static size_t findQuote(const std::wstring& s, size_t from) {
+    return s.find_first_of(L"\"'", from);
+}
+
 // See the declaration in Layout.h for the grammar/scope.
 std::vector<std::vector<std::wstring>> LayoutRoot::parseGridTemplateAreas(const std::wstring& v) {
     std::vector<std::vector<std::wstring>> rows;
     size_t i = 0;
     while (i < v.size()) {
-        size_t open = v.find(L'"', i);
+        size_t open = findQuote(v, i);
         if (open == std::wstring::npos) break;
-        size_t close = v.find(L'"', open + 1);
+        size_t close = v.find(v[open], open + 1);
         if (close == std::wstring::npos) return {}; // unterminated string - malformed, bail on the whole value
 
         std::wistringstream ss(v.substr(open + 1, close - open - 1));
@@ -1771,17 +1818,26 @@ std::vector<std::vector<std::wstring>> LayoutRoot::parseGridTemplateAreas(const 
 // top-level '/' first (an area string never contains one); everything
 // before it is scanned for alternating quoted area-rows and an optional
 // track-size token right after each one's closing quote.
-void LayoutRoot::parseGridTemplateShorthand(const std::wstring& v, int containingWidth,
+void LayoutRoot::parseGridTemplateShorthand(const std::wstring& v, int containingWidth, int fontSize,
                                              std::vector<std::vector<std::wstring>>& areas,
                                              std::vector<GridTrack>& rowTracks, std::vector<GridTrack>& colTracks) {
     size_t slash = v.find(L'/');
     std::wstring rowsPart = slash == std::wstring::npos ? v : v.substr(0, slash);
 
+    // The plain form: `<rows> / <columns>`, no area strings.
+    if (findQuote(rowsPart, 0) == std::wstring::npos) {
+        std::wstring rows = lowerCase(trimmed(rowsPart));
+        if (rows.empty() || rows == L"none") return;
+        rowTracks = parseGridTemplateTracks(rows, containingWidth, fontSize);
+        if (slash != std::wstring::npos) colTracks = parseGridTemplateTracks(trimmed(v.substr(slash + 1)), containingWidth, fontSize);
+        return;
+    }
+
     size_t i = 0;
     while (i < rowsPart.size()) {
-        size_t open = rowsPart.find(L'"', i);
+        size_t open = findQuote(rowsPart, i);
         if (open == std::wstring::npos) break;
-        size_t close = rowsPart.find(L'"', open + 1);
+        size_t close = rowsPart.find(rowsPart[open], open + 1);
         if (close == std::wstring::npos) { areas.clear(); rowTracks.clear(); return; } // unterminated - bail
 
         std::wistringstream ss(rowsPart.substr(open + 1, close - open - 1));
@@ -1798,10 +1854,10 @@ void LayoutRoot::parseGridTemplateShorthand(const std::wstring& v, int containin
         // actually-parsed 0px: layoutGrid already treats any isFr track as
         // unset/auto for rows (see gridTemplateRows's own comment), so
         // this rides that same rule for free instead of needing a new one.
-        size_t nextOpen = rowsPart.find(L'"', close + 1);
+        size_t nextOpen = findQuote(rowsPart, close + 1);
         std::wstring between = trimmed(rowsPart.substr(close + 1, (nextOpen == std::wstring::npos ? rowsPart.size() : nextOpen) - close - 1));
         if (!between.empty()) {
-            auto parsed = parseGridTemplateTracks(between, containingWidth);
+            auto parsed = parseGridTemplateTracks(between, containingWidth, fontSize);
             rowTracks.push_back(!parsed.empty() ? parsed[0] : GridTrack{ true, 0.0f });
         } else {
             rowTracks.push_back({ true, 0.0f });
@@ -1809,7 +1865,7 @@ void LayoutRoot::parseGridTemplateShorthand(const std::wstring& v, int containin
         i = close + 1;
     }
 
-    if (slash != std::wstring::npos) colTracks = parseGridTemplateTracks(trimmed(v.substr(slash + 1)), containingWidth);
+    if (slash != std::wstring::npos) colTracks = parseGridTemplateTracks(trimmed(v.substr(slash + 1)), containingWidth, fontSize);
 }
 
 // Places one <input> or <button> as a box of its own. Controls are laid out
@@ -2725,23 +2781,6 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
     if (cols.empty()) cols.push_back({ false, (float)containingWidth }); // no template at all -> one full-width column
     int numCols = (int)cols.size();
 
-    int colGap = style.columnGap;
-    int fixedTotal = 0;
-    float frTotal = 0;
-    for (auto& t : cols) { if (t.isFr) frTotal += t.value; else fixedTotal += (int)std::lround(t.value); }
-    int remaining = std::max(containingWidth - colGap * std::max(numCols - 1, 0) - fixedTotal, 0);
-
-    std::vector<int> colWidths(numCols), colX(numCols);
-    int cx = x;
-    for (int i = 0; i < numCols; i++) {
-        int w = cols[i].isFr
-            ? (frTotal > 0 ? (int)std::lround(remaining * (cols[i].value / frTotal)) : 0)
-            : (int)std::lround(cols[i].value);
-        colWidths[i] = std::max(w, 0);
-        colX[i] = cx;
-        cx += colWidths[i] + colGap;
-    }
-
     // Resolve each item's grid-column/grid-row against the template (see
     // ComputedStyle's comment on those fields) into a 0-based cell range
     // per axis, or leave that axis auto (-1) with just a span size for
@@ -2841,6 +2880,50 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
     }
     int numRows = maxRowUsed + 1;
 
+    // Column widths, now that it's known what sits in each column: fixed
+    // tracks first; then content-sized ones (auto, min-content, ...), each
+    // as wide as the widest item placed in it alone (shrink-to-fit, up to
+    // what's left and its cap); then fr tracks share the rest (each up to
+    // its cap, for minmax(0, <length>)).
+    const int colGap = style.columnGap;
+    std::vector<int> colWidths(numCols, 0), colX(numCols);
+    int used = colGap * std::max(numCols - 1, 0);
+    for (int i = 0; i < numCols; i++) {
+        if (cols[i].isFr || cols[i].isAuto) continue;
+        colWidths[i] = std::max((int)std::lround(cols[i].value), 0);
+        used += colWidths[i];
+    }
+    for (int i = 0; i < numCols; i++) {
+        if (!cols[i].isAuto) continue;
+        int available = std::max(containingWidth - used, 0);
+        int w = 0;
+        for (const auto& p : placements) {
+            if (p.colStart != i || p.colEnd != i + 1) continue;
+            const ComputedStyle& s = p.style;
+            if (s.width >= 0) {
+                int chrome = s.boxSizing == BoxSizing::BorderBox ? 0 : s.paddingLeft + s.paddingRight + 2 * s.borderWidth;
+                w = std::max(w, s.marginLeft + s.width + chrome + s.marginRight);
+            }
+            else w = std::max(w, shrinkToFitWidth(p.el, s, available));
+        }
+        if (cols[i].cap >= 0) w = std::min(w, (int)std::lround(cols[i].cap));
+        colWidths[i] = std::min(w, available);
+        used += colWidths[i];
+    }
+    float frTotal = 0;
+    for (const auto& t : cols) if (t.isFr) frTotal += t.value;
+    const int remaining = std::max(containingWidth - used, 0);
+    for (int i = 0; i < numCols; i++) {
+        if (!cols[i].isFr) continue;
+        int w = frTotal > 0 ? (int)std::lround(remaining * (cols[i].value / frTotal)) : 0;
+        if (cols[i].cap >= 0) w = std::min(w, (int)std::lround(cols[i].cap));
+        colWidths[i] = std::max(w, 0);
+    }
+    for (int i = 0, cx = x; i < numCols; i++) {
+        colX[i] = cx;
+        cx += colWidths[i] + colGap;
+    }
+
     // Lay out every item at its resolved span width to discover its
     // natural height, exactly as layoutFlex does per item.
     std::vector<std::vector<LayoutBox>> itemBoxes(placements.size());
@@ -2881,7 +2964,7 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
     std::vector<int> rowHeights(numRows, 0);
     std::vector<bool> rowExplicit(numRows, false);
     for (int r = 0; r < numRows; r++) {
-        if (r < (int)rowTracks.size() && !rowTracks[r].isFr) {
+        if (r < (int)rowTracks.size() && !rowTracks[r].isFr && !rowTracks[r].isAuto) {
             rowHeights[r] = (int)std::lround(rowTracks[r].value);
             rowExplicit[r] = true;
         }
