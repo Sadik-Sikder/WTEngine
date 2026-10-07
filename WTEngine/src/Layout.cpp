@@ -303,6 +303,10 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containin
             deferOutOfFlow(e, sv, 0, 0, false); // out of the flow; no position in the line is known here
             continue;
         }
+        if (sv.floatSide != ComputedStyle::Float::None) {
+            out.push_back(makeFloatItem(e, sv));
+            continue;
+        }
 
         // An image inside inline content (<a><svg>...</svg> Home</a>) sits
         // in the line like a word - never recursed into, so an <svg>'s
@@ -336,11 +340,40 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
     const int textInset = 4; // Engine::render draws text 4px inside its box
     // While measuring a table cell's min-content width, a line can be as
     // narrow as one word (see measuring_).
-    const float maxWidth = (float)std::max(containingWidth - 2 * textInset, measuring_ ? 0 : 40);
+    const float fullWidth = (float)std::max(containingWidth - 2 * textInset, measuring_ ? 0 : 40);
 
     struct Placed { InlineItem item; float offset; float width; };
     std::vector<Placed> line;
     float lineWidth = 0;
+
+    // The current line's left edge and width - the block's, unless floats
+    // beside it take some (openLine). text-align aligns within it.
+    int lineX = x;
+    float maxWidth = fullWidth;
+    float alignWidth = (float)std::max(containingWidth - 2 * textInset, 0);
+    // Floats met mid-line, placed below it once it's done.
+    std::vector<std::shared_ptr<FloatItem>> deferredFloats;
+
+    // Starts a line at `y` whose first item is `firstWidth` wide and about
+    // `height` tall: beside the floats there, or - if it doesn't fit there -
+    // lower down, past them.
+    auto openLine = [&](float firstWidth, int height) {
+        lineX = x;
+        maxWidth = fullWidth;
+        alignWidth = (float)std::max(containingWidth - 2 * textInset, 0);
+        if (!floatCtx_ || floatCtx_->floats.empty()) return;
+        for (;;) {
+            int left, right, next;
+            if (!spaceBeside(y, height, x, containingWidth, left, right, next)) return; // no float here
+            float avail = (float)std::max(right - left - 2 * textInset, 0);
+            if (avail >= firstWidth || next <= y) {
+                lineX = left;
+                maxWidth = alignWidth = avail;
+                return;
+            }
+            y = next;
+        }
+    };
 
     auto emitLine = [&]() {
         if (line.empty()) return;
@@ -361,7 +394,6 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
         // text-align: the whole line moves by its leftover width - of the
         // real width, not the 40px lines wrap at in narrower ones (a narrow
         // table column's right-aligned text would otherwise end past it).
-        const float alignWidth = (float)std::max(containingWidth - 2 * textInset, 0);
         float shift = 0;
         if (measuring_) {} // measured from the left edge
         else if (align == TextAlign::Center) shift = std::max(alignWidth - lineWidth, 0.0f) / 2;
@@ -369,7 +401,7 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
 
         for (size_t i = 0; i < line.size(); i++) {
             const Placed& p = line[i];
-            int left = x + (int)std::lround(p.offset + shift);
+            int left = lineX + (int)std::lround(p.offset + shift);
             if (p.item.image) {
                 LayoutBox box = *p.item.image;
                 // + textInset: offsets are measured where text is drawn, 4px
@@ -412,10 +444,17 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
         y += lineHeight;
         line.clear();
         lineWidth = 0;
+        for (const auto& f : deferredFloats) placeFloat(*f, x, containingWidth, y);
+        deferredFloats.clear();
     };
 
-    // A run of nothing but whitespace (between two blocks, say) takes no space.
-    if (std::all_of(items.begin(), items.end(), [](const InlineItem& i) { return i.isSpace; })) return;
+    // A run of nothing but whitespace (between two blocks, say) takes no
+    // space - though floats in it are still placed, where it is.
+    if (std::none_of(items.begin(), items.end(), [](const InlineItem& i) { return !i.isSpace && !i.floatItem; })) {
+        for (const auto& i : items)
+            if (i.floatItem) placeFloat(*i.floatItem, x, containingWidth, y);
+        return;
+    }
 
     // Whether the HTML had whitespace before the next item (see InlineItem).
     bool pendingSpace = false;
@@ -428,12 +467,18 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
     for (const auto& raw : items) {
         if (raw.isSpace) { pendingSpace = true; continue; }
         if (raw.isBreak) { emitLine(); pendingSpace = false; continue; }
+        if (raw.floatItem) {
+            if (line.empty()) placeFloat(*raw.floatItem, x, containingWidth, y);
+            else deferredFloats.push_back(raw.floatItem);
+            continue;
+        }
 
         if (raw.image) {
             // Wraps like a word; never split.
             float w = (float)(raw.marginLeft + raw.image->width + raw.marginRight);
             float spaceWidth = gapBefore(raw);
             if (!line.empty() && lineWidth + spaceWidth + w > maxWidth) emitLine();
+            if (line.empty()) openLine(w, raw.image->height);
             float offset = line.empty() ? 0 : lineWidth + spaceWidth;
             lineWidth = offset + w;
             line.push_back({ raw, offset, w });
@@ -444,11 +489,13 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
         InlineItem item = raw;
         float wordWidth = textWidth(item.word, item.fontSize, item.paint);
 
-        // A word wider than the line on its own gets broken by characters,
-        // one fragment per line, before whatever's left of it (now short
-        // enough) falls through to the normal wrapping below.
-        while (!measuring_ && wordWidth > maxWidth && item.word.size() > 1) {
+        // A word wider than the whole block gets broken by characters, one
+        // fragment per line (below any floats), before whatever's left of
+        // it (now short enough) falls through to the normal wrapping below.
+        const int band = lineBand(item.paint, item.fontSize);
+        while (!measuring_ && wordWidth > fullWidth && item.word.size() > 1) {
             if (!line.empty()) emitLine();
+            openLine(wordWidth, band);
             size_t n = 1;
             while (n < item.word.size() && textWidth(item.word.substr(0, n + 1), item.fontSize, item.paint) <= maxWidth) n++;
             InlineItem fragment = item;
@@ -464,6 +511,7 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
 
         float spaceWidth = gapBefore(item);
         if (!line.empty() && lineWidth + spaceWidth + wordWidth > maxWidth) emitLine();
+        if (line.empty()) openLine(wordWidth, band);
 
         float offset = line.empty() ? 0 : lineWidth + spaceWidth;
         lineWidth = offset + wordWidth;
@@ -857,11 +905,22 @@ static std::vector<BoxShadow> parseBoxShadows(const std::wstring& v, int fontSiz
 // nested blocks too, as <center> does - or for the table itself, centring
 // it), valign, and on cells, the enclosing table's cellpadding and border
 // (any border on the table gives each cell a 1px one). Also a <div>'s
-// align. Empty for every other element.
+// align, and the attributes that float or clear: <img>/<table>
+// align=left|right, <br clear>. Empty for every other element.
 static std::vector<std::pair<std::wstring, std::wstring>> tableHints(Element* e) {
     std::vector<std::pair<std::wstring, std::wstring>> out;
     const std::wstring& tag = e->tag;
     const bool cell = tag == L"td" || tag == L"th";
+    if (tag == L"img" || tag == L"br") {
+        // <img align=left|right> floats it; <br clear=all|left|right>
+        // clears floats.
+        auto a = e->attrs.find(tag == L"img" ? L"align" : L"clear");
+        if (a == e->attrs.end()) return out;
+        std::wstring v = lowerCase(trimmed(a->second));
+        if (tag == L"img" && (v == L"left" || v == L"right")) out.push_back({ L"float", v });
+        if (tag == L"br" && (v == L"left" || v == L"right" || v == L"all" || v == L"both")) out.push_back({ L"clear", v });
+        return out;
+    }
     if (tag == L"div") {
         auto a = e->attrs.find(L"align");
         if (a != e->attrs.end()) {
@@ -892,6 +951,7 @@ static std::vector<std::pair<std::wstring, std::wstring>> tableHints(Element* e)
         std::wstring v = lowerCase(trimmed(*a));
         if (tag == L"table") {
             if (v == L"center") { out.push_back({ L"margin-left", L"auto" }); out.push_back({ L"margin-right", L"auto" }); }
+            else if (v == L"left" || v == L"right") out.push_back({ L"float", v });
         }
         else if (v == L"center") out.push_back({ L"text-align", L"-webkit-center" });
         else if (v == L"left" || v == L"right") out.push_back({ L"text-align", v });
@@ -1291,6 +1351,21 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             else if (v == L"table-footer-group") sv.display = Display::TableFooterGroup;
             else if (v == L"table-caption") sv.display = Display::TableCaption;
             else if (v == L"table-column" || v == L"table-column-group") sv.display = Display::None;
+            else if (v == L"flow-root") sv.display = Display::Block;
+            sv.flowRoot = v == L"flow-root";
+        }
+        else if (k == L"float") {
+            std::wstring f = lowerCase(trimmed(v));
+            if (f == L"left" || f == L"inline-start") sv.floatSide = ComputedStyle::Float::Left;
+            else if (f == L"right" || f == L"inline-end") sv.floatSide = ComputedStyle::Float::Right;
+            else if (f == L"none") sv.floatSide = ComputedStyle::Float::None;
+        }
+        else if (k == L"clear") {
+            std::wstring c = lowerCase(trimmed(v));
+            if (c == L"left" || c == L"inline-start") sv.clear = ComputedStyle::Clear::Left;
+            else if (c == L"right" || c == L"inline-end") sv.clear = ComputedStyle::Clear::Right;
+            else if (c == L"both" || c == L"all") sv.clear = ComputedStyle::Clear::Both;
+            else if (c == L"none") sv.clear = ComputedStyle::Clear::None;
         }
         else if (k == L"vertical-align") {
             std::wstring a = lowerCase(trimmed(v));
@@ -1916,8 +1991,12 @@ void LayoutRoot::layout() {
     containingHeight_ = bodyStyle.height;
     if (containingHeight_ >= 0) usedViewportHeight = true; // height: % below can come from the viewport
 
+    FloatContext rootFloats;
+    floatCtx_ = &rootFloats;
+    detachedRoot_ = false;
     int y = 10;
     layoutElement(root, 10, y, viewportWidth - 20, bodyStyle.fontSize, false, bodyStyle.paint);
+    floatCtx_ = nullptr;
 
     // Sticky children of <body> stick until the end of the page.
     for (int i : openStickies_.back())
@@ -2037,13 +2116,13 @@ void LayoutRoot::layoutOutOfFlow(ContainingBlock& cb, int cbX, int cbY, int cbW,
 
 void LayoutRoot::applyPaintKey(size_t from, const ComputedStyle& style) {
     if (style.position == ComputedStyle::Position::Static) return;
-    int key = style.zAuto ? 1 : 2 * style.zIndex + 1;
+    int key = style.zAuto ? 2 : 4 * style.zIndex + 2;
     for (size_t i = from; i < boxes.size(); i++) {
-        // Boxes still in the flow take this element's key. A positioned
-        // descendant keeps its own - unless this element has an explicit
-        // z-index, which makes it a stacking context its descendants can't
-        // escape (simplified: they all share its key).
-        if (boxes[i].paintKey == 0 || !style.zAuto) boxes[i].paintKey = key;
+        // Boxes still in the flow (or in a float) take this element's key.
+        // A positioned descendant keeps its own - unless this element has
+        // an explicit z-index, which makes it a stacking context its
+        // descendants can't escape (simplified: they all share its key).
+        if (boxes[i].paintKey == 0 || boxes[i].paintKey == 1 || !style.zAuto) boxes[i].paintKey = key;
     }
 }
 
@@ -2106,6 +2185,14 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
 
             if (e->tag == L"br") {
                 pendingInline.push_back({ L"", inheritedFontSize, L"", nullptr, true, inheritedVisuallyHidden, inheritedPaint });
+                // <br clear=all>: the next line starts below the floats.
+                if (e->attrs.count(L"clear")) {
+                    ComputedStyle bs = computeStyle(e, inheritedFontSize, containingWidth, inheritedVisuallyHidden, inheritedPaint);
+                    if (bs.clear != ComputedStyle::Clear::None) {
+                        flushInline();
+                        y = std::max(y, clearance(bs.clear));
+                    }
+                }
                 continue;
             }
 
@@ -2116,6 +2203,13 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
             // block is (see deferOutOfFlow), from where it would have been.
             if (sv.position == ComputedStyle::Position::Absolute || sv.position == ComputedStyle::Position::Fixed) {
                 deferOutOfFlow(e, sv, x, y, true);
+                continue;
+            }
+
+            // A float joins the inline run, which places it where the run
+            // reaches it (see placeFloat).
+            if (sv.floatSide != ComputedStyle::Float::None) {
+                pendingInline.push_back(makeFloatItem(e, sv));
                 continue;
             }
 
@@ -2177,6 +2271,35 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     // `width` (and min-/max-width) name the content box, or the border box
     // with box-sizing: border-box; `chromeX` converts between that and the
     // outer (border-box) width.
+    // Floats. `clear` moves the block below them. A block that contains its
+    // own floats (a float context root - see FloatContext) doesn't overlap
+    // the floats around it either: it's narrowed to the space beside them,
+    // or - a table that doesn't fit there - moved down past them.
+    const bool detached = detachedRoot_;
+    detachedRoot_ = false;
+    const bool contextRoot = detached || sv.flowRoot || sv.clipX || sv.clipY || sv.display == Display::Table ||
+                             sv.display == Display::Flex || sv.display == Display::Grid ||
+                             sv.floatSide != ComputedStyle::Float::None;
+    if (sv.clear != ComputedStyle::Clear::None) {
+        int c = clearance(sv.clear);
+        if (c != INT_MIN) y = std::max(y, c - sv.marginTop);
+    }
+    const int fullX = x, fullWidth = containingWidth;
+    // Narrows x/containingWidth to the space beside the floats at y;
+    // returns where to try next if that's too narrow, or INT_MIN.
+    auto besideFloats = [&]() {
+        x = fullX;
+        containingWidth = fullWidth;
+        int left, right, next;
+        if (!contextRoot || detached || !floatCtx_ || floatCtx_->floats.empty() ||
+            !spaceBeside(y + sv.marginTop, 1, fullX, fullWidth, left, right, next))
+            return INT_MIN;
+        x = left;
+        containingWidth = right - left;
+        return next;
+    };
+    int nextTry = besideFloats();
+
     // A table's width always includes its border and padding, as in browsers.
     const bool borderBox = sv.boxSizing == BoxSizing::BorderBox || sv.display == Display::Table;
     const int chromeX = borderBox ? 0 : sv.paddingLeft + sv.paddingRight + 2 * sv.borderWidth;
@@ -2188,8 +2311,14 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     const int chromeFull = sv.paddingLeft + sv.paddingRight + 2 * sv.borderWidth;
     std::unique_ptr<TableModel> table;
     if (sv.display == Display::Table) {
-        int available = std::max(containingWidth - sv.marginLeft - sv.marginRight - chromeFull, 0);
-        table = buildTable(e, sv, available);
+        int available;
+        for (;;) {
+            available = std::max(containingWidth - sv.marginLeft - sv.marginRight - chromeFull, 0);
+            table = buildTable(e, sv, available);
+            if (nextTry == INT_MIN || table->minWidth <= available) break;
+            y = nextTry - sv.marginTop; // too narrow beside the floats: try lower down
+            nextTry = besideFloats();
+        }
         if (sv.width < 0)
             widthValue = std::max(std::min(table->maxWidth, available), table->minWidth) + chromeFull - chromeX;
     }
@@ -2278,6 +2407,11 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     if (positioned) positioned_.push_back(&containing);
     openStickies_.emplace_back(); // sticky children: their limit is this element's content box
 
+    // A float context root keeps the floats inside it to itself.
+    FloatContext ownFloats;
+    FloatContext* savedFloats = floatCtx_;
+    if (contextRoot) floatCtx_ = &ownFloats;
+
     int childX = boxX + sv.borderWidth + sv.paddingLeft;
     const int contentTop = y;
     if (sv.display == Display::Grid) layoutGrid(e, childX, y, contentWidth, sv);
@@ -2289,14 +2423,16 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     if (sv.display == Display::TableCell && y == inlineRunEnd_ && y - contentTop >= kParaGap) y -= kParaGap;
     inlineRunEnd_ = INT_MIN;
 
+    floatCtx_ = savedFloats;
     currentHref = savedHref;
     currentForm = savedForm;
     containingHeight_ = savedCH;
 
-    // The content height: its own if set, else its children's; then
-    // min-/max-height. Content taller than a set height overflows - drawn
-    // anyway unless overflow clips it (below) - but doesn't push what
-    // follows further down.
+    // The content height: its own if set, else its children's - floats
+    // included, for a float context root; then min-/max-height. Content
+    // taller than a set height overflows - drawn anyway unless overflow
+    // clips it (below) - but doesn't push what follows further down.
+    if (contextRoot) y = std::max(y, ownFloats.bottom(true, true));
     int contentHeight = fixedHeight >= 0 ? fixedHeight : y - contentTop;
     if (sv.minHeight >= 0) contentHeight = std::max(contentHeight, toContent(sv.minHeight));
     if (sv.maxHeight >= 0) contentHeight = std::min(contentHeight, toContent(sv.maxHeight));
@@ -2919,6 +3055,12 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
 std::vector<LayoutBox> LayoutRoot::layoutItemDetached(Element* item, int width, const ComputedStyle& style, int& height) {
     std::vector<LayoutBox> scratch;
     std::swap(boxes, scratch);
+    // Laid out at (0, 0), away from the floats around it - in a float
+    // context of its own, which it contains (see FloatContext).
+    FloatContext* savedFloats = floatCtx_;
+    FloatContext detachedFloats;
+    floatCtx_ = &detachedFloats;
+    detachedRoot_ = true;
     int localY = 0;
     if (item->tag == L"input" || item->tag == L"button" || item->tag == L"select")
         layoutControl(item, 0, localY, width, style);
@@ -2926,6 +3068,8 @@ std::vector<LayoutBox> LayoutRoot::layoutItemDetached(Element* item, int width, 
         layoutImage(item, 0, localY, width, style);
     else
         layoutBlockChild(item, 0, localY, width, style);
+    detachedRoot_ = false;
+    floatCtx_ = savedFloats;
     std::swap(boxes, scratch);
     height = localY;
     return scratch;
@@ -2947,6 +3091,137 @@ int LayoutRoot::shrinkToFitWidth(Element* item, const ComputedStyle& style, int 
     }
     int width = right + style.paddingRight + style.borderWidth + style.marginRight + 1; // +1: rounding in text measurement
     return std::min(std::max(width, 0), available);
+}
+
+// --- Floats ----------------------------------------------------------------------
+//
+// A float is taken out of the flow and laid out on its own (shrink-to-fit
+// unless it has a width, in a float context of its own), then placed at the
+// left or right edge of its containing block, as high as it can go: no
+// higher than where the inline run reached it, nor than an earlier float,
+// and lower down if it doesn't fit beside the floats already there. Lines
+// of text in the same float context are then shortened by the floats
+// beside them (layoutInlineRun's openLine), in nested blocks as well -
+// floats are kept in the same coordinates as the boxes.
+//
+// Simplified: a float met mid-line goes below that line rather than onto
+// it; there's no margin collapsing to account for; and a block without
+// its own float context ends at its content, so floats inside it can hang
+// out of the bottom (as in CSS - that's what clearfixes are for - but
+// ::after clearfixes aren't supported, so overflow: hidden or display:
+// flow-root is what contains them here).
+
+int LayoutRoot::FloatContext::bottom(bool left, bool right) const {
+    int b = INT_MIN;
+    for (const auto& f : floats)
+        if (f.left ? left : right) b = std::max(b, f.y + f.h);
+    return b;
+}
+
+bool LayoutRoot::spaceBeside(int top, int height, int x, int width, int& left, int& right, int& nextTop) const {
+    left = x;
+    right = x + width;
+    nextTop = INT_MAX;
+    bool narrowed = false;
+    if (!floatCtx_) return false;
+    for (const auto& f : floatCtx_->floats) {
+        if (f.y >= top + height || f.y + f.h <= top) continue; // not beside it
+        if (f.left ? f.x + f.w <= left : f.x >= right) continue; // doesn't reach into it
+        if (f.left) left = f.x + f.w;
+        else right = f.x;
+        narrowed = true;
+        nextTop = std::min(nextTop, f.y + f.h);
+    }
+    if (right < left) right = left;
+    return narrowed;
+}
+
+int LayoutRoot::clearance(ComputedStyle::Clear clear) const {
+    if (!floatCtx_ || clear == ComputedStyle::Clear::None) return INT_MIN;
+    return floatCtx_->bottom(clear != ComputedStyle::Clear::Right, clear != ComputedStyle::Clear::Left);
+}
+
+LayoutRoot::InlineItem LayoutRoot::makeFloatItem(Element* e, ComputedStyle style) {
+    auto f = std::make_shared<FloatItem>();
+    f->el = e;
+    f->style = std::move(style);
+    f->ancestors = ancestorStack;
+    f->href = currentHref;
+    f->form = currentForm;
+    InlineItem item;
+    item.owner = e;
+    item.floatItem = std::move(f);
+    return item;
+}
+
+void LayoutRoot::placeFloat(const FloatItem& item, int cbX, int cbW, int y) {
+    if (!floatCtx_) return;
+    ComputedStyle s = item.style;
+    if (s.display == Display::Inline) s.display = Display::Block; // a float is blockified
+    const std::wstring& tag = item.el->tag;
+    const bool replaced = tag == L"img" || tag == L"svg" || tag == L"input" || tag == L"button" || tag == L"select";
+
+    // Laid out in the context it was met in.
+    std::vector<Element*> ancestors = item.ancestors;
+    std::swap(ancestorStack, ancestors);
+    std::wstring savedHref = currentHref;
+    Element* savedForm = currentForm;
+    currentHref = item.href;
+    currentForm = item.form;
+    int savedCH = containingHeight_;
+    containingHeight_ = -1;
+
+    // Its width (margin box): shrink-to-fit for a block with no width. An
+    // image, a control or a table sizes itself - laid out in the whole
+    // containing block, it's as wide as its boxes reach.
+    const bool sizesItself = replaced || s.display == Display::Table;
+    int width = sizesItself ? cbW : s.width >= 0 ? cbW : shrinkToFitWidth(item.el, s, cbW);
+    int height = 0;
+    std::vector<LayoutBox> laid = layoutItemDetached(item.el, width, s, height);
+    if (sizesItself) {
+        int right = 0;
+        for (const auto& b : laid) right = std::max(right, b.x + b.width);
+        if (replaced) { // layoutImage/layoutControl leave horizontal margins out
+            for (auto& b : laid) b.x += s.marginLeft;
+            right += s.marginLeft;
+        }
+        width = right + s.marginRight;
+    }
+    else if (s.width >= 0) {
+        int chrome = s.boxSizing == BoxSizing::BorderBox ? 0 : s.paddingLeft + s.paddingRight + 2 * s.borderWidth;
+        int w = s.width;
+        if (s.maxWidth >= 0) w = std::min(w, s.maxWidth);
+        if (s.minWidth >= 0) w = std::max(w, s.minWidth);
+        width = s.marginLeft + w + chrome + s.marginRight;
+    }
+
+    containingHeight_ = savedCH;
+    currentHref = savedHref;
+    currentForm = savedForm;
+    std::swap(ancestorStack, ancestors);
+
+    // Where it goes: as high as allowed, then down past floats until it fits.
+    const bool left = s.floatSide != ComputedStyle::Float::Right;
+    int top = std::max(y, floatCtx_->lastTop);
+    int c = clearance(s.clear);
+    if (c != INT_MIN) top = std::max(top, c);
+    int fx = left ? cbX : cbX + cbW - width;
+    for (;;) {
+        int l, r, next;
+        if (!spaceBeside(top, std::max(height, 1), cbX, cbW, l, r, next) || r - l >= width || next <= top) {
+            fx = left ? l : r - width;
+            break;
+        }
+        top = next;
+    }
+
+    for (auto& b : laid) {
+        moveBox(b, fx, top);
+        if (b.paintKey == 0) b.paintKey = 1; // above in-flow backgrounds (see LayoutBox::paintKey)
+        boxes.push_back(std::move(b));
+    }
+    floatCtx_->floats.push_back({ left, fx, top, width, height });
+    floatCtx_->lastTop = top;
 }
 
 // --- Tables ----------------------------------------------------------------------

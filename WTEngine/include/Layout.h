@@ -106,9 +106,10 @@ struct LayoutBox {
 
     // From positioning and overflow (see LayoutRoot::layoutBlockChild):
     // - paintKey: boxes are stably sorted by it after layout, so it is the
-    //   paint order (and the reverse hit-test order). 0 = normal flow; a
-    //   positioned element's boxes get 2 * z-index + 1 (z-index auto = 0),
-    //   so they paint above the flow at the same z, as in CSS.
+    //   paint order (and the reverse hit-test order). 0 = normal flow; 1 =
+    //   a float's (above in-flow backgrounds, as in CSS); a positioned
+    //   element's boxes get 4 * z-index + 2 (z-index auto = 0), so they
+    //   paint above the flow and floats at the same z.
     // - fixed: position: fixed - `y` is relative to the top of the
     //   viewport, so the box stays put while the page scrolls.
     // - sticky: an index into LayoutRoot::stickies, whose shift for the
@@ -244,6 +245,7 @@ private:
         return textWidth(text, fontSize, p.bold, p.italic, p.family);
     }
 
+    struct FloatItem; // a float met in inline content - see below
     // One word of flowing inline content (from a text node, or from an
     // inline-level element like <a>/<b> flattened into its container's
     // run - see collectInline), tagged with the style it should render
@@ -269,6 +271,10 @@ private:
         // ("Hello " or a lone " " between elements): the next item, from
         // wherever it comes, then gets a space before it.
         bool isSpace = false;
+        // A float, instead of a word: placed by layoutInlineRun where the
+        // run reaches it - at the top of the current line if that's still
+        // empty, else below it.
+        std::shared_ptr<FloatItem> floatItem;
     };
     // Splits `text` on whitespace, appending one InlineItem per word.
     void appendWords(const std::wstring& text, int fontSize, const std::wstring& href,
@@ -407,6 +413,12 @@ private:
         int flexBasis = -1;
         // Only meaningful with display:flex, on the container.
         FlexWrap flexWrap = FlexWrap::NoWrap;
+        // float and clear. A float is laid out like an absolute element
+        // (shrink-to-fit, its own float context) but stays in the flow's
+        // float context - see placeFloat.
+        enum class Float { None, Left, Right } floatSide = Float::None;
+        enum class Clear { None, Left, Right, Both } clear = Clear::None;
+        bool flowRoot = false; // display: flow-root - a block that contains its floats
         // Tables: border-collapse and border-spacing (horizontal, vertical)
         // on the table; vertical-align on a cell, row or row group.
         bool borderCollapse = false;
@@ -534,6 +546,50 @@ private:
     // margin. Stands in for the max-content size this engine otherwise has
     // no notion of; capped at `available`.
     int shrinkToFitWidth(Element* item, const ComputedStyle& style, int available);
+
+    // --- Floats ---------------------------------------------------------
+    // A float found in inline content, with what it needs to be laid out
+    // later, when layoutInlineRun reaches it.
+    struct FloatItem {
+        Element* el = nullptr;
+        ComputedStyle style;
+        std::vector<Element*> ancestors;
+        std::wstring href;
+        Element* form = nullptr;
+    };
+    // A placed float's margin box, in the same coordinates as the boxes
+    // around it.
+    struct FloatBox {
+        bool left = true;
+        int x = 0, y = 0, w = 0, h = 0;
+    };
+    // The floats of one block formatting context: a float affects every
+    // line in it, nested blocks' included, until it ends. A new one starts
+    // at the root, in every detached layout (flex/grid items, table cells,
+    // absolute elements, floats) and in a block that contains its floats
+    // (overflow other than visible, display: flow-root, table, flex, grid).
+    struct FloatContext {
+        std::vector<FloatBox> floats;
+        int lastTop = INT_MIN; // a float never sits higher than an earlier one
+        int bottom(bool left, bool right) const; // lowest bottom among those sides' floats, or INT_MIN
+    };
+    FloatContext* floatCtx_ = nullptr;
+    // Set by layoutItemDetached: the block it lays out is a float context
+    // root whatever its style says (layoutBlockChild reads and clears it).
+    bool detachedRoot_ = false;
+    // The horizontal space [left, right) floats leave in [x, x + width) for
+    // something occupying [top, top + height). Returns whether any float
+    // narrowed it; `nextTop` gets the bottom of the highest float that did
+    // (where to look next if it doesn't fit).
+    bool spaceBeside(int top, int height, int x, int width, int& left, int& right, int& nextTop) const;
+    // Lays `item` out and floats it to the left or right of [cbX, cbX + cbW)
+    // at `y` or below, wherever its width fits beside earlier floats.
+    void placeFloat(const FloatItem& item, int cbX, int cbW, int y);
+    // The y a block with `clear` must start at (or below).
+    int clearance(ComputedStyle::Clear clear) const;
+    // An inline item standing for the float `e`, with the context it's
+    // laid out in (ancestors, link, form) as it is here.
+    InlineItem makeFloatItem(Element* e, ComputedStyle style);
 
     // --- Tables (layoutTable) ------------------------------------------
     // A table's rows and cells, read from the DOM, with each column's
