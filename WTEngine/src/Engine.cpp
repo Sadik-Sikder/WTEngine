@@ -630,6 +630,7 @@ void Engine::doLayout() {
     auto layoutStart = std::chrono::steady_clock::now();
     layoutRoot.boxes.clear();
     layoutRoot.viewportHeight = viewHeight(); // vh units, height: %, fixed boxes
+    layoutRoot.measureScale = measurer ? zoom_ : -1.0f; // text widths depend on these (measurePageText)
     layoutRoot.layout();
     lastLayoutMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - layoutStart).count();
 

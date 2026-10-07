@@ -265,6 +265,10 @@ Every other `@`-rule - `@supports`, `@import`, `@font-face`, `@keyframes`, a com
 
 **Rule index** (`LayoutRoot::RuleIndex`, rebuilt at the start of every `layout()`): each rule is bucketed by its rightmost compound's id, else its first class, else its tag, else "universal". `computeStyle` only tests an element against the universal bucket plus the buckets for its own tag, id and classes, instead of every rule on the page. On Wikipedia's Tiger article this took layout from 5.1 s to 1.7 s (Debug) with 1456 rules - more than double the 623 rules that parsed before the new selector support, and still faster than the old 2.2 s. The optional `ClassCache*` still avoids re-splitting `class=""` for each check.
 
+**Ancestor filter** (`LayoutRoot::AncestorFilter`): most rules left in a bucket still fail, on their ancestor part - `.navbox a` is in the `a` bucket, so every link was tested against it. So each rule also gets a 512-bit Bloom filter of the tags, ids and classes it requires of the element's ancestors (every compound whose right-hand combinator is a descendant or child one - a compound left of `+`/`~` is a sibling, not an ancestor), built in `rebuildRuleIndex`. `ancestorFilter()` keeps the same kind of filter for `ancestorStack`, as a stack beside it, revalidated against it on each call (it's pushed, popped and swapped wholesale in many places). A rule whose required bits aren't all set is skipped without calling `CSS::matches`. On the Tiger article this cut rule tests per layout from 522k to 134k - the 18,138 rules that matched still did - and matching from ~79 ms to ~20 ms (Release).
+
+**Applying declarations** (`applyDecl`): each declaration's property is looked up once in a map to a small enum (`Prop`), and the chain of branches compares that number instead of the name; a property the engine doesn't support stops at the lookup.
+
 **Cascade** (in `LayoutRoot::computeStyle`): matched rules are stable-sorted by specificity `(ids, classes, tags)` then source order and applied in that order; then the inline `style=""` attribute is applied last (always wins). `!important` is stripped but gives no extra priority.
 
 **Properties the engine actually honours:**
@@ -449,7 +453,9 @@ Greedy word wrapping. Each word gets its own `LayoutBox` (so words on one line c
 
 `ancestorStack` is maintained during the walk so `computeStyle` can evaluate descendant selectors.
 
-Text is measured through a `std::function` set by `Engine` that calls `Renderer::measureText`, so wrapping uses real Segoe UI metrics.
+Text is measured through a `std::function` set by `Engine` that calls `Renderer::measureText`, so wrapping uses real Segoe UI metrics. Each measurement is a GDI call, so `textWidth` caches widths by font (face, size, bold, italic) and text, across layouts too (`textCache_`, capped at 200,000 entries). The widths depend on the page zoom, so `Engine::doLayout` passes it in as `measureScale` and the cache starts afresh when it changes (or when no renderer is set yet, -1). On the Tiger article this took measuring from ~25 ms to ~3.5 ms per layout.
+
+**Layout cost, Tiger article, Release:** ~180 ms per layout before the ancestor filter, the text cache and `Prop` ids; ~80 ms after. What's left is spread out: rule matching (~20 ms), applying declarations (~12 ms), inline runs (~25 ms, mostly making boxes), and table measuring. `:hover` still relayouts only under 50 ms (§8), so it remains off on that page.
 
 > `<noscript>` is deliberately not in the skip-list: its content is laid out like a normal container, even though scripts now run. The engine doesn't distinguish "JS available" from "JS not available".
 

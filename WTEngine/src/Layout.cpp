@@ -142,8 +142,15 @@ void LayoutRoot::parseBoxShorthand(const std::wstring& v, int containingWidth, i
 }
 
 float LayoutRoot::textWidth(const std::wstring& text, int fontSize, bool bold, bool italic, const std::wstring* family) {
-    if (measureText) return measureText(text, fontSize, bold, italic, family);
-    return text.size() * fontSize * 0.55f; // rough fallback
+    if (!measureText) return text.size() * fontSize * 0.55f; // rough fallback
+    auto& widths = textCache_[FontKey{ family, fontSize, bold, italic }];
+    auto it = widths.find(text);
+    if (it != widths.end()) return it->second;
+    float w = measureText(text, fontSize, bold, italic, family);
+    // Bounded: a page with endless distinct text just starts over.
+    if (++textCacheSize_ > 200000) { textCache_.clear(); textCacheSize_ = 1; }
+    textCache_[FontKey{ family, fontSize, bold, italic }].emplace(text, w);
+    return w;
 }
 
 int LayoutRoot::lineBand(const TextPaint& p, int fontSize) {
@@ -1059,14 +1066,77 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
     };
 
     auto applyDecl = [&](const std::wstring& k, const std::wstring& v) {
-        if (k == L"color") sv.colorSet = true;
-        if (k == L"font" || k == L"font-family" || k == L"font-weight" || k == L"font-style") sv.fontSet = true;
+        // The property, identified once - then compared as a number down the
+        // chain below rather than as a string. Most pages also declare plenty
+        // this engine doesn't support (transition, cursor, ...): those stop
+        // at the lookup.
+        enum Prop {
+            P_align_items, P_background, P_background_color, P_background_image, P_background_position,
+            P_background_repeat, P_background_size, P_border, P_border_bottom_left_radius,
+            P_border_bottom_right_radius, P_border_collapse, P_border_color, P_border_radius,
+            P_border_spacing, P_border_top_left_radius, P_border_top_right_radius, P_border_width,
+            P_bottom, P_box_shadow, P_box_sizing, P_clear, P_color, P_column_gap, P_display, P_flex,
+            P_flex_basis, P_flex_direction, P_flex_flow, P_flex_grow, P_flex_shrink, P_flex_wrap, P_float,
+            P_font, P_font_family, P_font_size, P_font_style, P_font_weight, P_gap, P_grid_area,
+            P_grid_column, P_grid_column_end, P_grid_column_start, P_grid_gap, P_grid_row, P_grid_row_end,
+            P_grid_row_start, P_grid_template, P_grid_template_areas, P_grid_template_columns,
+            P_grid_template_rows, P_height, P_inset, P_justify_content, P_left, P_line_height, P_margin,
+            P_margin_bottom, P_margin_left, P_margin_right, P_margin_top, P_max_height, P_max_width,
+            P_min_height, P_min_width, P_opacity, P_overflow, P_overflow_x, P_overflow_y, P_padding,
+            P_padding_bottom, P_padding_left, P_padding_right, P_padding_top, P_position, P_right,
+            P_row_gap, P_text_align, P_text_decoration, P_text_decoration_line, P_text_transform, P_top,
+            P_vertical_align, P_visibility, P_width, P_z_index,
+        };
+        static const std::unordered_map<std::wstring, int> kProps = {
+            { L"align-items", P_align_items }, { L"background", P_background },
+            { L"background-color", P_background_color }, { L"background-image", P_background_image },
+            { L"background-position", P_background_position }, { L"background-repeat", P_background_repeat },
+            { L"background-size", P_background_size }, { L"border", P_border },
+            { L"border-bottom-left-radius", P_border_bottom_left_radius },
+            { L"border-bottom-right-radius", P_border_bottom_right_radius },
+            { L"border-collapse", P_border_collapse }, { L"border-color", P_border_color },
+            { L"border-radius", P_border_radius }, { L"border-spacing", P_border_spacing },
+            { L"border-top-left-radius", P_border_top_left_radius },
+            { L"border-top-right-radius", P_border_top_right_radius }, { L"border-width", P_border_width },
+            { L"bottom", P_bottom }, { L"box-shadow", P_box_shadow }, { L"box-sizing", P_box_sizing },
+            { L"clear", P_clear }, { L"color", P_color }, { L"column-gap", P_column_gap },
+            { L"display", P_display }, { L"flex", P_flex }, { L"flex-basis", P_flex_basis },
+            { L"flex-direction", P_flex_direction }, { L"flex-flow", P_flex_flow },
+            { L"flex-grow", P_flex_grow }, { L"flex-shrink", P_flex_shrink }, { L"flex-wrap", P_flex_wrap },
+            { L"float", P_float }, { L"font", P_font }, { L"font-family", P_font_family },
+            { L"font-size", P_font_size }, { L"font-style", P_font_style }, { L"font-weight", P_font_weight },
+            { L"gap", P_gap }, { L"grid-area", P_grid_area }, { L"grid-column", P_grid_column },
+            { L"grid-column-end", P_grid_column_end }, { L"grid-column-start", P_grid_column_start },
+            { L"grid-gap", P_grid_gap }, { L"grid-row", P_grid_row }, { L"grid-row-end", P_grid_row_end },
+            { L"grid-row-start", P_grid_row_start }, { L"grid-template", P_grid_template },
+            { L"grid-template-areas", P_grid_template_areas },
+            { L"grid-template-columns", P_grid_template_columns },
+            { L"grid-template-rows", P_grid_template_rows }, { L"height", P_height }, { L"inset", P_inset },
+            { L"justify-content", P_justify_content }, { L"left", P_left }, { L"line-height", P_line_height },
+            { L"margin", P_margin }, { L"margin-bottom", P_margin_bottom }, { L"margin-left", P_margin_left },
+            { L"margin-right", P_margin_right }, { L"margin-top", P_margin_top },
+            { L"max-height", P_max_height }, { L"max-width", P_max_width }, { L"min-height", P_min_height },
+            { L"min-width", P_min_width }, { L"opacity", P_opacity }, { L"overflow", P_overflow },
+            { L"overflow-x", P_overflow_x }, { L"overflow-y", P_overflow_y }, { L"padding", P_padding },
+            { L"padding-bottom", P_padding_bottom }, { L"padding-left", P_padding_left },
+            { L"padding-right", P_padding_right }, { L"padding-top", P_padding_top },
+            { L"position", P_position }, { L"right", P_right }, { L"row-gap", P_row_gap },
+            { L"text-align", P_text_align }, { L"text-decoration", P_text_decoration },
+            { L"text-decoration-line", P_text_decoration_line }, { L"text-transform", P_text_transform },
+            { L"top", P_top }, { L"vertical-align", P_vertical_align }, { L"visibility", P_visibility },
+            { L"width", P_width }, { L"z-index", P_z_index },
+        };
+        auto found = kProps.find(k);
+        if (found == kProps.end()) return;
+        const int prop = found->second;
+        if (prop == P_color) sv.colorSet = true;
+        if (prop == P_font || prop == P_font_family || prop == P_font_weight || prop == P_font_style) sv.fontSet = true;
 
-        if (k == L"background-color") {
+        if (prop == P_background_color) {
             Color unused;
             if (tryParseColor(v, unused)) sv.background = v;
         }
-        else if (k == L"background") {
+        else if (prop == P_background) {
             // The color comes from the last layer ("url(a.png), #fff");
             // the layers themselves are built after the cascade (see
             // Recorded). "background: none" (or only an image) clears any
@@ -1078,26 +1148,26 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             }
             bgShorthand = { v, ++declSeq };
         }
-        else if (k == L"background-image") bgImage = { v, ++declSeq };
-        else if (k == L"background-size") bgSize = { v, ++declSeq };
-        else if (k == L"background-position") bgPosition = { v, ++declSeq };
-        else if (k == L"background-repeat") bgRepeat = { v, ++declSeq };
-        else if (k == L"box-shadow") shadowRaw = v;
-        else if (k == L"color") {
+        else if (prop == P_background_image) bgImage = { v, ++declSeq };
+        else if (prop == P_background_size) bgSize = { v, ++declSeq };
+        else if (prop == P_background_position) bgPosition = { v, ++declSeq };
+        else if (prop == P_background_repeat) bgRepeat = { v, ++declSeq };
+        else if (prop == P_box_shadow) shadowRaw = v;
+        else if (prop == P_color) {
             // inherit/currentcolor keep the inherited value; anything that
             // isn't a valid color is ignored, same as a real browser.
             Color unused;
             if (v == L"initial" || v == L"unset") sv.paint.color.clear();
             else if (tryParseColor(v, unused)) sv.paint.color = v;
         }
-        else if (k == L"font-style") {
+        else if (prop == P_font_style) {
             if (v == L"italic" || v.rfind(L"oblique", 0) == 0) sv.paint.italic = true;
             else if (v == L"normal" || v == L"initial" || v == L"unset") sv.paint.italic = false;
         }
-        else if (k == L"font-family") {
+        else if (prop == P_font_family) {
             if (v != L"inherit") applyFamily(v);
         }
-        else if (k == L"text-align") {
+        else if (prop == P_text_align) {
             std::wstring a = lowerCase(trimmed(v));
             bool known = true;
             if (a == L"center" || a == L"-webkit-center") sv.paint.align = TextAlign::Center;
@@ -1106,8 +1176,8 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             else known = false;
             if (known) sv.paint.centerBlocks = a == L"-webkit-center";
         }
-        else if (k == L"line-height") lineHeightRaw = trimmed(v);
-        else if (k == L"text-decoration" || k == L"text-decoration-line") {
+        else if (prop == P_line_height) lineHeightRaw = trimmed(v);
+        else if (prop == P_text_decoration || prop == P_text_decoration_line) {
             // Only the line part matters here; a value naming no line
             // (just a color or style) leaves it alone.
             bool any = false, underline = false, through = false;
@@ -1118,14 +1188,14 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             }
             if (any) { sv.paint.underline = underline; sv.paint.lineThrough = through; }
         }
-        else if (k == L"text-transform") {
+        else if (prop == P_text_transform) {
             std::wstring t = lowerCase(trimmed(v));
             if (t == L"uppercase") sv.paint.transform = TextTransform::Uppercase;
             else if (t == L"lowercase") sv.paint.transform = TextTransform::Lowercase;
             else if (t == L"capitalize") sv.paint.transform = TextTransform::Capitalize;
             else if (t == L"none") sv.paint.transform = TextTransform::None;
         }
-        else if (k == L"font") {
+        else if (prop == P_font) {
             // [style] [variant] [weight] <size>[/<line-height>] <family list>.
             // Everything not given resets to normal, as the shorthand does.
             static const wchar_t* kSizeWords[] = { L"xx-small", L"x-small", L"small", L"medium", L"large",
@@ -1170,7 +1240,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             }
             if (found) { sv.paint.italic = italic; sv.paint.bold = bold; }
         }
-        else if (k == L"font-weight") {
+        else if (prop == P_font_weight) {
             if (v == L"bold" || v == L"bolder") sv.paint.bold = true;
             else if (v == L"normal" || v == L"lighter" || v == L"initial" || v == L"unset") sv.paint.bold = false;
             else {
@@ -1179,7 +1249,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
                 try { sv.paint.bold = std::stoi(v) >= 600; } catch (...) {}
             }
         }
-        else if (k == L"margin") {
+        else if (prop == P_margin) {
             parseBoxShorthand(v, containingWidth, 6, sv.marginTop, sv.marginRight, sv.marginBottom, sv.marginLeft);
             // Which of left/right is `auto`, by the 1-4 value rule (top,
             // right, bottom, left); auto resolved as 0 above.
@@ -1192,24 +1262,24 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
                 if (sv.marginLeftAuto) sv.marginLeft = 0;
             }
         }
-        else if (k == L"margin-top") sv.marginTop = resolveLength(v, containingWidth, 6);
-        else if (k == L"margin-right") { sv.marginRightAuto = lowerCase(trimmed(v)) == L"auto"; sv.marginRight = resolveLength(v, containingWidth, 0); }
-        else if (k == L"margin-bottom") sv.marginBottom = resolveLength(v, containingWidth, 6);
-        else if (k == L"margin-left") { sv.marginLeftAuto = lowerCase(trimmed(v)) == L"auto"; sv.marginLeft = resolveLength(v, containingWidth, 0); }
-        else if (k == L"padding") {
+        else if (prop == P_margin_top) sv.marginTop = resolveLength(v, containingWidth, 6);
+        else if (prop == P_margin_right) { sv.marginRightAuto = lowerCase(trimmed(v)) == L"auto"; sv.marginRight = resolveLength(v, containingWidth, 0); }
+        else if (prop == P_margin_bottom) sv.marginBottom = resolveLength(v, containingWidth, 6);
+        else if (prop == P_margin_left) { sv.marginLeftAuto = lowerCase(trimmed(v)) == L"auto"; sv.marginLeft = resolveLength(v, containingWidth, 0); }
+        else if (prop == P_padding) {
             parseBoxShorthand(v, containingWidth, 6, sv.paddingTop, sv.paddingRight, sv.paddingBottom, sv.paddingLeft);
         }
-        else if (k == L"padding-top") sv.paddingTop = resolveLength(v, containingWidth, 6);
-        else if (k == L"padding-right") sv.paddingRight = resolveLength(v, containingWidth, 6);
-        else if (k == L"padding-bottom") sv.paddingBottom = resolveLength(v, containingWidth, 6);
-        else if (k == L"padding-left") sv.paddingLeft = resolveLength(v, containingWidth, 6);
-        else if (k == L"width") sv.width = resolveLength(v, containingWidth, -1);
-        else if (k == L"min-width") sv.minWidth = resolveLength(v, containingWidth, -1);
-        else if (k == L"max-width") sv.maxWidth = lowerCase(trimmed(v)) == L"none" ? -1 : resolveLength(v, containingWidth, -1);
-        else if (k == L"height") sv.height = resolveHeight(v, sv.fontSize, -1);
-        else if (k == L"min-height") sv.minHeight = resolveHeight(v, sv.fontSize, -1);
-        else if (k == L"max-height") sv.maxHeight = v == L"none" ? -1 : resolveHeight(v, sv.fontSize, -1);
-        else if (k == L"position") {
+        else if (prop == P_padding_top) sv.paddingTop = resolveLength(v, containingWidth, 6);
+        else if (prop == P_padding_right) sv.paddingRight = resolveLength(v, containingWidth, 6);
+        else if (prop == P_padding_bottom) sv.paddingBottom = resolveLength(v, containingWidth, 6);
+        else if (prop == P_padding_left) sv.paddingLeft = resolveLength(v, containingWidth, 6);
+        else if (prop == P_width) sv.width = resolveLength(v, containingWidth, -1);
+        else if (prop == P_min_width) sv.minWidth = resolveLength(v, containingWidth, -1);
+        else if (prop == P_max_width) sv.maxWidth = lowerCase(trimmed(v)) == L"none" ? -1 : resolveLength(v, containingWidth, -1);
+        else if (prop == P_height) sv.height = resolveHeight(v, sv.fontSize, -1);
+        else if (prop == P_min_height) sv.minHeight = resolveHeight(v, sv.fontSize, -1);
+        else if (prop == P_max_height) sv.maxHeight = v == L"none" ? -1 : resolveHeight(v, sv.fontSize, -1);
+        else if (prop == P_position) {
             std::wstring p = lowerCase(trimmed(v));
             if (p == L"relative") sv.position = ComputedStyle::Position::Relative;
             else if (p == L"absolute") sv.position = ComputedStyle::Position::Absolute;
@@ -1217,11 +1287,11 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             else if (p == L"sticky" || p == L"-webkit-sticky") sv.position = ComputedStyle::Position::Sticky;
             else if (p == L"static") sv.position = ComputedStyle::Position::Static;
         }
-        else if (k == L"top" || k == L"right" || k == L"bottom" || k == L"left") {
-            Len& side = k == L"top" ? sv.top : k == L"right" ? sv.right : k == L"bottom" ? sv.bottom : sv.left;
+        else if (prop == P_top || prop == P_right || prop == P_bottom || prop == P_left) {
+            Len& side = prop == P_top ? sv.top : prop == P_right ? sv.right : prop == P_bottom ? sv.bottom : sv.left;
             side = parseOffset(v, sv.fontSize);
         }
-        else if (k == L"inset") {
+        else if (prop == P_inset) {
             // 1-4 values, like margin: top, right, bottom, left.
             std::vector<std::wstring> t = cssTokens(v);
             if (!t.empty() && t.size() <= 4) {
@@ -1230,25 +1300,25 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
                 for (int i = 0; i < 4; i++) *sides[i] = parseOffset(t[kPick[t.size() - 1][i]], sv.fontSize);
             }
         }
-        else if (k == L"z-index") {
+        else if (prop == P_z_index) {
             if (lowerCase(trimmed(v)) == L"auto") sv.zAuto = true;
             else { try { sv.zIndex = std::stoi(v); sv.zAuto = false; } catch (...) {} }
         }
-        else if (k == L"overflow" || k == L"overflow-x" || k == L"overflow-y") {
+        else if (prop == P_overflow || prop == P_overflow_x || prop == P_overflow_y) {
             // "hidden", or "<x> <y>" for the shorthand. Anything but visible
             // clips (see ComputedStyle::clipX).
             std::vector<std::wstring> t = cssTokens(lowerCase(v));
             if (t.empty()) return;
             auto clips = [](const std::wstring& o) { return o != L"visible"; };
             bool cx = clips(t[0]), cy = clips(t.size() > 1 ? t[1] : t[0]);
-            if (k != L"overflow-y") sv.clipX = cx;
-            if (k != L"overflow-x") sv.clipY = k == L"overflow" ? cy : cx;
+            if (prop != P_overflow_y) sv.clipX = cx;
+            if (prop != P_overflow_x) sv.clipY = prop == P_overflow ? cy : cx;
         }
-        else if (k == L"box-sizing") {
+        else if (prop == P_box_sizing) {
             if (v == L"border-box") sv.boxSizing = BoxSizing::BorderBox;
             else if (v == L"content-box") sv.boxSizing = BoxSizing::ContentBox;
         }
-        else if (k == L"border-radius") {
+        else if (prop == P_border_radius) {
             // 1-4 values: all corners; tl+br / tr+bl; tl / tr+bl / br; or
             // each of tl tr br bl. An elliptical "/ <vertical radii>" part
             // is dropped - corners are always circular here.
@@ -1263,17 +1333,17 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             if (!r.empty() && r.size() <= 4)
                 for (int i = 0; i < 4; i++) sv.radius[i] = r[kPick[r.size() - 1][i]];
         }
-        else if (k == L"border-top-left-radius" || k == L"border-top-right-radius" ||
-                 k == L"border-bottom-right-radius" || k == L"border-bottom-left-radius") {
-            int corner = k == L"border-top-left-radius" ? 0 : k == L"border-top-right-radius" ? 1
-                       : k == L"border-bottom-right-radius" ? 2 : 3;
+        else if (prop == P_border_top_left_radius || prop == P_border_top_right_radius ||
+                 prop == P_border_bottom_right_radius || prop == P_border_bottom_left_radius) {
+            int corner = prop == P_border_top_left_radius ? 0 : prop == P_border_top_right_radius ? 1
+                       : prop == P_border_bottom_right_radius ? 2 : 3;
             auto toks = cssTokens(v);
             LayoutBox::CornerRadius c;
             if (!toks.empty() && parseRadius(toks[0], sv.fontSize, c)) sv.radius[corner] = c;
         }
-        else if (k == L"border-color") sv.borderColor = v;
-        else if (k == L"border-width") sv.borderWidth = resolveLength(v, containingWidth, 0);
-        else if (k == L"border") {
+        else if (prop == P_border_color) sv.borderColor = v;
+        else if (prop == P_border_width) sv.borderWidth = resolveLength(v, containingWidth, 0);
+        else if (prop == P_border) {
             // Shorthand, e.g. "1px solid #333": scan whitespace-separated
             // tokens for a length and a color (any CSS color). The style keyword
             // (solid/dashed/...) is accepted but has nothing to key off of -
@@ -1288,10 +1358,10 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
                 }
             }
         }
-        else if (k == L"grid-template-columns") sv.gridTemplateColumns = parseGridTemplateTracks(v, containingWidth);
-        else if (k == L"grid-template-rows") sv.gridTemplateRows = parseGridTemplateTracks(v, containingWidth);
-        else if (k == L"grid-template-areas") sv.gridTemplateAreas = parseGridTemplateAreas(v);
-        else if (k == L"grid-template") {
+        else if (prop == P_grid_template_columns) sv.gridTemplateColumns = parseGridTemplateTracks(v, containingWidth);
+        else if (prop == P_grid_template_rows) sv.gridTemplateRows = parseGridTemplateTracks(v, containingWidth);
+        else if (prop == P_grid_template_areas) sv.gridTemplateAreas = parseGridTemplateAreas(v);
+        else if (prop == P_grid_template) {
             std::vector<std::vector<std::wstring>> areas;
             std::vector<GridTrack> rowTracks, colTracks;
             parseGridTemplateShorthand(v, containingWidth, areas, rowTracks, colTracks);
@@ -1299,32 +1369,32 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             if (!rowTracks.empty()) sv.gridTemplateRows = std::move(rowTracks);
             if (!colTracks.empty()) sv.gridTemplateColumns = std::move(colTracks);
         }
-        else if (k == L"grid-area") sv.gridArea = trimmed(v); // on an item: the area name to place into - see its ComputedStyle comment
-        else if (k == L"grid-column") {
+        else if (prop == P_grid_area) sv.gridArea = trimmed(v); // on an item: the area name to place into - see its ComputedStyle comment
+        else if (prop == P_grid_column) {
             int s, e, n;
             if (parseGridLinePlacement(v, s, e, n)) { sv.gridColumnStart = s; sv.gridColumnEnd = e; sv.gridColumnSpan = n; }
         }
-        else if (k == L"grid-column-start" || k == L"grid-column-end") {
+        else if (prop == P_grid_column_start || prop == P_grid_column_end) {
             int line, n;
             if (parseGridLine(v, line, n)) {
-                (k == L"grid-column-start" ? sv.gridColumnStart : sv.gridColumnEnd) = line;
+                (prop == P_grid_column_start ? sv.gridColumnStart : sv.gridColumnEnd) = line;
                 if (n) sv.gridColumnSpan = n;
             }
         }
-        else if (k == L"grid-row") {
+        else if (prop == P_grid_row) {
             int s, e, n;
             if (parseGridLinePlacement(v, s, e, n)) { sv.gridRowStart = s; sv.gridRowEnd = e; sv.gridRowSpan = n; }
         }
-        else if (k == L"grid-row-start" || k == L"grid-row-end") {
+        else if (prop == P_grid_row_start || prop == P_grid_row_end) {
             int line, n;
             if (parseGridLine(v, line, n)) {
-                (k == L"grid-row-start" ? sv.gridRowStart : sv.gridRowEnd) = line;
+                (prop == P_grid_row_start ? sv.gridRowStart : sv.gridRowEnd) = line;
                 if (n) sv.gridRowSpan = n;
             }
         }
-        else if (k == L"row-gap") sv.rowGap = resolveLength(v, containingWidth, 0);
-        else if (k == L"column-gap") sv.columnGap = resolveLength(v, containingWidth, 0);
-        else if (k == L"gap" || k == L"grid-gap") {
+        else if (prop == P_row_gap) sv.rowGap = resolveLength(v, containingWidth, 0);
+        else if (prop == P_column_gap) sv.columnGap = resolveLength(v, containingWidth, 0);
+        else if (prop == P_gap || prop == P_grid_gap) {
             // "gap: <row>" sets both; "gap: <row> <column>" sets them
             // separately, in that order - same order real CSS uses.
             std::wistringstream ss(v);
@@ -1334,10 +1404,10 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             if (ss >> t2) { sv.rowGap = g1; sv.columnGap = resolveLength(t2, containingWidth, 0); }
             else { sv.rowGap = sv.columnGap = g1; }
         }
-        else if (k == L"font-size") sv.fontSize = resolveFontSize(v, inheritedFontSize, sv.fontSize);
-        else if (k == L"opacity") { try { sv.opacity = std::stof(v); } catch (...) {} }
-        else if (k == L"visibility") sv.visibilityHidden = (v == L"hidden" || v == L"collapse");
-        else if (k == L"display") {
+        else if (prop == P_font_size) sv.fontSize = resolveFontSize(v, inheritedFontSize, sv.fontSize);
+        else if (prop == P_opacity) { try { sv.opacity = std::stof(v); } catch (...) {} }
+        else if (prop == P_visibility) sv.visibilityHidden = (v == L"hidden" || v == L"collapse");
+        else if (prop == P_display) {
             if (v == L"none") sv.display = Display::None;
             else if (v == L"inline" || v == L"inline-block") sv.display = Display::Inline;
             else if (v == L"block") sv.display = Display::Block;
@@ -1354,31 +1424,31 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             else if (v == L"flow-root") sv.display = Display::Block;
             sv.flowRoot = v == L"flow-root";
         }
-        else if (k == L"float") {
+        else if (prop == P_float) {
             std::wstring f = lowerCase(trimmed(v));
             if (f == L"left" || f == L"inline-start") sv.floatSide = ComputedStyle::Float::Left;
             else if (f == L"right" || f == L"inline-end") sv.floatSide = ComputedStyle::Float::Right;
             else if (f == L"none") sv.floatSide = ComputedStyle::Float::None;
         }
-        else if (k == L"clear") {
+        else if (prop == P_clear) {
             std::wstring c = lowerCase(trimmed(v));
             if (c == L"left" || c == L"inline-start") sv.clear = ComputedStyle::Clear::Left;
             else if (c == L"right" || c == L"inline-end") sv.clear = ComputedStyle::Clear::Right;
             else if (c == L"both" || c == L"all") sv.clear = ComputedStyle::Clear::Both;
             else if (c == L"none") sv.clear = ComputedStyle::Clear::None;
         }
-        else if (k == L"vertical-align") {
+        else if (prop == P_vertical_align) {
             std::wstring a = lowerCase(trimmed(v));
             if (a == L"top" || a == L"text-top" || a == L"baseline") sv.verticalAlign = VAlign::Top;
             else if (a == L"middle") sv.verticalAlign = VAlign::Middle;
             else if (a == L"bottom" || a == L"text-bottom") sv.verticalAlign = VAlign::Bottom;
         }
-        else if (k == L"border-collapse") {
+        else if (prop == P_border_collapse) {
             std::wstring a = lowerCase(trimmed(v));
             if (a == L"collapse") sv.borderCollapse = true;
             else if (a == L"separate") sv.borderCollapse = false;
         }
-        else if (k == L"border-spacing") {
+        else if (prop == P_border_spacing) {
             // One length for both directions, or horizontal then vertical.
             std::vector<std::wstring> t = cssTokens(v);
             if (!t.empty() && t.size() <= 2) {
@@ -1386,37 +1456,37 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
                 sv.borderSpacingY = t.size() > 1 ? std::max(resolveLength(t[1], 0, sv.borderSpacingY), 0) : sv.borderSpacingX;
             }
         }
-        else if (k == L"flex-direction") {
+        else if (prop == P_flex_direction) {
             // The -reverse variants are laid out unreversed; anything
             // unrecognized falls back to row, the real default.
             sv.flexDirection = (v == L"column" || v == L"column-reverse") ? FlexDirection::Column : FlexDirection::Row;
         }
-        else if (k == L"justify-content") {
+        else if (prop == P_justify_content) {
             if (v == L"center") sv.justifyContent = JustifyContent::Center;
             else if (v == L"flex-end") sv.justifyContent = JustifyContent::FlexEnd;
             else if (v == L"space-between") sv.justifyContent = JustifyContent::SpaceBetween;
             else if (v == L"space-around") sv.justifyContent = JustifyContent::SpaceAround;
             else sv.justifyContent = JustifyContent::FlexStart;
         }
-        else if (k == L"align-items") {
+        else if (prop == P_align_items) {
             if (v == L"flex-start") sv.alignItems = AlignItems::FlexStart;
             else if (v == L"center") sv.alignItems = AlignItems::Center;
             else if (v == L"flex-end") sv.alignItems = AlignItems::FlexEnd;
             else sv.alignItems = AlignItems::Stretch;
         }
-        else if (k == L"flex-grow") {
+        else if (prop == P_flex_grow) {
             try { sv.flexGrow = std::stof(v); sv.flexGrowSet = true; } catch (...) {}
         }
-        else if (k == L"flex-shrink") {
+        else if (prop == P_flex_shrink) {
             try { sv.flexShrink = std::max(std::stof(v), 0.0f); } catch (...) {}
         }
-        else if (k == L"flex-basis") {
+        else if (prop == P_flex_basis) {
             sv.flexBasis = (v == L"auto" || v == L"content") ? -1 : resolveLength(v, containingWidth, -1);
         }
-        else if (k == L"flex-wrap") {
+        else if (prop == P_flex_wrap) {
             sv.flexWrap = v == L"wrap" ? FlexWrap::Wrap : v == L"wrap-reverse" ? FlexWrap::WrapReverse : FlexWrap::NoWrap;
         }
-        else if (k == L"flex-flow") {
+        else if (prop == P_flex_flow) {
             // "<direction> <wrap>" in either order, either part optional.
             for (const auto& tok : cssTokens(v)) {
                 if (tok == L"row" || tok == L"row-reverse") sv.flexDirection = FlexDirection::Row;
@@ -1426,7 +1496,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
                 else if (tok == L"nowrap") sv.flexWrap = FlexWrap::NoWrap;
             }
         }
-        else if (k == L"flex") {
+        else if (prop == P_flex) {
             // The shorthand, per spec: none = 0 0 auto; auto = 1 1 auto;
             // otherwise up to two numbers (grow, then shrink) and a basis,
             // where a unitless number sets grow/shrink and anything else is
@@ -1465,6 +1535,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
     for (const auto& decl : hints) cascade.push_back(&decl);
     if (rules) {
         std::vector<const CSS::Rule*> matched;
+        const AncestorFilter& ancestors = ancestorFilter();
         auto consider = [&](const std::vector<const CSS::Rule*>& bucket) {
             for (const CSS::Rule* rule : bucket) {
                 // A width-conditioned @media's rule carries the viewport
@@ -1474,6 +1545,8 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
                 // re-evaluates it for free, no separate reactivity needed.
                 if (rule->mediaMinWidth >= 0 && viewportWidth < rule->mediaMinWidth) continue;
                 if (rule->mediaMaxWidth >= 0 && viewportWidth > rule->mediaMaxWidth) continue;
+                // An ancestor the selector needs is missing (AncestorFilter).
+                if (!ancestors.covers(ruleIndex.required[rule - rules->data()])) continue;
                 if (CSS::matches(*rule, ancestorStack, e, &classCache, hover)) matched.push_back(rule);
             }
         };
@@ -1487,14 +1560,8 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         lookup(ruleIndex.byTag, e->tag);
         auto id = e->attrs.find(L"id");
         if (id != e->attrs.end()) lookup(ruleIndex.byId, id->second);
-        if (!ruleIndex.byClass.empty() && e->attrs.count(L"class")) {
-            auto [it, inserted] = classCache.try_emplace(e);
-            if (inserted) {
-                std::wistringstream ss(e->attrs[L"class"]);
-                for (std::wstring c; ss >> c;) it->second.push_back(c);
-            }
-            for (const auto& c : it->second) lookup(ruleIndex.byClass, c);
-        }
+        if (!ruleIndex.byClass.empty() && e->attrs.count(L"class"))
+            for (const auto& c : classesOf(e)) lookup(ruleIndex.byClass, c);
         std::stable_sort(matched.begin(), matched.end(),
             [](const CSS::Rule* a, const CSS::Rule* b) {
                 if (a->specificity < b->specificity) return true;
@@ -1937,9 +2004,66 @@ void LayoutRoot::layoutImage(Element* e, int x, int& y, int containingWidth, con
     y += box.height + style.marginBottom;
 }
 
+// The hash an ancestor filter files a tag name, id or class under - kept
+// apart by `kind`, so a class "nav" and a tag "nav" don't collide.
+static size_t filterKey(wchar_t kind, const std::wstring& name) {
+    size_t h = std::hash<std::wstring>{}(name);
+    return (h ^ (size_t)kind * 0x9E3779B97F4A7C15ull) * 0xBF58476D1CE4E5B9ull;
+}
+
+const std::vector<std::wstring>& LayoutRoot::classesOf(Element* el) {
+    auto [it, inserted] = classCache.try_emplace(el);
+    if (inserted) {
+        auto c = el->attrs.find(L"class");
+        if (c != el->attrs.end()) {
+            std::wistringstream ss(c->second);
+            for (std::wstring name; ss >> name;) it->second.push_back(name);
+        }
+    }
+    return it->second;
+}
+
+const LayoutRoot::AncestorFilter& LayoutRoot::ancestorFilter() {
+    // Keep the part that still matches ancestorStack, recompute the rest.
+    size_t same = 0;
+    while (same < filterFor_.size() && same < ancestorStack.size() && filterFor_[same] == ancestorStack[same]) same++;
+    filterFor_.resize(same);
+    filterStack_.resize(same);
+    for (size_t i = same; i < ancestorStack.size(); i++) {
+        Element* a = ancestorStack[i];
+        AncestorFilter f = i ? filterStack_[i - 1] : AncestorFilter{};
+        f.add(filterKey(L't', a->tag));
+        auto id = a->attrs.find(L"id");
+        if (id != a->attrs.end() && !id->second.empty()) f.add(filterKey(L'#', id->second));
+        for (const auto& c : classesOf(a)) f.add(filterKey(L'.', c));
+        filterFor_.push_back(a);
+        filterStack_.push_back(f);
+    }
+    static const AncestorFilter empty;
+    return filterStack_.empty() ? empty : filterStack_.back();
+}
+
 void LayoutRoot::rebuildRuleIndex() {
     ruleIndex = RuleIndex{};
+    filterFor_.clear();
+    filterStack_.clear();
     if (!rules) return;
+    ruleIndex.required.resize(rules->size());
+    for (size_t r = 0; r < rules->size(); r++) {
+        // What the rule needs among the element's ancestors: every compound
+        // whose right-hand combinator is a descendant or child one (a
+        // compound left of + or ~ is a sibling, not an ancestor).
+        const auto& chain = (*rules)[r].chain;
+        for (size_t i = 0; i + 1 < chain.size(); i++) {
+            CSS::Combinator next = chain[i + 1].combinator;
+            if (next != CSS::Combinator::Descendant && next != CSS::Combinator::Child) continue;
+            const CSS::CompoundSelector& c = chain[i];
+            AncestorFilter& need = ruleIndex.required[r];
+            if (!c.tag.empty()) need.add(filterKey(L't', c.tag));
+            if (!c.id.empty()) need.add(filterKey(L'#', c.id));
+            for (const auto& cls : c.classes) need.add(filterKey(L'.', cls));
+        }
+    }
     for (const auto& rule : *rules) {
         if (rule.chain.empty()) continue;
         const CSS::CompoundSelector& last = rule.chain.back();
@@ -1955,6 +2079,7 @@ void LayoutRoot::layout() {
     ancestorStack.clear();
     classCache.clear(); // safe to reuse within this pass only - see its declaration in Layout.h
     cellCache_.clear(); // likewise
+    if (measureScale != cachedScale_) { textCache_.clear(); textCacheSize_ = 0; cachedScale_ = measureScale; } // widths change with zoom
     nextAnchor_ = 1;
     measuring_ = false;
     inlineRunEnd_ = INT_MIN;

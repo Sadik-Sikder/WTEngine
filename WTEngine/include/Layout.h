@@ -184,6 +184,10 @@ struct LayoutRoot {
     // Returns the pixel width of `text` at `fontSize`. Used to wrap text; a
     // rough per-character estimate is used when unset.
     std::function<float(const std::wstring&, int, bool bold, bool italic, const std::wstring* family)> measureText;
+    // What measureText's results depend on besides its arguments (the page
+    // zoom): textWidth caches widths across layouts, and starts afresh when
+    // this changes.
+    float measureScale = 1.0f;
 
     // Resolves an <img>'s raw `src`, fetching/decoding (and caching) it if
     // not already cached, and returns its natural pixel size via (outW,
@@ -248,6 +252,24 @@ private:
     int resolveLength(const std::wstring& s, int base, int def);
     float textWidth(const std::wstring& text, int fontSize, bool bold = false, bool italic = false,
                     const std::wstring* family = nullptr);
+    // Widths measured so far, by font (face, size, bold, italic) and then
+    // text: the same words come up over and over, on a page and from one
+    // layout to the next, and each measurement is a GDI call. Font faces
+    // are interned (see TextPaint::family), so the pointer identifies one.
+    struct FontKey {
+        const std::wstring* family;
+        int size;
+        bool bold, italic;
+        bool operator==(const FontKey& o) const { return family == o.family && size == o.size && bold == o.bold && italic == o.italic; }
+    };
+    struct FontKeyHash {
+        size_t operator()(const FontKey& k) const {
+            return std::hash<const void*>{}(k.family) ^ ((size_t)k.size << 2 | (size_t)k.bold << 1 | (size_t)k.italic) * 0x9E3779B97F4A7C15ull;
+        }
+    };
+    std::unordered_map<FontKey, std::unordered_map<std::wstring, float>, FontKeyHash> textCache_;
+    size_t textCacheSize_ = 0;
+    float cachedScale_ = 1.0f;
     float textWidth(const std::wstring& text, int fontSize, const TextPaint& p) {
         return textWidth(text, fontSize, p.bold, p.italic, p.family);
     }
@@ -670,11 +692,40 @@ private:
     // bucket. Rebuilt at the start of every layout() - cheap next to the
     // layout itself, and it can't go stale when a stylesheet arrives or
     // the page changes.
+    // A Bloom filter of tag names, ids and classes: for an element, those of
+    // all its ancestors; for a rule, those its selector requires of the
+    // element's ancestors (the compounds left of a descendant or child
+    // combinator). A rule whose requirements aren't all in the element's
+    // filter can't match, so computeStyle skips CSS::matches for it - most
+    // descendant rules (".navbox a") fail that way without walking the
+    // ancestor chain. False positives just mean a full match is tried.
+    struct AncestorFilter {
+        uint64_t bits[8] = {};
+        void add(size_t hash) {
+            bits[(hash >> 6) & 7] |= 1ull << (hash & 63);
+            bits[(hash >> 15) & 7] |= 1ull << ((hash >> 9) & 63);
+        }
+        void merge(const AncestorFilter& o) { for (int i = 0; i < 8; i++) bits[i] |= o.bits[i]; }
+        bool covers(const AncestorFilter& need) const {
+            for (int i = 0; i < 8; i++) if (need.bits[i] & ~bits[i]) return false;
+            return true;
+        }
+    };
     struct RuleIndex {
         std::unordered_map<std::wstring, std::vector<const CSS::Rule*>> byId, byClass, byTag;
         std::vector<const CSS::Rule*> universal;
+        std::vector<AncestorFilter> required; // per rule, by its position in *rules
     } ruleIndex;
     void rebuildRuleIndex();
+    // The filter of ancestorStack's elements, kept as a stack alongside it:
+    // computeStyle revalidates it against ancestorStack (which is pushed,
+    // popped and swapped wholesale in many places) and recomputes only what
+    // changed.
+    std::vector<Element*> filterFor_;
+    std::vector<AncestorFilter> filterStack_;
+    const AncestorFilter& ancestorFilter();
+    // `el`'s parsed class="" list, cached for this pass (classCache).
+    const std::vector<std::wstring>& classesOf(Element* el);
 
     // --- Height, positioning, overflow ---------------------------------
     // The content height of the block being laid out into, when it's
