@@ -94,6 +94,8 @@ int LayoutRoot::resolveLength(const std::wstring& s, int base, int def) {
 
     if (unit.empty() || unit == L"px") return (int)std::lround(value);
     if (unit == L"%") return (int)std::lround(value * base / 100.0);
+    if (unit == L"em") return (int)std::lround(value * emBase_);
+    if (unit == L"rem") return (int)std::lround(value * 14); // the root font size - see layout()
     if (unit == L"vw") return (int)std::lround(value * viewportWidth / 100.0);
     if (unit == L"vh" || unit == L"vmin" || unit == L"vmax") usedViewportHeight = true;
     if (unit == L"vh") return (int)std::lround(value * viewportHeight / 100.0);
@@ -315,6 +317,17 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containin
             continue;
         }
 
+        // A block-level element (<a><div>...</div></a>) or a form control
+        // inside inline content: the run is split around it, which lays it
+        // out on lines of its own (InlineItem::blockItem) - the same a
+        // control directly in a block gets.
+        const bool control = e->tag == L"input" || e->tag == L"button" || e->tag == L"select";
+        const bool image = e->tag == L"img" || e->tag == L"svg";
+        if (control || (sv.display != Display::Inline && !image)) {
+            out.push_back(makeFloatItem(e, sv, true));
+            continue;
+        }
+
         // An image inside inline content (<a><svg>...</svg> Home</a>) sits
         // in the line like a word - never recursed into, so an <svg>'s
         // <title>/<text> can't leak in as words.
@@ -340,7 +353,6 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containin
 // items on the same line can differ in font size, href, or owning element
 // (e.g. a link in the middle of a sentence). Generalizes what layoutText
 // used to do for a single homogeneously-styled string.
-static constexpr int kParaGap = 6; // space below each run of text
 
 void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, int& y, int containingWidth,
                                  TextAlign align) {
@@ -479,6 +491,13 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
             else deferredFloats.push_back(raw.floatItem);
             continue;
         }
+        if (raw.blockItem) {
+            // The line so far ends here; the block takes the lines below it.
+            emitLine();
+            pendingSpace = false;
+            layoutInlineBlock(*raw.blockItem, x, y, containingWidth);
+            continue;
+        }
 
         if (raw.image) {
             // Wraps like a word; never split.
@@ -525,9 +544,6 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
         line.push_back({ item, offset, wordWidth });
     }
     emitLine();
-
-    y += kParaGap;
-    inlineRunEnd_ = y;
 }
 
 static std::wstring lowerCase(std::wstring s) {
@@ -1003,6 +1019,33 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
     }
     else if (tag == L"col" || tag == L"colgroup") sv.display = Display::None; // read by buildTable for widths only
 
+    // The rest of a browser's built-in spacing and sizes. Vertical margins
+    // are in em of the element's final font size, so they're resolved once
+    // the cascade is done - unless an author rule set them (uaMarginEm).
+    // A list inside a list has none, as in browsers.
+    const bool heading = tag.size() == 2 && tag[0] == L'h' && tag[1] >= L'1' && tag[1] <= L'6';
+    const bool list = tag == L"ul" || tag == L"ol" || tag == L"menu" || tag == L"dir";
+    float uaMarginEm = 0;
+    if (tag == L"p" || tag == L"dl" || tag == L"pre" || tag == L"blockquote" || tag == L"figure") uaMarginEm = 1;
+    else if (tag == L"hr") uaMarginEm = 0.5f;
+    else if (list) {
+        uaMarginEm = 1;
+        for (Element* a = e->parent; a; a = a->parent)
+            if (a->tag == L"ul" || a->tag == L"ol" || a->tag == L"menu" || a->tag == L"dir") { uaMarginEm = 0; break; }
+    }
+    if (heading) {
+        static const float kSize[6] = { 2, 1.5f, 1.17f, 1, 0.83f, 0.67f };
+        static const float kMargin[6] = { 0.67f, 0.83f, 1, 1.33f, 1.67f, 2.33f };
+        int level = tag[1] - L'1';
+        sv.fontSize = (int)std::lround(inheritedFontSize * kSize[level]);
+        uaMarginEm = kMargin[level];
+    }
+    if (list) sv.paddingLeft = 40;
+    if (tag == L"dd") sv.marginLeft = 40;
+    if (tag == L"blockquote" || tag == L"figure") sv.marginLeft = sv.marginRight = 40;
+    if (tag == L"hr") { sv.borderWidth = 1; sv.borderColor = L"#9a9a9a"; }
+    bool marginTopSet = false, marginBottomSet = false; // by an author rule, over uaMarginEm
+
     // color/font-weight: inherited, then the tag's own default (what a
     // browser's built-in stylesheet would give it), then author rules.
     sv.paint = inheritedPaint;
@@ -1129,6 +1172,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         auto found = kProps.find(k);
         if (found == kProps.end()) return;
         const int prop = found->second;
+        emBase_ = sv.fontSize; // what em resolves against in lengths below (resolveLength)
         if (prop == P_color) sv.colorSet = true;
         if (prop == P_font || prop == P_font_family || prop == P_font_weight || prop == P_font_style) sv.fontSet = true;
 
@@ -1250,7 +1294,8 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             }
         }
         else if (prop == P_margin) {
-            parseBoxShorthand(v, containingWidth, 6, sv.marginTop, sv.marginRight, sv.marginBottom, sv.marginLeft);
+            parseBoxShorthand(v, containingWidth, 0, sv.marginTop, sv.marginRight, sv.marginBottom, sv.marginLeft);
+            marginTopSet = marginBottomSet = true;
             // Which of left/right is `auto`, by the 1-4 value rule (top,
             // right, bottom, left); auto resolved as 0 above.
             std::vector<std::wstring> t = cssTokens(lowerCase(v));
@@ -1262,18 +1307,24 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
                 if (sv.marginLeftAuto) sv.marginLeft = 0;
             }
         }
-        else if (prop == P_margin_top) sv.marginTop = resolveLength(v, containingWidth, 6);
-        else if (prop == P_margin_right) { sv.marginRightAuto = lowerCase(trimmed(v)) == L"auto"; sv.marginRight = resolveLength(v, containingWidth, 0); }
-        else if (prop == P_margin_bottom) sv.marginBottom = resolveLength(v, containingWidth, 6);
-        else if (prop == P_margin_left) { sv.marginLeftAuto = lowerCase(trimmed(v)) == L"auto"; sv.marginLeft = resolveLength(v, containingWidth, 0); }
+        else if (prop == P_margin_top) { sv.marginTop = resolveLength(v, containingWidth, sv.marginTop); marginTopSet = true; }
+        else if (prop == P_margin_right) { sv.marginRightAuto = lowerCase(trimmed(v)) == L"auto"; sv.marginRight = resolveLength(v, containingWidth, sv.marginRightAuto ? 0 : sv.marginRight); }
+        else if (prop == P_margin_bottom) { sv.marginBottom = resolveLength(v, containingWidth, sv.marginBottom); marginBottomSet = true; }
+        else if (prop == P_margin_left) { sv.marginLeftAuto = lowerCase(trimmed(v)) == L"auto"; sv.marginLeft = resolveLength(v, containingWidth, sv.marginLeftAuto ? 0 : sv.marginLeft); }
         else if (prop == P_padding) {
-            parseBoxShorthand(v, containingWidth, 6, sv.paddingTop, sv.paddingRight, sv.paddingBottom, sv.paddingLeft);
+            parseBoxShorthand(v, containingWidth, 0, sv.paddingTop, sv.paddingRight, sv.paddingBottom, sv.paddingLeft);
         }
-        else if (prop == P_padding_top) sv.paddingTop = resolveLength(v, containingWidth, 6);
-        else if (prop == P_padding_right) sv.paddingRight = resolveLength(v, containingWidth, 6);
-        else if (prop == P_padding_bottom) sv.paddingBottom = resolveLength(v, containingWidth, 6);
-        else if (prop == P_padding_left) sv.paddingLeft = resolveLength(v, containingWidth, 6);
-        else if (prop == P_width) sv.width = resolveLength(v, containingWidth, -1);
+        else if (prop == P_padding_top) sv.paddingTop = resolveLength(v, containingWidth, sv.paddingTop);
+        else if (prop == P_padding_right) sv.paddingRight = resolveLength(v, containingWidth, sv.paddingRight);
+        else if (prop == P_padding_bottom) sv.paddingBottom = resolveLength(v, containingWidth, sv.paddingBottom);
+        else if (prop == P_padding_left) sv.paddingLeft = resolveLength(v, containingWidth, sv.paddingLeft);
+        else if (prop == P_width) {
+            // While measuring a content width, a percentage counts as auto,
+            // as in CSS - it would otherwise claim the whole width measured in.
+            std::wstring w = trimmed(v);
+            if (measuring_ && !w.empty() && w.back() == L'%') sv.width = -1;
+            else sv.width = resolveLength(v, containingWidth, -1);
+        }
         else if (prop == P_min_width) sv.minWidth = resolveLength(v, containingWidth, -1);
         else if (prop == P_max_width) sv.maxWidth = lowerCase(trimmed(v)) == L"none" ? -1 : resolveLength(v, containingWidth, -1);
         else if (prop == P_height) sv.height = resolveHeight(v, sv.fontSize, -1);
@@ -1475,7 +1526,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             else sv.alignItems = AlignItems::Stretch;
         }
         else if (prop == P_flex_grow) {
-            try { sv.flexGrow = std::stof(v); sv.flexGrowSet = true; } catch (...) {}
+            try { sv.flexGrow = std::stof(v); } catch (...) {}
         }
         else if (prop == P_flex_shrink) {
             try { sv.flexShrink = std::max(std::stof(v), 0.0f); } catch (...) {}
@@ -1502,8 +1553,8 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             // where a unitless number sets grow/shrink and anything else is
             // the basis. A basis left out becomes 0 - so `flex: 1` makes
             // items share the whole line equally, regardless of `width`.
-            if (v == L"none") { sv.flexGrow = 0; sv.flexShrink = 0; sv.flexBasis = -1; sv.flexGrowSet = true; }
-            else if (v == L"auto") { sv.flexGrow = 1; sv.flexShrink = 1; sv.flexBasis = -1; sv.flexGrowSet = true; }
+            if (v == L"none") { sv.flexGrow = 0; sv.flexShrink = 0; sv.flexBasis = -1; }
+            else if (v == L"auto") { sv.flexGrow = 1; sv.flexShrink = 1; sv.flexBasis = -1; }
             else if (v != L"initial") {
                 int numbers = 0;
                 bool basisSet = false;
@@ -1519,7 +1570,6 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
                     else { basisSet = true; basis = resolveLength(tok, containingWidth, 0); }
                 }
                 sv.flexGrow = grow;
-                sv.flexGrowSet = true;
                 sv.flexShrink = shrink;
                 sv.flexBasis = basisSet ? basis : 0;
             }
@@ -1611,6 +1661,11 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         std::wstring value;
         if (substituteVars(decl->second, sv.paint.vars.get(), value)) applyDecl(k, value);
     }
+    emBase_ = sv.fontSize;
+
+    // The tag's default vertical margins, in em of the final font size.
+    if (!marginTopSet) sv.marginTop = (int)std::lround(uaMarginEm * sv.fontSize);
+    if (!marginBottomSet) sv.marginBottom = (int)std::lround(uaMarginEm * sv.fontSize);
 
     if (!lineHeightRaw.empty()) {
         // A plain number is inherited as a multiple (each descendant applies
@@ -2138,7 +2193,6 @@ void LayoutRoot::layout() {
     if (measureScale != cachedScale_) { textCache_.clear(); textCacheSize_ = 0; cachedScale_ = measureScale; } // widths change with zoom
     nextAnchor_ = 1;
     measuring_ = false;
-    inlineRunEnd_ = INT_MIN;
     rebuildRuleIndex();
     if (!rootNode) return;
 
@@ -2177,6 +2231,11 @@ void LayoutRoot::layout() {
     floatCtx_ = &rootFloats;
     detachedRoot_ = false;
     int y = 10;
+    // The 10px above <body>'s content stands in for its margin, which -
+    // with no border or padding of its own - merges with its first child's.
+    openTops_.clear();
+    marginEndY_ = y;
+    pendingMargin_ = 10;
     layoutElement(root, 10, y, viewportWidth - 20, bodyStyle.fontSize, false, bodyStyle.paint);
     floatCtx_ = nullptr;
 
@@ -2468,6 +2527,12 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
     ancestorStack.pop_back();
 }
 
+// Two adjoining vertical margins merged into one, as CSS collapses them: the
+// largest positive one plus the most negative one.
+static int combineMargins(int a, int b) {
+    return std::max(std::max(a, b), 0) + std::min(std::min(a, b), 0);
+}
+
 // See the declaration in Layout.h. This is exactly what layoutElement's own
 // loop used to do inline for a block-level child; factored out so layoutGrid
 // can give a grid item identical box-model treatment without duplicating it.
@@ -2544,7 +2609,8 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     // margin: auto - what's left of the container goes to the auto margin(s):
     // both centres the box (margin: 0 auto), one pushes it to the other side.
     int marginLeft = sv.marginLeft;
-    if (sv.marginLeftAuto || sv.marginRightAuto) {
+    if (measuring_) {} // a content width doesn't include centring (see measuring_)
+    else if (sv.marginLeftAuto || sv.marginRightAuto) {
         int free = std::max(containingWidth - outerWidth - (sv.marginLeftAuto ? 0 : sv.marginLeft) -
                             (sv.marginRightAuto ? 0 : sv.marginRight), 0);
         if (sv.marginLeftAuto && sv.marginRightAuto) marginLeft = free / 2;
@@ -2554,7 +2620,20 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
         marginLeft += std::max(containingWidth - outerWidth - sv.marginLeft - sv.marginRight, 0) / 2;
     int boxX = x + marginLeft;
 
-    y += sv.marginTop;
+    // Margin collapsing (see marginEndY_): a top margin straight after
+    // another margin - a previous sibling's bottom one, or the parent's own
+    // top one with nothing in between - merges with it rather than adding
+    // to it. If it's the parent's, this box's top is the parent's top too.
+    int topMargin = sv.marginTop; // the margin above this box, merged
+    bool collapsedWithParent = false;
+    if (y == marginEndY_) {
+        y -= pendingMargin_;
+        topMargin = combineMargins(pendingMargin_, sv.marginTop);
+        collapsedWithParent = !openTops_.empty() && openTops_.back().y == marginEndY_ && openTops_.back().newTop == INT_MIN;
+    }
+    y += topMargin;
+    marginEndY_ = INT_MIN;
+    if (collapsedWithParent) openTops_.back().newTop = y;
     // A table's captions sit above it, outside its border.
     if (table && !table->captions.empty()) {
         ancestorStack.push_back(e);
@@ -2590,6 +2669,15 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
 
     y += sv.borderWidth + sv.paddingTop;
 
+    // With no border or padding above its content (and no float context of
+    // its own), its top margin stays open to its first child's.
+    const bool openTop = !contextRoot && !table && sv.borderWidth == 0 && sv.paddingTop == 0;
+    if (openTop) {
+        marginEndY_ = y;
+        pendingMargin_ = topMargin;
+        openTops_.push_back({ y, INT_MIN });
+    }
+
     // Recurse into nested elements/text - or, for a grid/flex container,
     // into layoutGrid/layoutFlex instead of the usual vertical flow.
     std::wstring savedHref = currentHref;
@@ -2622,15 +2710,11 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     if (contextRoot) floatCtx_ = &ownFloats;
 
     int childX = boxX + sv.borderWidth + sv.paddingLeft;
-    const int contentTop = y;
+    int contentTop = y;
     if (sv.display == Display::Grid) layoutGrid(e, childX, y, contentWidth, sv);
     else if (sv.display == Display::Flex) layoutFlex(e, childX, y, contentWidth, sv);
     else if (table) layoutTable(e, childX, y, contentWidth, sv, *table);
     else layoutElement(e, childX, y, contentWidth, sv.fontSize, sv.visuallyHidden, sv.paint);
-    // A table cell ends at its last line of text, without the gap a
-    // paragraph leaves below it.
-    if (sv.display == Display::TableCell && y == inlineRunEnd_ && y - contentTop >= kParaGap) y -= kParaGap;
-    inlineRunEnd_ = INT_MIN;
 
     floatCtx_ = savedFloats;
     currentHref = savedHref;
@@ -2642,6 +2726,30 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     // taller than a set height overflows - drawn anyway unless overflow
     // clips it (below) - but doesn't push what follows further down.
     if (contextRoot) y = std::max(y, ownFloats.bottom(true, true));
+
+    // Its first child's top margin merged with its own: its box starts where
+    // that child does (and so does its parent's, if it had merged with that).
+    if (openTop) {
+        int newTop = openTops_.back().newTop;
+        openTops_.pop_back();
+        if (newTop != INT_MIN && newTop > contentStartY) {
+            if (collapsedWithParent && !openTops_.empty() && openTops_.back().newTop == contentStartY)
+                openTops_.back().newTop = newTop;
+            contentStartY = contentTop = newTop;
+            if (bgIndex != static_cast<size_t>(-1)) boxes[bgIndex].y = newTop;
+        }
+    }
+    // Likewise at the bottom: with no border, padding or set height below
+    // its content, its last child's bottom margin (or, if it's empty, its
+    // own top margin) carries through to merge with its bottom margin.
+    const bool openBottom = !contextRoot && !table && sv.borderWidth == 0 && sv.paddingBottom == 0 &&
+                            fixedHeight < 0 && sv.minHeight < 0;
+    int marginBase = INT_MIN, carried = 0; // a margin carried through: where it starts, and its size
+    if (openBottom && y == marginEndY_) {
+        carried = pendingMargin_;
+        marginBase = y - carried;
+        y = std::max(marginBase, contentTop); // the content ends before it
+    }
     int contentHeight = fixedHeight >= 0 ? fixedHeight : y - contentTop;
     if (sv.minHeight >= 0) contentHeight = std::max(contentHeight, toContent(sv.minHeight));
     if (sv.maxHeight >= 0) contentHeight = std::min(contentHeight, toContent(sv.maxHeight));
@@ -2700,7 +2808,17 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     }
 
     applyPaintKey(firstBox, sv);
-    y += sv.marginBottom;
+    // Its bottom margin - merged with one carried through it, if any - left
+    // open for whatever comes next to merge with.
+    if (marginBase != INT_MIN) {
+        pendingMargin_ = combineMargins(carried, sv.marginBottom);
+        y = marginBase + pendingMargin_;
+    }
+    else {
+        pendingMargin_ = sv.marginBottom;
+        y += sv.marginBottom;
+    }
+    marginEndY_ = y;
 }
 
 // Moves a box laid out somewhere else (a flex/grid item laid out at 0,0)
@@ -2778,7 +2896,8 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
     // missing ones with 1fr, the same fallback "no template" already uses.
     int areaCols = style.gridTemplateAreas.empty() ? 0 : (int)style.gridTemplateAreas[0].size();
     while ((int)cols.size() < areaCols) cols.push_back({ true, 1.0f });
-    if (cols.empty()) cols.push_back({ false, (float)containingWidth }); // no template at all -> one full-width column
+    // No template at all: one full-width column (content-sized while measuring).
+    if (cols.empty()) cols.push_back(measuring_ ? GridTrack{ false, 0, true } : GridTrack{ false, (float)containingWidth });
     int numCols = (int)cols.size();
 
     // Resolve each item's grid-column/grid-row against the template (see
@@ -2884,9 +3003,13 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
     // tracks first; then content-sized ones (auto, min-content, ...), each
     // as wide as the widest item placed in it alone (shrink-to-fit, up to
     // what's left and its cap); then fr tracks share the rest (each up to
-    // its cap, for minmax(0, <length>)).
+    // its cap, for minmax(0, <length>)). While measuring a content width
+    // (measuring_), fr tracks are content-sized too, as CSS sizes them for
+    // a max-content measurement - shared out, they'd claim all the width
+    // measured in.
     const int colGap = style.columnGap;
     std::vector<int> colWidths(numCols, 0), colX(numCols);
+    auto contentSized = [&](int i) { return cols[i].isAuto || (measuring_ && cols[i].isFr); };
     int used = colGap * std::max(numCols - 1, 0);
     for (int i = 0; i < numCols; i++) {
         if (cols[i].isFr || cols[i].isAuto) continue;
@@ -2894,7 +3017,7 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
         used += colWidths[i];
     }
     for (int i = 0; i < numCols; i++) {
-        if (!cols[i].isAuto) continue;
+        if (!contentSized(i)) continue;
         int available = std::max(containingWidth - used, 0);
         int w = 0;
         for (const auto& p : placements) {
@@ -2914,7 +3037,7 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
     for (const auto& t : cols) if (t.isFr) frTotal += t.value;
     const int remaining = std::max(containingWidth - used, 0);
     for (int i = 0; i < numCols; i++) {
-        if (!cols[i].isFr) continue;
+        if (!cols[i].isFr || contentSized(i)) continue;
         int w = frTotal > 0 ? (int)std::lround(remaining * (cols[i].value / frTotal)) : 0;
         if (cols[i].cap >= 0) w = std::min(w, (int)std::lround(cols[i].cap));
         colWidths[i] = std::max(w, 0);
@@ -2938,23 +3061,11 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
         // itself (its own padding/margin/width), same reason layoutFlex does.
         ComputedStyle real = computeStyle(p.el, style.fontSize, spanWidth, p.style.visuallyHidden, style.paint);
 
-        std::vector<LayoutBox> scratch;
-        std::swap(boxes, scratch); // redirect every push_back below into `scratch`
-        int localY = 0;
-        if (p.el->tag == L"input" || p.el->tag == L"button" || p.el->tag == L"select") {
-            layoutControl(p.el, 0, localY, spanWidth, real);
-        } else if (p.el->tag == L"img" || p.el->tag == L"svg") {
-            layoutImage(p.el, 0, localY, spanWidth, real);
-        } else {
-            // A grid item is always block-level, regardless of its own
-            // tag's default (real CSS "blockifies" it the same way).
-            if (real.display == Display::Inline) real.display = Display::Block;
-            layoutBlockChild(p.el, 0, localY, spanWidth, real);
-        }
-        std::swap(boxes, scratch);
-
-        itemBoxes[idx] = std::move(scratch);
-        itemHeights[idx] = localY;
+        // A grid item is always block-level, regardless of its own tag's
+        // default (real CSS "blockifies" it the same way), and laid out on
+        // its own: its own float context, its margins kept to itself.
+        if (real.display == Display::Inline) real.display = Display::Block;
+        itemBoxes[idx] = layoutItemDetached(p.el, spanWidth, real, itemHeights[idx]);
     }
 
     // Row heights: an explicit grid-template-rows track wins if set (fr
@@ -3112,13 +3223,9 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
     // Row direction.
     //
     // 1. Each item gets a hypothetical outer width: its flex-basis if set,
-    //    else its explicit width. An item with neither is sized one of two
-    //    ways. In a nowrap row it starts at 0 and takes a share of the
-    //    leftover space (flex-grow, or 1 if unset) - the engine's original
-    //    behavior, kept because there's no real content-based sizing.
-    //    In a wrapping row that would never wrap anything, so it starts at
-    //    a shrink-to-fit estimate instead (shrinkToFitWidth) and, as in
-    //    real CSS, only grows if flex-grow says so.
+    //    else its explicit width, else its content's width - a shrink-to-fit
+    //    estimate (shrinkToFitWidth), standing in for CSS's max-content
+    //    size. As in CSS, an item only grows past that if flex-grow says so.
     // 2. Items are broken into lines (only with flex-wrap), each as many
     //    items as fit - an item wider than the container gets a line of
     //    its own.
@@ -3137,11 +3244,7 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
 
     std::vector<int> basis(n), minWidth(n);
     std::vector<float> grow(n), shrink(n);
-    // With auto margins in play, items without a width are sized to their
-    // content (as CSS always does) rather than this engine's usual implicit
-    // flex-grow - otherwise they'd fill the row and leave the margins nothing.
-    bool autoMarginsUsed = false;
-    for (const auto& s : itemStyles) autoMarginsUsed |= s.marginLeftAuto || s.marginRightAuto;
+    std::vector<char> basisFromContent(n, 0); // the basis is the content's width - never below its min-content
     for (int i = 0; i < n; i++) {
         const ComputedStyle& s = itemStyles[i];
         int chrome = s.paddingLeft + s.paddingRight + 2 * s.borderWidth;
@@ -3149,17 +3252,10 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
         int w;
         if (s.flexBasis >= 0) w = s.boxSizing == BoxSizing::BorderBox ? s.flexBasis : s.flexBasis + chrome;
         else w = explicitWidth(s);
-        if (w >= 0) {
-            basis[i] = w;
-            grow[i] = s.flexGrow;
-        } else if (wraps || autoMarginsUsed) {
-            basis[i] = shrinkToFitWidth(items[i], s, containingWidth);
-            grow[i] = s.flexGrow;
-        } else {
-            basis[i] = 0;
-            grow[i] = s.flexGrowSet ? s.flexGrow : 1.0f;
-        }
+        basisFromContent[i] = w < 0;
+        basis[i] = w >= 0 ? w : shrinkToFitWidth(items[i], s, containingWidth);
         basis[i] = std::max(basis[i], minWidth[i]);
+        grow[i] = s.flexGrow;
         shrink[i] = s.flexShrink;
     }
 
@@ -3180,20 +3276,51 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
         int count = b - a;
         if (li > 0) lineY += style.rowGap;
 
-        int used = colGap * (count - 1);
-        float totalGrow = 0, totalScaledShrink = 0;
-        for (int i = a; i < b; i++) {
-            used += basis[i];
-            totalGrow += grow[i];
-            totalScaledShrink += shrink[i] * basis[i];
+        // Free space goes to items by flex-grow; overflow is taken back by
+        // flex-shrink weighted by basis. Either way no item ends up below
+        // its min-content width (CSS's min-width: auto for flex items, but
+        // never above its own width if it set one): an item that would is
+        // frozen there and the free space worked out again for the rest,
+        // round by round. The min-content width is measured only where it
+        // could matter - an item being shrunk, or one whose basis didn't
+        // come from its content (flex: 1's basis of 0, say).
+        // Measuring a content width (measuring_), free space isn't handed
+        // out - not to flex-grow, nor to justify-content or auto margins
+        // below.
+        std::vector<int> floorW(count, -1);
+        auto floorOf = [&](int k) {
+            int i = a + k;
+            if (floorW[k] < 0) {
+                int f = minContentWidth(items[i], itemStyles[i]);
+                int own = explicitWidth(itemStyles[i]);
+                if (own >= 0) f = std::min(f, own);
+                floorW[k] = std::max(f, minWidth[i]);
+            }
+            return floorW[k];
+        };
+        std::vector<char> frozen(count, 0);
+        for (;;) {
+            int usedNow = colGap * (count - 1);
+            float growNow = 0, shrinkNow = 0;
+            for (int k = 0; k < count; k++) {
+                int i = a + k;
+                usedNow += frozen[k] ? itemWidths[i] : basis[i];
+                if (!frozen[k]) { growNow += grow[i]; shrinkNow += shrink[i] * basis[i]; }
+            }
+            int freeNow = containingWidth - usedNow;
+            bool newlyFrozen = false;
+            for (int k = 0; k < count; k++) {
+                if (frozen[k]) continue;
+                int i = a + k;
+                int w = basis[i];
+                if (freeNow > 0 && growNow > 0 && !measuring_) w += (int)std::lround(freeNow * (grow[i] / growNow));
+                else if (freeNow < 0 && shrinkNow > 0) w += (int)std::lround(freeNow * (shrink[i] * basis[i] / shrinkNow));
+                if ((w < basis[i] || !basisFromContent[i]) && w < floorOf(k)) { w = floorOf(k); frozen[k] = 1; newlyFrozen = true; }
+                itemWidths[i] = w;
+            }
+            if (!newlyFrozen) break;
         }
-        int free = containingWidth - used;
         for (int i = a; i < b; i++) {
-            if (free > 0 && totalGrow > 0)
-                itemWidths[i] = basis[i] + (int)std::lround(free * (grow[i] / totalGrow));
-            else if (free < 0 && totalScaledShrink > 0)
-                itemWidths[i] = std::max(minWidth[i],
-                    basis[i] + (int)std::lround(free * (shrink[i] * basis[i] / totalScaledShrink)));
             // min-/max-width have the last word (the space a clamped item
             // gives up isn't handed on to the others - a simplification).
             const ComputedStyle& s = itemStyles[i];
@@ -3228,7 +3355,7 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
 
         int usedWidth = colGap * (count - 1);
         for (int i = a; i < b; i++) usedWidth += itemWidths[i];
-        int leftover = std::max(containingWidth - usedWidth, 0);
+        int leftover = measuring_ ? 0 : std::max(containingWidth - usedWidth, 0);
 
         int startX = x;
         int extraGap = 0;
@@ -3297,6 +3424,11 @@ std::vector<LayoutBox> LayoutRoot::layoutItemDetached(Element* item, int width, 
     FloatContext detachedFloats;
     floatCtx_ = &detachedFloats;
     detachedRoot_ = true;
+    // Nor do its margins merge with anything outside it.
+    const int savedMarginEnd = marginEndY_, savedPending = pendingMargin_;
+    std::vector<OpenTop> savedOpenTops;
+    savedOpenTops.swap(openTops_);
+    marginEndY_ = INT_MIN;
     int localY = 0;
     if (item->tag == L"input" || item->tag == L"button" || item->tag == L"select")
         layoutControl(item, 0, localY, width, style);
@@ -3306,27 +3438,49 @@ std::vector<LayoutBox> LayoutRoot::layoutItemDetached(Element* item, int width, 
         layoutBlockChild(item, 0, localY, width, style);
     detachedRoot_ = false;
     floatCtx_ = savedFloats;
+    marginEndY_ = savedMarginEnd;
+    pendingMargin_ = savedPending;
+    openTops_.swap(savedOpenTops);
     std::swap(boxes, scratch);
     height = localY;
     return scratch;
 }
 
 int LayoutRoot::shrinkToFitWidth(Element* item, const ComputedStyle& style, int available) {
+    return std::min(contentWidth(item, style, available, false), available);
+}
+
+int LayoutRoot::minContentWidth(Element* item, const ComputedStyle& style) {
+    return contentWidth(item, style, 0, true);
+}
+
+int LayoutRoot::contentWidth(Element* item, const ComputedStyle& style, int width, bool narrow) {
+    // A measuring layout: content isn't aligned, centred or spread out to
+    // fill the width, which would make it reach further than it needs.
+    // Absolute elements met go to a throwaway containing block.
+    const bool wasMeasuring = measuring_;
+    measuring_ = true;
+    ContainingBlock scratch;
+    positioned_.push_back(&scratch);
     int height;
-    std::vector<LayoutBox> trial = layoutItemDetached(item, available, style, height);
+    std::vector<LayoutBox> trial = layoutItemDetached(item, width, style, height);
+    positioned_.pop_back();
+    measuring_ = wasMeasuring;
     int right = 0;
     for (const auto& b : trial) {
-        // Only content has a natural width; a background box just spans
-        // whatever width it was given, so it says nothing about fit.
+        if (b.anchor) continue; // marks a position; has no size of its own
+        // Content has a natural width. A background box, when laid out
+        // wide, just spans whatever width it was given, so it says nothing
+        // about fit; laid out narrow, it's only as wide as it must be.
         bool content = !b.text.empty() || !b.imageSrc.empty() || b.control != LayoutBox::NoControl;
-        if (!content) continue;
+        if (!content && (!narrow || b.el == item)) continue;
         // A text box starts at the run's content edge, but layoutInlineRun
         // wraps at the content width minus a 4px inset on *each* side.
         int textInset = b.text.empty() || b.control != LayoutBox::NoControl ? 0 : 8;
         right = std::max(right, b.x + b.width + textInset);
     }
-    int width = right + style.paddingRight + style.borderWidth + style.marginRight + 1; // +1: rounding in text measurement
-    return std::min(std::max(width, 0), available);
+    int measured = right + style.paddingRight + style.borderWidth + style.marginRight + 1; // +1: rounding in text measurement
+    return std::max(measured, 0);
 }
 
 // --- Floats ----------------------------------------------------------------------
@@ -3377,7 +3531,7 @@ int LayoutRoot::clearance(ComputedStyle::Clear clear) const {
     return floatCtx_->bottom(clear != ComputedStyle::Clear::Right, clear != ComputedStyle::Clear::Left);
 }
 
-LayoutRoot::InlineItem LayoutRoot::makeFloatItem(Element* e, ComputedStyle style) {
+LayoutRoot::InlineItem LayoutRoot::makeFloatItem(Element* e, ComputedStyle style, bool block) {
     auto f = std::make_shared<FloatItem>();
     f->el = e;
     f->style = std::move(style);
@@ -3386,8 +3540,23 @@ LayoutRoot::InlineItem LayoutRoot::makeFloatItem(Element* e, ComputedStyle style
     f->form = currentForm;
     InlineItem item;
     item.owner = e;
-    item.floatItem = std::move(f);
+    (block ? item.blockItem : item.floatItem) = std::move(f);
     return item;
+}
+
+void LayoutRoot::layoutInlineBlock(const FloatItem& item, int x, int& y, int width) {
+    std::vector<Element*> ancestors = item.ancestors;
+    std::swap(ancestorStack, ancestors);
+    std::wstring savedHref = currentHref;
+    Element* savedForm = currentForm;
+    currentHref = item.href;
+    currentForm = item.form;
+    const std::wstring& tag = item.el->tag;
+    if (tag == L"input" || tag == L"button" || tag == L"select") layoutControl(item.el, x, y, width, item.style);
+    else layoutBlockChild(item.el, x, y, width, item.style);
+    currentHref = savedHref;
+    currentForm = savedForm;
+    std::swap(ancestorStack, ancestors);
 }
 
 void LayoutRoot::placeFloat(const FloatItem& item, int cbX, int cbW, int y) {
@@ -3437,7 +3606,11 @@ void LayoutRoot::placeFloat(const FloatItem& item, int cbX, int cbW, int y) {
     std::swap(ancestorStack, ancestors);
 
     // Where it goes: as high as allowed, then down past floats until it fits.
-    const bool left = s.floatSide != ComputedStyle::Float::Right;
+    // While measuring a content width, a right float goes on the left too:
+    // at the far right edge it would make the content seem to reach all
+    // the way across; beside the rest, it adds just its own width, as it
+    // does to a max-content width in CSS.
+    const bool left = s.floatSide != ComputedStyle::Float::Right || measuring_;
     int top = std::max(y, floatCtx_->lastTop);
     int c = clearance(s.clear);
     if (c != INT_MIN) top = std::max(top, c);

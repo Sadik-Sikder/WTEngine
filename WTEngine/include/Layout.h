@@ -246,10 +246,13 @@ private:
     // against the containing block's width, not the font size - the same
     // base CSS itself uses for percentage margin/padding on every side,
     // including top/bottom (a well-known CSS quirk, not a bug here).
-    // em/rem aren't supported for these properties (unlike font-size,
-    // there's no single obviously-right base to multiply), and fall back
-    // to `def` like any other unrecognized unit.
+    // em and rem work too (see emBase_); an unrecognized unit falls back to
+    // `def`.
     int resolveLength(const std::wstring& s, int base, int def);
+    // What em resolves against in resolveLength: the font size of the
+    // element whose style is being computed (computeStyle keeps it current).
+    // rem is always against the 14px root size.
+    int emBase_ = 14;
     float textWidth(const std::wstring& text, int fontSize, bool bold = false, bool italic = false,
                     const std::wstring* family = nullptr);
     // Widths measured so far, by font (face, size, bold, italic) and then
@@ -304,6 +307,11 @@ private:
         // run reaches it - at the top of the current line if that's still
         // empty, else below it.
         std::shared_ptr<FloatItem> floatItem;
+        // A block-level element met inside inline content (<a><div>, or a
+        // <div> in a <span>): layoutInlineRun ends the line there, lays the
+        // block out on its own lines, and carries on below it - CSS's
+        // anonymous block boxes around a block inside an inline.
+        std::shared_ptr<FloatItem> blockItem;
     };
     // Splits `text` on whitespace, appending one InlineItem per word.
     void appendWords(const std::wstring& text, int fontSize, const std::wstring& href,
@@ -355,8 +363,11 @@ private:
     };
     struct ComputedStyle {
         std::wstring background;
-        int marginTop = 6, marginBottom = 6, marginLeft = 0, marginRight = 0;
-        int paddingTop = 6, paddingRight = 6, paddingBottom = 6, paddingLeft = 6;
+        // No margin or padding unless the tag's default (computeStyle - as a
+        // browser's built-in stylesheet gives <p>, <ul>, headings, ...) or
+        // an author rule sets some.
+        int marginTop = 0, marginBottom = 0, marginLeft = 0, marginRight = 0;
+        int paddingTop = 0, paddingRight = 0, paddingBottom = 0, paddingLeft = 0;
         int width = -1; // -1 = auto: fill the container, same as if unset (today's only behavior)
         // min-/max-width in px (in the same box as `width`, per box-sizing),
         // -1 for none.
@@ -439,7 +450,6 @@ private:
         // 0 (unset) is the real CSS default too - an item only grows if
         // this is explicitly positive.
         float flexGrow = 0;
-        bool flexGrowSet = false; // distinguishes an explicit flex-grow:0 (or flex:none) from unset
         // How much of a line's overflow this item gives up, weighted by
         // its basis (the spec's "scaled shrink factor"). 1 is the CSS default.
         float flexShrink = 1;
@@ -581,10 +591,19 @@ private:
     // margin. Stands in for the max-content size this engine otherwise has
     // no notion of; capped at `available`.
     int shrinkToFitWidth(Element* item, const ComputedStyle& style, int available);
+    // The narrowest `item` can be without its content overflowing: its
+    // widest word, image or fixed-width box, plus its own chrome - what a
+    // flex item won't shrink below (CSS's min-width: auto).
+    int minContentWidth(Element* item, const ComputedStyle& style);
+    // Both of those: lays `item` out at `width` in measuring mode and
+    // measures how far its content reaches (outer, margins included).
+    // `narrow`: laid out at its narrowest, where nested boxes count too.
+    int contentWidth(Element* item, const ComputedStyle& style, int width, bool narrow);
 
     // --- Floats ---------------------------------------------------------
-    // A float found in inline content, with what it needs to be laid out
-    // later, when layoutInlineRun reaches it.
+    // A float (or a block - InlineItem::blockItem) found in inline content,
+    // with what it needs to be laid out later, when layoutInlineRun reaches
+    // it.
     struct FloatItem {
         Element* el = nullptr;
         ComputedStyle style;
@@ -620,11 +639,16 @@ private:
     // Lays `item` out and floats it to the left or right of [cbX, cbX + cbW)
     // at `y` or below, wherever its width fits beside earlier floats.
     void placeFloat(const FloatItem& item, int cbX, int cbW, int y);
+    // Lays out a block or control met inside inline content
+    // (InlineItem::blockItem) at (x, y), in the context it was met in.
+    void layoutInlineBlock(const FloatItem& item, int x, int& y, int width);
     // The y a block with `clear` must start at (or below).
     int clearance(ComputedStyle::Clear clear) const;
-    // An inline item standing for the float `e`, with the context it's
-    // laid out in (ancestors, link, form) as it is here.
-    InlineItem makeFloatItem(Element* e, ComputedStyle style);
+    // An inline item standing for the float `e` (or, `block`, for a
+    // block-level element inside inline content - InlineItem::blockItem),
+    // with the context it's laid out in (ancestors, link, form) as it is
+    // here.
+    InlineItem makeFloatItem(Element* e, ComputedStyle style, bool block = false);
 
     // --- Tables (layoutTable) ------------------------------------------
     // A table's rows and cells, read from the DOM, with each column's
@@ -673,12 +697,25 @@ private:
     // with their containing block, sticky elements) always happen.
     std::pair<std::vector<LayoutBox>, int> layoutCell(const TableCell& cell, int width);
     std::map<std::pair<const Element*, int>, std::pair<std::vector<LayoutBox>, int>> cellCache_;
-    // Set while measuring a table cell's min/max-content width: text isn't
-    // aligned or broken mid-word, and lines can be as narrow as one word.
+    // Set while measuring a content width - a table cell's min/max-content
+    // width, or shrinkToFitWidth's: text isn't aligned or broken mid-word,
+    // lines can be as narrow as one word, and free space isn't handed out
+    // (flex-grow, justify-content, auto margins, centring), since all of
+    // those would make content reach further than it needs.
     bool measuring_ = false;
-    // Where the last inline run left `y`, its trailing paragraph gap
-    // included - so a table cell can drop that gap below its last line.
-    int inlineRunEnd_ = INT_MIN;
+
+    // Margin collapsing (layoutBlockChild). marginEndY_ is where the last
+    // margin laid out ends - a block's bottom margin, or a parent's top
+    // margin with nothing (no border, padding, content) after it yet - and
+    // pendingMargin_ its size. A block starting exactly there merges its
+    // top margin with it instead of adding to it. openTops_ holds, for each
+    // parent whose top margin is still open to its first child, where its
+    // content starts and (newTop) where its box top ends up once that
+    // child's margin has merged with it.
+    int marginEndY_ = INT_MIN;
+    int pendingMargin_ = 0;
+    struct OpenTop { int y; int newTop; };
+    std::vector<OpenTop> openTops_;
 
     // Ancestors of the element layoutElement is currently iterating the
     // children of (root first); used to match descendant selectors ("a b").

@@ -878,20 +878,43 @@ bool Engine::boxContains(const LayoutBox& b, int docX, int docY) const {
 
 // Each shadow is the box's shape moved by its offset and grown by its
 // spread (corners too), with its edge blurred. The last one listed is
-// painted first, so the first ends up on top, as in CSS. Unlike CSS, a
-// shadow isn't cut away under the box itself - which only shows through a
-// box with a see-through background.
+// painted first, so the first ends up on top, as in CSS. As in CSS, none of
+// it is painted under the box itself: for a box whose background doesn't
+// cover that anyway, the shadow is drawn clipped to the four bands around
+// the box's rectangle - so `box-shadow: 0 1px #ccc` on a see-through box is
+// the 1px line below it, not a gray box. (Simplified: with rounded
+// corners, the bits of shadow inside the rectangle but outside the curve
+// are cut away too.)
 void Engine::paintShadows(Renderer& renderer, const LayoutBox& b, float screenY) {
     if (b.shadows.empty()) return;
     float r[4];
     b.cornerRadii(r);
+    Color bg;
+    const bool opaque = !b.background.empty() && tryParseColor(b.background, bg) && bg.a >= 1.0f;
     for (auto it = b.shadows.rbegin(); it != b.shadows.rend(); ++it) {
         const BoxShadow& s = *it;
         if (s.inset) continue;
         float grown[4];
         for (int i = 0; i < 4; i++) grown[i] = r[i] > 0 ? std::max(r[i] + s.spread, 0.0f) : 0;
-        renderer.drawShadow(b.x + s.x - s.spread, screenY + s.y - s.spread,
-                            b.width + 2 * s.spread, b.height + 2 * s.spread, grown, s.blur, s.color);
+        auto draw = [&]() {
+            renderer.drawShadow(b.x + s.x - s.spread, screenY + s.y - s.spread,
+                                b.width + 2 * s.spread, b.height + 2 * s.spread, grown, s.blur, s.color);
+        };
+        if (opaque) { draw(); continue; }
+        // Far enough out to hold all of the shadow, blur included.
+        const float reach = std::abs(s.x) + std::abs(s.y) + std::abs(s.spread) + 2 * s.blur + 2;
+        const float left = (float)b.x, top = screenY, right = left + b.width, bottom = top + b.height;
+        const float bands[4][4] = {
+            { left - reach, top - reach, (right + reach) - (left - reach), reach },  // above
+            { left - reach, bottom, (right + reach) - (left - reach), reach },       // below
+            { left - reach, top, reach, (float)b.height },                           // left
+            { right, top, reach, (float)b.height },                                  // right
+        };
+        for (const auto& band : bands) {
+            renderer.pushClip(band[0], band[1], band[2], band[3]);
+            draw();
+            renderer.popClip();
+        }
     }
 }
 
