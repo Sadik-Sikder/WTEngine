@@ -117,6 +117,13 @@ struct LayoutBox {
     // - clipped: drawn and hit-tested only inside clip* (document
     //   coordinates) - an ancestor's overflow other than visible.
     int paintKey = 0;
+    // Non-zero: not a real box but an anchor - the zero-size marker
+    // deferOutOfFlow leaves where an absolute element would have been in
+    // the flow. It moves with the boxes around it (a flex item, table cell
+    // or float is laid out at (0, 0) and moved later), so layoutOutOfFlow
+    // reads the element's static position from it. Removed at the end of
+    // layout(); never painted.
+    int anchor = 0;
     bool fixed = false;
     int sticky = -1;
     bool clipped = false;
@@ -689,17 +696,21 @@ private:
         ComputedStyle style;
         int staticX = 0, staticY = 0;
         bool hasStatic = true;
+        int anchor = 0; // the LayoutBox::anchor marking the static position, 0 if none
         std::vector<Element*> ancestors;
         std::wstring href;
         Element* form = nullptr;
     };
+    int nextAnchor_ = 1;
     struct ContainingBlock {
         std::vector<OutOfFlow> pending;
     };
     // Innermost positioned ancestor last; [0] is the viewport.
     std::vector<ContainingBlock*> positioned_;
     void deferOutOfFlow(Element* e, ComputedStyle style, int staticX, int staticY, bool hasStatic);
-    void layoutOutOfFlow(ContainingBlock& cb, int cbX, int cbY, int cbW, int cbH, bool isViewport);
+    // `searchFrom`: where in `boxes` the containing block's own boxes start
+    // - its absolute elements' anchors are among them.
+    void layoutOutOfFlow(ContainingBlock& cb, int cbX, int cbY, int cbW, int cbH, bool isViewport, size_t searchFrom);
     // Gives the boxes [from, boxes.size()) a positioned element's paint
     // key (see LayoutBox::paintKey).
     void applyPaintKey(size_t from, const ComputedStyle& style);

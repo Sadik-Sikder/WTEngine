@@ -1955,6 +1955,7 @@ void LayoutRoot::layout() {
     ancestorStack.clear();
     classCache.clear(); // safe to reuse within this pass only - see its declaration in Layout.h
     cellCache_.clear(); // likewise
+    nextAnchor_ = 1;
     measuring_ = false;
     inlineRunEnd_ = INT_MIN;
     rebuildRuleIndex();
@@ -2004,8 +2005,10 @@ void LayoutRoot::layout() {
     openStickies_.clear();
 
     containingHeight_ = viewportHeight;
-    layoutOutOfFlow(viewport, 0, 0, viewportWidth, viewportHeight, true);
+    layoutOutOfFlow(viewport, 0, 0, viewportWidth, viewportHeight, true, 0);
     positioned_.clear();
+    // The anchors have served their purpose (LayoutBox::anchor).
+    boxes.erase(std::remove_if(boxes.begin(), boxes.end(), [](const LayoutBox& b) { return b.anchor != 0; }), boxes.end());
 
     // A sticky element inside a flex/grid item was laid out at (0, 0) and
     // then moved, so its recorded top is off; its boxes say where it ended
@@ -2033,6 +2036,16 @@ void LayoutRoot::deferOutOfFlow(Element* e, ComputedStyle style, int staticX, in
     item.staticX = staticX;
     item.staticY = staticY;
     item.hasStatic = hasStatic;
+    if (hasStatic) {
+        // Mark the static position in the box list, so it moves with the
+        // boxes around it (see LayoutBox::anchor).
+        LayoutBox marker;
+        marker.x = staticX;
+        marker.y = staticY;
+        marker.width = marker.height = 0;
+        marker.anchor = item.anchor = nextAnchor_++;
+        boxes.push_back(std::move(marker));
+    }
     item.ancestors = ancestorStack;
     item.href = currentHref;
     item.form = currentForm;
@@ -2052,12 +2065,24 @@ void LayoutRoot::deferOutOfFlow(Element* e, ComputedStyle style, int staticX, in
 //   flow; y the same with top/bottom.
 // Each is laid out at (0, 0) like a flex item and moved into place; its
 // boxes go at the end of the list, painting over the flow.
-void LayoutRoot::layoutOutOfFlow(ContainingBlock& cb, int cbX, int cbY, int cbW, int cbH, bool isViewport) {
-    if (isViewport && !cb.pending.empty()) usedViewportHeight = true; // placed against the viewport's height
+void LayoutRoot::layoutOutOfFlow(ContainingBlock& cb, int cbX, int cbY, int cbW, int cbH, bool isViewport, size_t searchFrom) {
+    if (cb.pending.empty()) return;
+    if (isViewport) usedViewportHeight = true; // placed against the viewport's height
+    // Where each anchor ended up (see LayoutBox::anchor). Scanned as needed:
+    // laying one element out appends boxes, and anchors of elements it
+    // queues (a fixed element inside it, to the viewport's list).
+    std::unordered_map<int, std::pair<int, int>> anchors;
+    size_t scanned = std::min(searchFrom, boxes.size());
     // By index: laying one out can add more (a fixed element inside it, to
     // the viewport's list).
     for (size_t i = 0; i < cb.pending.size(); i++) {
         OutOfFlow p = cb.pending[i];
+        if (p.anchor) {
+            for (; scanned < boxes.size(); scanned++)
+                if (boxes[scanned].anchor) anchors[boxes[scanned].anchor] = { boxes[scanned].x, boxes[scanned].y };
+            auto at = anchors.find(p.anchor);
+            if (at != anchors.end()) { p.staticX = at->second.first; p.staticY = at->second.second; }
+        }
         ComputedStyle& s = p.style;
         auto resolve = [](const Len& l, int base) { return l.percent ? (int)std::lround(l.value * base / 100.0) : (int)l.value; };
         int L = resolve(s.left, cbW), R = resolve(s.right, cbW), T = resolve(s.top, cbH), B = resolve(s.bottom, cbH);
@@ -2202,6 +2227,9 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
             // Absolute/fixed: out of the flow - laid out once its containing
             // block is (see deferOutOfFlow), from where it would have been.
             if (sv.position == ComputedStyle::Position::Absolute || sv.position == ComputedStyle::Position::Fixed) {
+                // A block-level one's static position is below the text
+                // before it, so that text is laid out first.
+                if (sv.display != Display::Inline) flushInline();
                 deferOutOfFlow(e, sv, x, y, true);
                 continue;
             }
@@ -2450,7 +2478,7 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     if (positioned) {
         positioned_.pop_back();
         layoutOutOfFlow(containing, boxX + sv.borderWidth, contentStartY + sv.borderWidth,
-                        outerWidth - 2 * sv.borderWidth, borderHeight - 2 * sv.borderWidth, false);
+                        outerWidth - 2 * sv.borderWidth, borderHeight - 2 * sv.borderWidth, false, firstBox);
     }
 
     // overflow: its descendants' boxes (not its own) clipped to its padding box.
@@ -3180,7 +3208,7 @@ void LayoutRoot::placeFloat(const FloatItem& item, int cbX, int cbW, int y) {
     std::vector<LayoutBox> laid = layoutItemDetached(item.el, width, s, height);
     if (sizesItself) {
         int right = 0;
-        for (const auto& b : laid) right = std::max(right, b.x + b.width);
+        for (const auto& b : laid) if (!b.anchor) right = std::max(right, b.x + b.width);
         if (replaced) { // layoutImage/layoutControl leave horizontal margins out
             for (auto& b : laid) b.x += s.marginLeft;
             right += s.marginLeft;
@@ -3494,6 +3522,7 @@ std::unique_ptr<LayoutRoot::TableModel> LayoutRoot::buildTable(Element* table, c
     auto rightEdge = [](const std::vector<LayoutBox>& laid, const TableCell& c, bool narrow) {
         int right = 0;
         for (const auto& b : laid) {
+            if (b.anchor) continue; // marks a position; has no size of its own
             bool text = !b.text.empty() && b.control == LayoutBox::NoControl;
             bool content = text || !b.imageSrc.empty() || b.control != LayoutBox::NoControl;
             if (!content) {
