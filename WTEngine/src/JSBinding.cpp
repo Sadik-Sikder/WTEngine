@@ -201,23 +201,26 @@ static DOMBindingState* bindingState(JSContext* ctx) {
     return static_cast<DOMBindingState*>(JS_GetContextOpaque(ctx));
 }
 
+static Element* parentOf(DOMBindingState* state, Node* node);
+
 // The shared_ptr that owns `node`: its parent's child slot, or its
-// detachedNodes entry. Empty for the top of the tree, which Document owns
-// (and no script can free), and for a text node inside the tree - only an
-// element knows its parent, and text nodes are only ever wrapped when
-// created by createTextNode, while they're still in detachedNodes.
+// detachedNodes entry. Empty only for the top of the tree, which Document
+// owns (and no script can free). A text node doesn't know its parent, so
+// finding one in the tree is a search - callers that already hold the
+// owning pointer pass it to wrapNode instead.
 static std::shared_ptr<Node> owningPtr(DOMBindingState* state, Node* node) {
-    if (node->type == Node::ELEMENT) {
-        if (Element* p = static_cast<Element*>(node)->parent) {
-            for (auto& c : p->children) if (c.get() == node) return c;
-        }
+    if (Element* p = parentOf(state, node)) {
+        for (auto& c : p->children) if (c.get() == node) return c;
     }
     for (auto& d : state->detachedNodes) if (d.get() == node) return d;
     return {};
 }
 
-// Returns the node's one wrapper object, creating it on first use.
-static JSValue wrapNode(JSContext* ctx, Node* node) {
+// Returns the node's one wrapper object, creating it on first use. The
+// wrapper keeps its node alive (NodeWrappers), so a node a script holds
+// survives being dropped from the tree; `owner`, when the caller has it,
+// saves looking it up.
+static JSValue wrapNode(JSContext* ctx, Node* node, const std::shared_ptr<Node>* owner = nullptr) {
     if (!node) return JS_NULL;
     DOMBindingState* state = bindingState(ctx);
     if (state) {
@@ -227,7 +230,7 @@ static JSValue wrapNode(JSContext* ctx, Node* node) {
     JSValue obj = JS_NewObjectClass(ctx, js_node_class_id);
     if (JS_IsException(obj)) return obj;
     JS_SetOpaque(obj, node);
-    if (state) state->wrappers->byNode[node] = { JS_DupValue(ctx, obj), owningPtr(state, node) };
+    if (state) state->wrappers->byNode[node] = { JS_DupValue(ctx, obj), owner ? *owner : owningPtr(state, node) };
     return obj;
 }
 
@@ -246,6 +249,14 @@ static Element* unwrapElement(JSValueConst v) {
 
 static void markDirty(JSContext* ctx) {
     if (DOMBindingState* s = bindingState(ctx)) s->domDirty = true;
+}
+
+// Empties `el`. Its old child elements no longer have it as their parent
+// (a script holding one sees parentNode null, as in browsers).
+static void clearChildren(Element* el) {
+    for (auto& c : el->children)
+        if (c->type == Node::ELEMENT) static_cast<Element*>(c.get())->parent = nullptr;
+    el->children.clear();
 }
 
 // --- textContent ------------------------------------------------------
@@ -276,14 +287,86 @@ static JSValue js_set_textContent(JSContext* ctx, JSValueConst this_val, JSValue
     }
     else {
         auto* el = static_cast<Element*>(n);
-        el->children.clear();
+        clearChildren(el);
         if (!text.empty()) el->children.push_back(std::make_shared<TextNode>(text));
     }
     markDirty(ctx);
     return JS_UNDEFINED;
 }
 
-// --- innerHTML (write-only: no HTML serializer exists yet for a getter) --
+// --- innerHTML / outerHTML ----------------------------------------------
+// The getters serialize the subtree back to HTML as browsers do: text and
+// attribute values escaped, no end tag for a void element, <script>/<style>
+// content as is.
+
+static bool isVoidElement(const std::wstring& t) {
+    static const std::set<std::wstring> v = {
+        L"area", L"base", L"br", L"col", L"embed", L"hr", L"img", L"input", L"link", L"meta",
+        L"source", L"track", L"wbr" };
+    return v.count(t) > 0;
+}
+
+static void escapeHTML(const std::wstring& s, bool attribute, std::wstring& out) {
+    for (wchar_t c : s) {
+        switch (c) {
+        case L'&': out += L"&amp;"; break;
+        case 0xA0: out += L"&nbsp;"; break;
+        case L'"': if (attribute) out += L"&quot;"; else out += c; break;
+        case L'<': if (!attribute) out += L"&lt;"; else out += c; break;
+        case L'>': if (!attribute) out += L"&gt;"; else out += c; break;
+        default: out += c;
+        }
+    }
+}
+
+static void serializeNode(const Node* n, std::wstring& out, bool rawText = false);
+
+static void serializeChildren(const Element* el, std::wstring& out) {
+    const bool raw = el->tag == L"script" || el->tag == L"style" || el->tag == L"xmp" ||
+                     el->tag == L"noscript" || el->tag == L"plaintext";
+    for (const auto& c : el->children) serializeNode(c.get(), out, raw);
+}
+
+static void serializeNode(const Node* n, std::wstring& out, bool rawText) {
+    if (n->type == Node::TEXT) {
+        const std::wstring& t = static_cast<const TextNode*>(n)->text;
+        if (rawText) out += t;
+        else escapeHTML(t, false, out);
+        return;
+    }
+    const auto* el = static_cast<const Element*>(n);
+    out += L'<';
+    out += el->tag;
+    for (const auto& [name, value] : el->attrs) {
+        out += L' ';
+        out += name;
+        out += L"=\"";
+        escapeHTML(value, true, out);
+        out += L'"';
+    }
+    out += L'>';
+    if (isVoidElement(el->tag)) return;
+    serializeChildren(el, out);
+    out += L"</";
+    out += el->tag;
+    out += L'>';
+}
+
+static JSValue js_get_innerHTML(JSContext* ctx, JSValueConst this_val) {
+    Element* el = unwrapElement(this_val);
+    if (!el) return jsStr(ctx, L"");
+    std::wstring out;
+    serializeChildren(el, out);
+    return jsStr(ctx, out);
+}
+
+static JSValue js_get_outerHTML(JSContext* ctx, JSValueConst this_val) {
+    Node* n = unwrapNode(this_val);
+    if (!n) return jsStr(ctx, L"");
+    std::wstring out;
+    serializeNode(n, out);
+    return jsStr(ctx, out);
+}
 
 static JSValue js_set_innerHTML(JSContext* ctx, JSValueConst this_val, JSValueConst val) {
     Element* el = unwrapElement(this_val);
@@ -297,6 +380,7 @@ static JSValue js_set_innerHTML(JSContext* ctx, JSValueConst this_val, JSValueCo
     // fragment's node list, reused as-is with no separate "fragment mode".
     HTMLParser parser;
     auto frag = parser.parse(html);
+    clearChildren(el);
     el->children = frag->body->children;
     // The moved children's `parent` still points at frag->body, which is
     // about to be destroyed (frag is local) - repoint them at `el`, their
@@ -457,6 +541,10 @@ static std::shared_ptr<Node> takeNode(DOMBindingState* state, Node* node) {
         d.erase(d.begin() + i);
         return owned;
     }
+    // Dropped from the tree (by innerHTML/textContent replacing its
+    // parent's children) and kept alive only by its JS wrapper.
+    auto w = state->wrappers->byNode.find(node);
+    if (w != state->wrappers->byNode.end() && w->second.keepAlive.get() == node) return w->second.keepAlive;
     return {};
 }
 
@@ -665,6 +753,214 @@ static JSValue js_querySelectorAll(JSContext* ctx, JSValueConst this_val, int ar
     queryAll(root, rule, ancestors, found, false);
     for (size_t i = 0; i < found.size(); i++)
         JS_SetPropertyUint32(ctx, arr, (uint32_t)i, wrapNode(ctx, found[i]));
+    return arr;
+}
+
+// --- getElementsByClassName / matches / closest / contains --------------
+
+static std::vector<std::wstring> splitSpaces(const std::wstring& s) {
+    std::vector<std::wstring> out;
+    std::wstring cur;
+    for (wchar_t c : s) {
+        if (iswspace(c)) { if (!cur.empty()) out.push_back(std::move(cur)); cur.clear(); }
+        else cur += c;
+    }
+    if (!cur.empty()) out.push_back(std::move(cur));
+    return out;
+}
+
+static void findByClasses(Element* el, const std::vector<std::wstring>& want, std::vector<Element*>& out) {
+    for (auto& c : el->children) {
+        if (c->type != Node::ELEMENT) continue;
+        auto* ce = static_cast<Element*>(c.get());
+        auto cls = ce->attrs.find(L"class");
+        if (cls != ce->attrs.end()) {
+            std::vector<std::wstring> have = splitSpaces(cls->second);
+            if (std::all_of(want.begin(), want.end(), [&](const std::wstring& w) {
+                    return std::find(have.begin(), have.end(), w) != have.end(); }))
+                out.push_back(ce);
+        }
+        findByClasses(ce, want, out);
+    }
+}
+
+// Every descendant with all the given classes, in document order.
+static JSValue js_getElementsByClassName(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    Element* root = unwrapElement(this_val);
+    JSValue arr = JS_NewArray(ctx);
+    if (!root || argc < 1) return arr;
+    std::vector<std::wstring> want = splitSpaces(argStr(ctx, argc, argv, 0));
+    if (want.empty()) return arr;
+    std::vector<Element*> found;
+    findByClasses(root, want, found);
+    for (size_t i = 0; i < found.size(); i++)
+        JS_SetPropertyUint32(ctx, arr, (uint32_t)i, wrapNode(ctx, found[i]));
+    return arr;
+}
+
+// Whether `el` matches `rule`, with its real ancestors (outermost first).
+static bool elementMatches(Element* el, const CSS::Rule& rule) {
+    std::vector<Element*> ancestors;
+    for (Element* a = el->parent; a; a = a->parent) ancestors.push_back(a);
+    std::reverse(ancestors.begin(), ancestors.end());
+    return CSS::matches(rule, ancestors, el);
+}
+
+static JSValue throwSyntaxError(JSContext* ctx, const std::wstring& sel) {
+    std::string msg = "'" + wideToUtf8(sel) + "' is not a valid selector.";
+    return throwDOMException(ctx, "SyntaxError", msg.c_str());
+}
+
+static JSValue js_matches(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    Element* el = unwrapElement(this_val);
+    if (!el || argc < 1) return JS_FALSE;
+    std::wstring sel = argStr(ctx, argc, argv, 0);
+    CSS::Rule rule;
+    if (!parseSingleSelector(sel, rule)) return throwSyntaxError(ctx, sel);
+    return JS_NewBool(ctx, elementMatches(el, rule));
+}
+
+// The element itself or its nearest ancestor matching the selector.
+static JSValue js_closest(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    Element* el = unwrapElement(this_val);
+    if (!el || argc < 1) return JS_NULL;
+    std::wstring sel = argStr(ctx, argc, argv, 0);
+    CSS::Rule rule;
+    if (!parseSingleSelector(sel, rule)) return throwSyntaxError(ctx, sel);
+    for (Element* a = el; a; a = a->parent)
+        if (elementMatches(a, rule)) return wrapNode(ctx, a);
+    return JS_NULL;
+}
+
+// Whether `other` is this node or inside it.
+static JSValue js_contains(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    Node* n = unwrapNode(this_val);
+    Node* other = argc >= 1 ? unwrapNode(argv[0]) : nullptr;
+    DOMBindingState* state = bindingState(ctx);
+    if (!n || !other || !state) return JS_FALSE;
+    if (other == n) return JS_TRUE;
+    for (Element* a = parentOf(state, other); a; a = a->parent)
+        if (a == n) return JS_TRUE;
+    return JS_FALSE;
+}
+
+// --- cloneNode -----------------------------------------------------------
+
+static std::shared_ptr<Node> cloneTree(const Node* n, bool deep) {
+    if (n->type == Node::TEXT) return std::make_shared<TextNode>(static_cast<const TextNode*>(n)->text);
+    const auto* el = static_cast<const Element*>(n);
+    auto copy = std::make_shared<Element>(el->tag);
+    copy->attrs = el->attrs;
+    if (deep) {
+        for (const auto& c : el->children) {
+            auto child = cloneTree(c.get(), true);
+            if (child->type == Node::ELEMENT) static_cast<Element*>(child.get())->parent = copy.get();
+            copy->children.push_back(std::move(child));
+        }
+    }
+    return copy;
+}
+
+// A detached copy: attributes (and, deep, the whole subtree), but not
+// event listeners - as in browsers.
+static JSValue js_cloneNode(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    Node* n = unwrapNode(this_val);
+    DOMBindingState* state = bindingState(ctx);
+    if (!n || !state) return JS_NULL;
+    bool deep = argc >= 1 && JS_ToBool(ctx, argv[0]);
+    auto copy = cloneTree(n, deep);
+    state->detachedNodes.push_back(copy);
+    return wrapNode(ctx, copy.get(), &state->detachedNodes.back());
+}
+
+// --- Tree traversal ------------------------------------------------------
+// childNodes/children are arrays (not live collections): a snapshot of the
+// children when read.
+
+static JSValue js_get_childNodes(JSContext* ctx, JSValueConst this_val, int elementsOnly) {
+    Element* el = unwrapElement(this_val);
+    JSValue arr = JS_NewArray(ctx);
+    if (!el) return arr;
+    uint32_t i = 0;
+    for (const auto& c : el->children)
+        if (!elementsOnly || c->type == Node::ELEMENT) JS_SetPropertyUint32(ctx, arr, i++, wrapNode(ctx, c.get(), &c));
+    return arr;
+}
+
+enum Relative { FirstChild, LastChild, NextSibling, PreviousSibling, FirstElementChild, LastElementChild,
+                NextElementSibling, PreviousElementSibling };
+
+static JSValue js_get_relative(JSContext* ctx, JSValueConst this_val, int which) {
+    Node* n = unwrapNode(this_val);
+    DOMBindingState* state = bindingState(ctx);
+    if (!n || !state) return JS_NULL;
+    const bool elementsOnly = which >= FirstElementChild;
+    auto ok = [&](const std::shared_ptr<Node>& c) { return !elementsOnly || c->type == Node::ELEMENT; };
+    if (which == FirstChild || which == LastChild || which == FirstElementChild || which == LastElementChild) {
+        if (n->type != Node::ELEMENT) return JS_NULL;
+        auto& kids = static_cast<Element*>(n)->children;
+        if (which == FirstChild || which == FirstElementChild) {
+            for (auto& c : kids) if (ok(c)) return wrapNode(ctx, c.get(), &c);
+        }
+        else {
+            for (auto it = kids.rbegin(); it != kids.rend(); ++it) if (ok(*it)) return wrapNode(ctx, it->get(), &*it);
+        }
+        return JS_NULL;
+    }
+    Element* parent = parentOf(state, n);
+    if (!parent) return JS_NULL;
+    auto& kids = parent->children;
+    size_t at = 0;
+    while (at < kids.size() && kids[at].get() != n) at++;
+    if (at == kids.size()) return JS_NULL;
+    if (which == NextSibling || which == NextElementSibling) {
+        for (size_t i = at + 1; i < kids.size(); i++) if (ok(kids[i])) return wrapNode(ctx, kids[i].get(), &kids[i]);
+    }
+    else {
+        for (size_t i = at; i-- > 0;) if (ok(kids[i])) return wrapNode(ctx, kids[i].get(), &kids[i]);
+    }
+    return JS_NULL;
+}
+
+// nodeType: 1 for an element, 3 for text; nodeName: the tag upper-cased, or "#text".
+static JSValue js_get_nodeType(JSContext* ctx, JSValueConst this_val) {
+    Node* n = unwrapNode(this_val);
+    return JS_NewInt32(ctx, !n ? 0 : n->type == Node::TEXT ? 3 : 1);
+}
+
+static JSValue js_get_nodeName(JSContext* ctx, JSValueConst this_val) {
+    Node* n = unwrapNode(this_val);
+    if (!n) return JS_NULL;
+    if (n->type == Node::TEXT) return jsStr(ctx, L"#text");
+    std::wstring upper = static_cast<Element*>(n)->tag;
+    for (auto& c : upper) c = (wchar_t)towupper(c);
+    return jsStr(ctx, upper);
+}
+
+// nodeValue / data: a text node's text; null for an element.
+static JSValue js_get_nodeValue(JSContext* ctx, JSValueConst this_val) {
+    Node* n = unwrapNode(this_val);
+    if (!n || n->type != Node::TEXT) return JS_NULL;
+    return jsStr(ctx, static_cast<TextNode*>(n)->text);
+}
+
+static JSValue js_set_nodeValue(JSContext* ctx, JSValueConst this_val, JSValueConst val) {
+    Node* n = unwrapNode(this_val);
+    if (!n || n->type != Node::TEXT) return JS_UNDEFINED;
+    const char* s = JS_ToCString(ctx, val);
+    static_cast<TextNode*>(n)->text = utf8ToWide(s);
+    JS_FreeCString(ctx, s);
+    markDirty(ctx);
+    return JS_UNDEFINED;
+}
+
+// getAttributeNames(): every attribute's name.
+static JSValue js_getAttributeNames(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    Element* el = unwrapElement(this_val);
+    JSValue arr = JS_NewArray(ctx);
+    if (!el) return arr;
+    uint32_t i = 0;
+    for (const auto& [name, value] : el->attrs) JS_SetPropertyUint32(ctx, arr, i++, jsStr(ctx, name));
     return arr;
 }
 
@@ -2442,6 +2738,168 @@ static const char kBootstrapJS[] = R"JS(
     },
   });
 })();
+
+// The rest of the DOM API that's simplest written over the natives:
+// classList, dataset, the node-or-string insertion methods, and
+// insertAdjacent*.
+(() => {
+  const nodeProto = Object.getPrototypeOf(document);
+  const def = (name, desc) => Object.defineProperty(nodeProto, name, Object.assign({ configurable: true }, desc));
+  const method = (name, fn) => def(name, { value: fn, writable: true });
+
+  // classList: a view of the class attribute, live like a browser's
+  // DOMTokenList (each call reads and writes className).
+  const tokens = el => (el.className || '').split(/\s+/).filter(Boolean);
+  const setTokens = (el, list) => { el.className = list.join(' '); };
+  class DOMTokenList {
+    constructor(el) { Object.defineProperty(this, '_el', { value: el }); }
+    get length() { return tokens(this._el).length; }
+    get value() { return this._el.className || ''; }
+    set value(v) { this._el.className = String(v); }
+    item(i) { const t = tokens(this._el); return i >= 0 && i < t.length ? t[i] : null; }
+    contains(c) { return tokens(this._el).includes(String(c)); }
+    add(...cs) {
+      const t = tokens(this._el);
+      for (const c of cs) if (!t.includes(String(c))) t.push(String(c));
+      setTokens(this._el, t);
+    }
+    remove(...cs) { setTokens(this._el, tokens(this._el).filter(t => !cs.map(String).includes(t))); }
+    toggle(c, force) {
+      c = String(c);
+      const has = this.contains(c);
+      const want = force === undefined ? !has : !!force;
+      if (want && !has) this.add(c);
+      else if (!want && has) this.remove(c);
+      return want;
+    }
+    replace(a, b) {
+      const t = tokens(this._el), i = t.indexOf(String(a));
+      if (i < 0) return false;
+      t[i] = String(b);
+      setTokens(this._el, t.filter((x, j) => t.indexOf(x) === j));
+      return true;
+    }
+    forEach(fn, thisArg) { tokens(this._el).forEach((t, i) => fn.call(thisArg, t, i, this)); }
+    entries() { return tokens(this._el).entries(); }
+    keys() { return tokens(this._el).keys(); }
+    values() { return tokens(this._el).values(); }
+    [Symbol.iterator]() { return tokens(this._el)[Symbol.iterator](); }
+    toString() { return this.value; }
+  }
+  globalThis.DOMTokenList = DOMTokenList;
+  def('classList', {
+    get() { return this.tagName ? new DOMTokenList(this) : undefined; },
+    set(v) { this.className = String(v); },
+  });
+
+  // dataset: data-* attributes, named in camelCase (data-user-id <-> userId).
+  const dataAttr = p => 'data-' + p.replace(/[A-Z]/g, c => '-' + c.toLowerCase());
+  const camel = n => n.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+  def('dataset', {
+    get() {
+      const el = this;
+      return new Proxy({}, {
+        get: (_, p) => typeof p === 'string' && el.hasAttribute(dataAttr(p)) ? el.getAttribute(dataAttr(p)) : undefined,
+        set: (_, p, v) => { el.setAttribute(dataAttr(String(p)), String(v)); return true; },
+        has: (_, p) => typeof p === 'string' && el.hasAttribute(dataAttr(p)),
+        deleteProperty: (_, p) => { el.removeAttribute(dataAttr(String(p))); return true; },
+        ownKeys: () => el.getAttributeNames().filter(n => n.startsWith('data-')).map(camel),
+        getOwnPropertyDescriptor: (_, p) => typeof p === 'string' && el.hasAttribute(dataAttr(p))
+          ? { value: el.getAttribute(dataAttr(p)), enumerable: true, configurable: true, writable: true } : undefined,
+      });
+    },
+  });
+
+  // Strings become text nodes, as in append('text', node).
+  const asNode = n => (n !== null && typeof n === 'object' && 'nodeType' in n) ? n : document.createTextNode(String(n));
+  method('append', function (...nodes) { for (const n of nodes) this.appendChild(asNode(n)); });
+  method('prepend', function (...nodes) {
+    const first = this.firstChild;
+    for (const n of nodes) this.insertBefore(asNode(n), first);
+  });
+  method('before', function (...nodes) {
+    const p = this.parentNode;
+    if (p) for (const n of nodes) p.insertBefore(asNode(n), this);
+  });
+  method('after', function (...nodes) {
+    const p = this.parentNode;
+    if (!p) return;
+    const next = this.nextSibling;
+    for (const n of nodes) p.insertBefore(asNode(n), next);
+  });
+  method('replaceWith', function (...nodes) {
+    const p = this.parentNode;
+    if (!p) return;
+    const next = this.nextSibling;
+    this.remove();
+    for (const n of nodes) p.insertBefore(asNode(n), next);
+  });
+  method('replaceChildren', function (...nodes) {
+    while (this.firstChild) this.removeChild(this.firstChild);
+    for (const n of nodes) this.appendChild(asNode(n));
+  });
+  method('hasChildNodes', function () { return this.firstChild !== null; });
+  method('toggleAttribute', function (name, force) {
+    const want = force === undefined ? !this.hasAttribute(name) : !!force;
+    if (want) this.setAttribute(name, '');
+    else this.removeAttribute(name);
+    return want;
+  });
+  def('childElementCount', { get() { return this.children.length; } });
+  def('localName', { get() { return this.tagName ? this.tagName.toLowerCase() : undefined; } });
+  def('ownerDocument', { get() { return document; } });
+  def('isConnected', {
+    get() {
+      let n = this;
+      while (n.parentNode) n = n.parentNode;
+      return n === document.documentElement;
+    },
+  });
+  // innerText: textContent here, since there's no layout-aware version.
+  def('innerText', {
+    get() { return this.textContent; },
+    set(v) { this.textContent = v; },
+  });
+
+  // insertAdjacentElement/Text/HTML(position, ...): beforebegin and
+  // afterend go outside the element, afterbegin and beforeend inside it.
+  const place = (el, where, node) => {
+    switch (String(where).toLowerCase()) {
+      case 'beforebegin': if (!el.parentNode) return null; el.parentNode.insertBefore(node, el); return node;
+      case 'afterbegin': el.insertBefore(node, el.firstChild); return node;
+      case 'beforeend': el.appendChild(node); return node;
+      case 'afterend': if (!el.parentNode) return null; el.parentNode.insertBefore(node, el.nextSibling); return node;
+    }
+    throw new DOMException("The value provided ('" + where + "') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or 'afterEnd'.", 'SyntaxError');
+  };
+  method('insertAdjacentElement', function (where, el) { return place(this, where, el); });
+  method('insertAdjacentText', function (where, text) { place(this, where, document.createTextNode(String(text))); });
+  method('insertAdjacentHTML', function (where, html) {
+    const holder = document.createElement('div');
+    holder.innerHTML = String(html);
+    const nodes = holder.childNodes;
+    const w = String(where).toLowerCase();
+    // Kept in order: each goes after the one before it.
+    if (w === 'afterbegin') { const first = this.firstChild; for (const n of nodes) this.insertBefore(n, first); }
+    else if (w === 'afterend') {
+      if (!this.parentNode) return;
+      const next = this.nextSibling;
+      for (const n of nodes) this.parentNode.insertBefore(n, next);
+    }
+    else for (const n of nodes) place(this, where, n);
+  });
+
+  // outerHTML = html: replaces the element with what the HTML parses to.
+  const outer = Object.getOwnPropertyDescriptor(nodeProto, 'outerHTML');
+  def('outerHTML', {
+    get: outer.get,
+    set(html) {
+      if (!this.parentNode) return;
+      this.insertAdjacentHTML('beforebegin', html);
+      this.remove();
+    },
+  });
+})();
 )JS";
 
 // ---------------------------------------------------------------------
@@ -2450,7 +2908,22 @@ static const char kBootstrapJS[] = R"JS(
 
 static const JSCFunctionListEntry js_node_proto_funcs[] = {
     JS_CGETSET_DEF("textContent", js_get_textContent, js_set_textContent),
-    JS_CGETSET_DEF("innerHTML", nullptr, js_set_innerHTML),
+    JS_CGETSET_DEF("innerHTML", js_get_innerHTML, js_set_innerHTML),
+    JS_CGETSET_DEF("outerHTML", js_get_outerHTML, nullptr), // its setter is in kBootstrapJS
+    JS_CGETSET_MAGIC_DEF("childNodes", js_get_childNodes, nullptr, 0),
+    JS_CGETSET_MAGIC_DEF("children", js_get_childNodes, nullptr, 1),
+    JS_CGETSET_MAGIC_DEF("firstChild", js_get_relative, nullptr, FirstChild),
+    JS_CGETSET_MAGIC_DEF("lastChild", js_get_relative, nullptr, LastChild),
+    JS_CGETSET_MAGIC_DEF("nextSibling", js_get_relative, nullptr, NextSibling),
+    JS_CGETSET_MAGIC_DEF("previousSibling", js_get_relative, nullptr, PreviousSibling),
+    JS_CGETSET_MAGIC_DEF("firstElementChild", js_get_relative, nullptr, FirstElementChild),
+    JS_CGETSET_MAGIC_DEF("lastElementChild", js_get_relative, nullptr, LastElementChild),
+    JS_CGETSET_MAGIC_DEF("nextElementSibling", js_get_relative, nullptr, NextElementSibling),
+    JS_CGETSET_MAGIC_DEF("previousElementSibling", js_get_relative, nullptr, PreviousElementSibling),
+    JS_CGETSET_DEF("nodeType", js_get_nodeType, nullptr),
+    JS_CGETSET_DEF("nodeName", js_get_nodeName, nullptr),
+    JS_CGETSET_DEF("nodeValue", js_get_nodeValue, js_set_nodeValue),
+    JS_CGETSET_DEF("data", js_get_nodeValue, js_set_nodeValue),
     JS_CGETSET_DEF("tagName", js_get_tagName, nullptr),
     JS_CGETSET_MAGIC_DEF("id", js_get_attr_magic, js_set_attr_magic, 0),
     JS_CGETSET_MAGIC_DEF("className", js_get_attr_magic, js_set_attr_magic, 1),
@@ -2475,8 +2948,14 @@ static const JSCFunctionListEntry js_node_proto_funcs[] = {
     JS_CFUNC_DEF("remove", 0, js_remove),
     JS_CFUNC_DEF("getElementById", 1, js_getElementById),
     JS_CFUNC_DEF("getElementsByTagName", 1, js_getElementsByTagName),
+    JS_CFUNC_DEF("getElementsByClassName", 1, js_getElementsByClassName),
     JS_CFUNC_DEF("querySelector", 1, js_querySelector),
     JS_CFUNC_DEF("querySelectorAll", 1, js_querySelectorAll),
+    JS_CFUNC_DEF("matches", 1, js_matches),
+    JS_CFUNC_DEF("closest", 1, js_closest),
+    JS_CFUNC_DEF("contains", 1, js_contains),
+    JS_CFUNC_DEF("cloneNode", 1, js_cloneNode),
+    JS_CFUNC_DEF("getAttributeNames", 0, js_getAttributeNames),
     JS_CFUNC_DEF("createElement", 1, js_createElement),
     JS_CFUNC_DEF("createTextNode", 1, js_createTextNode),
     JS_CFUNC_DEF("addEventListener", 2, js_addEventListener),

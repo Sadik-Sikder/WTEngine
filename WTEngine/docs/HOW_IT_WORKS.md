@@ -655,7 +655,12 @@ A relative URL is resolved against the page's own URL with `resolveUrl` - same r
 | Member | Notes |
 |---|---|
 | `textContent` (get/set) | |
-| `innerHTML` (set only) | Parses the fragment with `HTMLParser` |
+| `innerHTML`, `outerHTML` (get/set) | Getting serializes the subtree back to HTML (`serializeNode`: text and attributes escaped, void elements with no end tag, `<script>`/`<style>` content as is). Setting `innerHTML` parses the fragment with `HTMLParser`; setting `outerHTML` (`kBootstrapJS`) replaces the element with what it parses to. Children replaced this way get a null `parentNode`, and a script still holding one can insert it elsewhere |
+| `childNodes`, `children`, `firstChild`/`lastChild`, `nextSibling`/`previousSibling`, `first`/`lastElementChild`, `next`/`previousElementSibling`, `childElementCount` | Plain arrays (a snapshot, not a live collection) for the lists. Text nodes are included where the DOM has them (no comment nodes - the parser drops comments) |
+| `nodeType`, `nodeName`, `nodeValue`/`data`, `localName`, `ownerDocument`, `isConnected` | `nodeType` 1 or 3; `nodeName` the upper-cased tag or `#text`; `nodeValue`/`data` a text node's text (settable) |
+| `matches`, `closest`, `contains`, `cloneNode` | Selectors as in `querySelector`, matched against the element's real ancestors; an invalid one throws `SyntaxError`. `cloneNode(deep)` copies attributes (and the subtree) but not listeners |
+| `classList`, `dataset` | `classList` is a `DOMTokenList` over `className` (`add`, `remove`, `toggle`, `replace`, `contains`, `item`, iteration); `dataset` maps camelCase names to `data-*` attributes |
+| `append`, `prepend`, `before`, `after`, `replaceWith`, `replaceChildren`, `insertAdjacentHTML`/`Element`/`Text`, `hasChildNodes`, `toggleAttribute`, `getAttributeNames`, `innerText` | In `kBootstrapJS`, over the natives; strings become text nodes. `innerText` is `textContent` (no layout-aware version) |
 | `tagName`, `id`, `className` | |
 | `title` (get/set) | On `document`: the page's `<title>` text; setting it rewrites (or creates, in `<head>`) the `<title>` element, and the window title follows next frame. On any other element: its `title=""` attribute |
 | `value` (get/set) | `<input>`/`<button>`: the `value` attribute (`"on"` for a checkbox without one). `<textarea>`: its text. `<select>`: the selected `<option>`'s value (the first option if none is marked); setting it selects the first matching option. `<option>`: `value`, else its text. If the focused text field's value is changed, `Engine::render` reloads its editor from it |
@@ -666,7 +671,7 @@ A relative URL is resolved against the page's own URL with `resolveUrl` - same r
 | `appendChild`, `insertBefore`, `replaceChild` | Inserting a node that's already somewhere - in the page or in another detached subtree - **moves** it, as in browsers. Inserting a node into itself or its own descendant throws a `HierarchyRequestError` `DOMException`; a reference/old child that isn't a child throws `NotFoundError` |
 | `removeChild`, `remove()` | Detach (not destroy) the node; see Memory model |
 | `parentNode`, `parentElement` | The parent element, or `null` |
-| `getElementById`, `getElementsByTagName` | Search the subtree of the node they're called on |
+| `getElementById`, `getElementsByTagName`, `getElementsByClassName` | Search the subtree of the node they're called on |
 | `querySelector`, `querySelectorAll` | Same selector grammar as CSS (§8), including combinators, attribute selectors and structural pseudo-classes; results are plain arrays. Combinators only look at ancestors inside the searched subtree, but sibling combinators and structural pseudo-classes see the element's real siblings |
 | `addEventListener`, `removeEventListener`, `dispatchEvent` | Any event type; see Events below |
 | `onclick`, `oninput`, `onchange`, `onsubmit`, `onkeydown`, ... | `on*` handler properties for the types in `kHandlerTypes` |
@@ -823,7 +828,7 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 
 **JavaScript**
 - `window.onerror`/`unhandledrejection` events don't exist - errors reach the developer console (§11), not page code.
-- No computed style (`getComputedStyle`; `element.style` only sees inline declarations), or `innerHTML` getter. (`location`, `fetch()`, `XMLHttpRequest`, events, `localStorage`, `element.style`/`.value`/`.checked` and `document.title` are supported - §11.)
+- No computed style (`getComputedStyle`; `element.style` only sees inline declarations), and no element geometry (`getBoundingClientRect`, `offsetWidth`). No `navigator`, `URL` or `URLSearchParams`. (`location`, `fetch()`, `XMLHttpRequest`, events, `localStorage`, `element.style`/`.value`/`.checked` and `document.title` are supported - §11.)
 - Events the engine doesn't fire yet, though listeners and `on*` handlers for them can be registered: `mousedown`/`mouseup`/`mousemove`/`dblclick`/`contextmenu`/`wheel`, `keypress`, `scroll`/`resize`, `<img>`/`<script>` `load`/`error`, and `focus`/`blur` on anything but a text field. `load` doesn't wait for images. `el.click()`, `form.submit()` and `form.requestSubmit()` don't exist.
 - Mouse events only find elements that have a box: text, controls, images, and blocks with a background or border. Moving or clicking over the empty part of a plain `<div>` reaches its nearest painted ancestor instead (often none).
 - `document` is the `<body>` element's wrapper rather than a separate Document node, so `document.body === document`, and a listener on `document` sits between `<body>` and `<html>` in the event path instead of above `<html>`.
