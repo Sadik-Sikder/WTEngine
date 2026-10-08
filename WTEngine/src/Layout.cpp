@@ -237,7 +237,7 @@ static bool isInlineTag(const std::wstring& tag) {
         L"a", L"span", L"b", L"strong", L"i", L"em", L"u", L"small", L"code",
         L"sub", L"sup", L"mark", L"label", L"abbr", L"cite", L"q", L"img", L"svg",
         L"del", L"ins", L"s", L"strike", L"kbd", L"samp", L"var", L"dfn", L"tt", L"time",
-        L"bdi", L"bdo", L"big", L"font", L"data", L"output"
+        L"bdi", L"bdo", L"big", L"font", L"data", L"output", L"nobr", L"wbr"
     };
     for (const auto& t : kInline) if (tag == t) return true;
     return false;
@@ -249,10 +249,61 @@ static bool isInlineTag(const std::wstring& tag) {
 void LayoutRoot::appendWords(const std::wstring& text, int fontSize, const std::wstring& href,
                               Element* owner, std::vector<InlineItem>& out, bool visuallyHidden,
                               const TextPaint& paint) {
+    auto push = [&](std::wstring word, bool spaceBefore) {
+        switch (paint.transform) { // text-transform changes what's drawn (and measured), not the DOM
+        case TextTransform::Uppercase: for (auto& c : word) c = (wchar_t)towupper(c); break;
+        case TextTransform::Lowercase: for (auto& c : word) c = (wchar_t)towlower(c); break;
+        case TextTransform::Capitalize: word[0] = (wchar_t)towupper(word[0]); break;
+        case TextTransform::None: break;
+        }
+        InlineItem item{ std::move(word), fontSize, href, owner, false, visuallyHidden, paint };
+        item.spaceBefore = spaceBefore; // false for the first word of text glued to what precedes it
+        out.push_back(std::move(item));
+    };
+    auto pushBreak = [&]() { out.push_back({ L"", fontSize, href, owner, true, visuallyHidden, paint }); };
+
+    // pre / pre-wrap: spaces and newlines are kept. Each line is one item
+    // (pre: it never wraps), or one per word with the spaces after it
+    // (pre-wrap: it wraps between them, and the spaces stay); tabs become
+    // spaces up to the next multiple of 8 columns.
+    if (paint.whiteSpace == WhiteSpace::Pre || paint.whiteSpace == WhiteSpace::PreWrap) {
+        size_t i = 0;
+        for (;;) {
+            size_t nl = text.find(L'\n', i);
+            std::wstring line;
+            for (size_t k = i; k < (nl == std::wstring::npos ? text.size() : nl); k++) {
+                if (text[k] == L'\t') line.append(8 - line.size() % 8, L' ');
+                else if (text[k] != L'\r') line.push_back(text[k]);
+            }
+            if (paint.whiteSpace == WhiteSpace::Pre) {
+                if (!line.empty()) push(std::move(line), false);
+            }
+            else {
+                for (size_t a = 0; a < line.size();) {
+                    size_t b = a;
+                    while (b < line.size() && line[b] != L' ') b++;
+                    while (b < line.size() && line[b] == L' ') b++;
+                    push(line.substr(a, b - a), false);
+                    a = b;
+                }
+            }
+            if (nl == std::wstring::npos) break;
+            pushBreak();
+            i = nl + 1;
+        }
+        return;
+    }
+
+    // normal / nowrap / pre-line: runs of whitespace collapse to one space;
+    // pre-line keeps the newlines in them, as line breaks.
+    const bool keepNewlines = paint.whiteSpace == WhiteSpace::PreLine;
     size_t i = 0;
     while (i < text.size()) {
         bool space = false;
-        while (i < text.size() && iswspace(text[i])) { i++; space = true; }
+        for (; i < text.size() && iswspace(text[i]); i++) {
+            if (keepNewlines && text[i] == L'\n') { pushBreak(); space = false; }
+            else space = true;
+        }
         size_t start = i;
         while (i < text.size() && !iswspace(text[i])) i++;
         if (start == i) {
@@ -264,16 +315,7 @@ void LayoutRoot::appendWords(const std::wstring& text, int fontSize, const std::
             }
             break;
         }
-        std::wstring word = text.substr(start, i - start);
-        switch (paint.transform) { // text-transform changes what's drawn (and measured), not the DOM
-        case TextTransform::Uppercase: for (auto& c : word) c = (wchar_t)towupper(c); break;
-        case TextTransform::Lowercase: for (auto& c : word) c = (wchar_t)towlower(c); break;
-        case TextTransform::Capitalize: word[0] = (wchar_t)towupper(word[0]); break;
-        case TextTransform::None: break;
-        }
-        InlineItem item{ std::move(word), fontSize, href, owner, false, visuallyHidden, paint };
-        item.spaceBefore = space; // false for the first word of text glued to what precedes it
-        out.push_back(std::move(item));
+        push(text.substr(start, i - start), space);
     }
 }
 
@@ -475,6 +517,13 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
         return;
     }
 
+    // white-space: nowrap and pre text never wraps: there's no break between
+    // two such items (one before or after other text can still break there).
+    auto noWrap = [](const InlineItem& i) {
+        return i.paint.whiteSpace == WhiteSpace::NoWrap || i.paint.whiteSpace == WhiteSpace::Pre;
+    };
+    auto keepsLine = [&](const InlineItem& i) { return !line.empty() && noWrap(i) && noWrap(line.back().item); };
+
     // Whether the HTML had whitespace before the next item (see InlineItem).
     bool pendingSpace = false;
     auto gapBefore = [&](const InlineItem& item) {
@@ -485,7 +534,14 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
 
     for (const auto& raw : items) {
         if (raw.isSpace) { pendingSpace = true; continue; }
-        if (raw.isBreak) { emitLine(); pendingSpace = false; continue; }
+        if (raw.isBreak) {
+            // A break on an empty line leaves a blank one ("a<br><br>b", or an
+            // empty line in <pre>); one ending a line just ends it.
+            if (line.empty()) y += lineBand(raw.paint, raw.fontSize);
+            else emitLine();
+            pendingSpace = false;
+            continue;
+        }
         if (raw.floatItem) {
             if (line.empty()) placeFloat(*raw.floatItem, x, containingWidth, y);
             else deferredFloats.push_back(raw.floatItem);
@@ -503,7 +559,7 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
             // Wraps like a word; never split.
             float w = (float)(raw.marginLeft + raw.image->width + raw.marginRight);
             float spaceWidth = gapBefore(raw);
-            if (!line.empty() && lineWidth + spaceWidth + w > maxWidth) emitLine();
+            if (!line.empty() && lineWidth + spaceWidth + w > maxWidth && !keepsLine(raw)) emitLine();
             if (line.empty()) openLine(w, raw.image->height);
             float offset = line.empty() ? 0 : lineWidth + spaceWidth;
             lineWidth = offset + w;
@@ -519,7 +575,7 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
         // fragment per line (below any floats), before whatever's left of
         // it (now short enough) falls through to the normal wrapping below.
         const int band = lineBand(item.paint, item.fontSize);
-        while (!measuring_ && wordWidth > fullWidth && item.word.size() > 1) {
+        while (!measuring_ && !noWrap(item) && wordWidth > fullWidth && item.word.size() > 1) {
             if (!line.empty()) emitLine();
             openLine(wordWidth, band);
             size_t n = 1;
@@ -536,7 +592,7 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
         if (item.word.empty()) continue;
 
         float spaceWidth = gapBefore(item);
-        if (!line.empty() && lineWidth + spaceWidth + wordWidth > maxWidth) emitLine();
+        if (!line.empty() && lineWidth + spaceWidth + wordWidth > maxWidth && !keepsLine(item)) emitLine();
         if (line.empty()) openLine(wordWidth, band);
 
         float offset = line.empty() ? 0 : lineWidth + spaceWidth;
@@ -1098,6 +1154,9 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
     if (tag == L"u" || tag == L"ins") sv.paint.underline = true;
     if (tag == L"s" || tag == L"strike" || tag == L"del") sv.paint.lineThrough = true;
     if (tag == L"center" || tag == L"th") sv.paint.align = TextAlign::Center;
+    if (tag == L"pre" || tag == L"listing" || tag == L"xmp" || tag == L"plaintext") sv.paint.whiteSpace = WhiteSpace::Pre;
+    if (tag == L"nobr" || ((tag == L"td" || tag == L"th") && e->attrs.count(L"nowrap")))
+        sv.paint.whiteSpace = WhiteSpace::NoWrap;
     if (tag == L"center") sv.paint.centerBlocks = true;
     else if (tag == L"th") sv.paint.centerBlocks = false;
 
@@ -1182,7 +1241,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             P_min_height, P_min_width, P_opacity, P_overflow, P_overflow_x, P_overflow_y, P_padding,
             P_padding_bottom, P_padding_left, P_padding_right, P_padding_top, P_position, P_right,
             P_row_gap, P_text_align, P_text_decoration, P_text_decoration_line, P_text_transform, P_top,
-            P_vertical_align, P_visibility, P_width, P_z_index,
+            P_vertical_align, P_visibility, P_white_space, P_text_wrap, P_width, P_z_index,
         };
         static const std::unordered_map<std::wstring, int> kProps = {
             { L"align-items", P_align_items }, { L"background", P_background },
@@ -1223,6 +1282,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             { L"text-align", P_text_align }, { L"text-decoration", P_text_decoration },
             { L"text-decoration-line", P_text_decoration_line }, { L"text-transform", P_text_transform },
             { L"top", P_top }, { L"vertical-align", P_vertical_align }, { L"visibility", P_visibility },
+            { L"white-space", P_white_space }, { L"text-wrap", P_text_wrap }, { L"text-wrap-mode", P_text_wrap },
             { L"width", P_width }, { L"z-index", P_z_index },
         };
         auto found = kProps.find(k);
@@ -1547,6 +1607,24 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         else if (prop == P_font_size) sv.fontSize = resolveFontSize(v, inheritedFontSize, sv.fontSize);
         else if (prop == P_opacity) { try { sv.opacity = std::stof(v); } catch (...) {} }
         else if (prop == P_visibility) sv.visibilityHidden = (v == L"hidden" || v == L"collapse");
+        else if (prop == P_white_space) {
+            // Also the newer two-part form ("collapse nowrap", "preserve wrap").
+            std::wstring w = lowerCase(trimmed(v));
+            if (w == L"normal" || w == L"initial" || w == L"collapse wrap" || w == L"collapse") sv.paint.whiteSpace = WhiteSpace::Normal;
+            else if (w == L"nowrap" || w == L"collapse nowrap") sv.paint.whiteSpace = WhiteSpace::NoWrap;
+            else if (w == L"pre" || w == L"preserve nowrap") sv.paint.whiteSpace = WhiteSpace::Pre;
+            else if (w == L"pre-wrap" || w == L"break-spaces" || w == L"preserve" || w == L"preserve wrap") sv.paint.whiteSpace = WhiteSpace::PreWrap;
+            else if (w == L"pre-line" || w == L"preserve-breaks") sv.paint.whiteSpace = WhiteSpace::PreLine;
+        }
+        else if (prop == P_text_wrap) {
+            // text-wrap / text-wrap-mode: only whether to wrap at all (balance,
+            // pretty and stable wrap as normal).
+            std::wstring w = lowerCase(trimmed(v));
+            const bool preserve = sv.paint.whiteSpace == WhiteSpace::Pre || sv.paint.whiteSpace == WhiteSpace::PreWrap;
+            if (w == L"nowrap") sv.paint.whiteSpace = preserve ? WhiteSpace::Pre : WhiteSpace::NoWrap;
+            else if (w == L"wrap" || w == L"balance" || w == L"pretty" || w == L"stable")
+                sv.paint.whiteSpace = preserve ? WhiteSpace::PreWrap : sv.paint.whiteSpace == WhiteSpace::NoWrap ? WhiteSpace::Normal : sv.paint.whiteSpace;
+        }
         else if (prop == P_display) {
             if (v == L"none") sv.display = Display::None;
             else if (v == L"inline" || v == L"inline-block") sv.display = Display::Inline;

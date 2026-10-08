@@ -206,6 +206,8 @@ private:
     enum class TextAlign { Left, Center, Right };
     enum class TextTransform { None, Uppercase, Lowercase, Capitalize };
     // list-style-type. String: a quoted string, used as the marker as written.
+    // white-space (break-spaces is treated as pre-wrap).
+    enum class WhiteSpace { Normal, NoWrap, Pre, PreWrap, PreLine };
     enum class ListStyle { Disc, Circle, Square, Decimal, DecimalLeadingZero, LowerAlpha, UpperAlpha,
                            LowerRoman, UpperRoman, LowerGreek, String, None };
     struct TextPaint {
@@ -231,6 +233,10 @@ private:
         bool underline = false;
         bool lineThrough = false;
         TextTransform transform = TextTransform::None;
+        // white-space: how appendWords splits text (Pre/PreWrap keep spaces and
+        // newlines, PreLine keeps newlines) and whether layoutInlineRun may wrap
+        // between words (not for NoWrap or Pre). Inherited.
+        WhiteSpace whiteSpace = WhiteSpace::Normal;
         // list-style-type and list-style-position: inherited, so set on a list
         // and used by its items (see addListMarker). `listString` is the marker
         // for ListStyle::String.

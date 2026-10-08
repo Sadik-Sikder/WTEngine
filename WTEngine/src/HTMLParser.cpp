@@ -187,6 +187,13 @@ std::shared_ptr<Element> HTMLParser::parseElement() {
         return elem;
     }
 
+    // A newline straight after <pre> is dropped, as in HTML, so
+    // "<pre>\ncode" starts with "code".
+    if (name == L"pre" || name == L"listing") {
+        if (pos < s.size() && s[pos] == L'\r') pos++;
+        if (pos < s.size() && s[pos] == L'\n') pos++;
+    }
+
     // parse children until </name>. Whitespace isn't skipped: it becomes
     // part of the text nodes (see parseText), since "<b>a</b> <i>b</i>" and
     // "<b>a</b><i>b</i>" lay out differently.
@@ -239,15 +246,9 @@ std::wstring HTMLParser::parseText() {
     while (pos < s.size() && s[pos] != L'<') {
         out.push_back(s[pos++]);
     }
-    // Whitespace at either end collapses to one space rather than being
-    // dropped, so layout can tell "<em>x</em>," (no gap) from "<em>x</em> ,"
-    // - and text that's only whitespace becomes " ". (Whitespace between
-    // words is kept as is; layout splits on it anyway.)
-    size_t a = 0, b = out.size();
-    while (a < b && iswspace(out[a])) a++;
-    while (b > a && iswspace(out[b - 1])) b--;
-    if (a == b) return out.empty() ? L"" : L" ";
-    return (a > 0 ? L" " : L"") + decodeEntities(out.substr(a, b - a)) + (b < out.size() ? L" " : L"");
+    // Kept as written, whitespace and all: layout collapses it or not
+    // depending on white-space (appendWords), and scripts see the real text.
+    return decodeEntities(out);
 }
 
 std::shared_ptr<Node> HTMLParser::parseNode() {
