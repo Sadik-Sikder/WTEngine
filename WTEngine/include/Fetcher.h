@@ -81,6 +81,10 @@ struct HttpResponse {
     int status = 0;
     std::string body;        // raw bytes, already decompressed
     std::string contentType;
+    // Every header but Set-Cookie (names lowercased), and the status line's
+    // reason phrase ("OK", "Not Found") - what scripts get to see.
+    std::vector<std::pair<std::string, std::string>> headers;
+    std::string statusText;
     std::wstring finalUrl;   // after redirects
     std::wstring error;
 };

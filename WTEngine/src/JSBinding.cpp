@@ -1626,13 +1626,22 @@ void pollFetches(JSContext* ctx) {
         JSValue result;
         JSValue settle;
         if (res.ok) {
-            JSValue args[4] = {
+            // The headers as a flat [name, value, ...] array.
+            JSValue headers = JS_NewArray(ctx);
+            uint32_t h = 0;
+            for (const auto& [name, value] : res.headers) {
+                JS_SetPropertyUint32(ctx, headers, h++, JS_NewStringLen(ctx, name.data(), name.size()));
+                JS_SetPropertyUint32(ctx, headers, h++, JS_NewStringLen(ctx, value.data(), value.size()));
+            }
+            JSValue args[6] = {
                 JS_NewInt32(ctx, res.status),
                 jsStr(ctx, res.finalUrl),
                 JS_NewStringLen(ctx, res.body.data(), res.body.size()),
                 JS_NewStringLen(ctx, res.contentType.data(), res.contentType.size()),
+                headers,
+                JS_NewStringLen(ctx, res.statusText.data(), res.statusText.size()),
             };
-            result = JS_Call(ctx, makeResponse, JS_UNDEFINED, 4, args);
+            result = JS_Call(ctx, makeResponse, JS_UNDEFINED, 6, args);
             for (JSValue& a : args) JS_FreeValue(ctx, a);
             settle = f.resolve;
         } else {
@@ -1997,17 +2006,54 @@ static const char kBootstrapJS[] = R"JS(
   }
   g.MessageEvent = eventClasses.MessageEvent = MessageEvent;
 
+  // A plain event target, for the objects defined here that aren't DOM
+  // nodes (MessagePort, XMLHttpRequest) - and the global EventTarget a page
+  // can extend. No capture or bubbling: there's only ever the one target.
+  // An on<type> handler runs before the listeners.
+  class EventTarget {
+    constructor() { hidden(this, '_listeners', []); }
+    addEventListener(type, fn, options) {
+      if (!fn || this._listeners.some(l => l.type === type && l.fn === fn)) return;
+      const once = !!(options && typeof options === 'object' && options.once);
+      this._listeners.push({ type: String(type), fn, once });
+    }
+    removeEventListener(type, fn) {
+      const i = this._listeners.findIndex(l => l.type === type && l.fn === fn);
+      if (i >= 0) this._listeners.splice(i, 1);
+    }
+    dispatchEvent(event) {
+      event.target = event.currentTarget = this;
+      event.eventPhase = 2;
+      const call = fn => {
+        try { typeof fn === 'function' ? fn.call(this, event) : fn.handleEvent(event); }
+        catch (e) { __wtReportError(e, event.type + ' listener'); }
+      };
+      const handler = this['on' + event.type];
+      if (typeof handler === 'function') call(handler);
+      for (const l of this._listeners.slice()) {
+        if (event.__wtStopImmediate) break;
+        if (l.type !== event.type || !this._listeners.includes(l)) continue;
+        if (l.once) this.removeEventListener(l.type, l.fn);
+        call(l.fn);
+      }
+      event.currentTarget = null;
+      event.eventPhase = 0;
+      return !event.defaultPrevented;
+    }
+  }
+  g.EventTarget = EventTarget;
+
   // One end of a MessageChannel. Messages are delivered as tasks, in order,
   // once the port is started - by start(), or by setting onmessage.
   // Simplified: data isn't cloned (the receiver gets the same object) and
   // ports can't be transferred.
-  class MessagePort {
+  class MessagePort extends EventTarget {
     constructor() {
+      super();
       hidden(this, '_other', null);
       hidden(this, '_started', false);
       hidden(this, '_closed', false);
       hidden(this, '_queue', []);
-      hidden(this, '_listeners', []);
       hidden(this, '_onmessage', null);
       this.onmessageerror = null;
     }
@@ -2025,33 +2071,6 @@ static const char kBootstrapJS[] = R"JS(
       for (const data of queued) __wtQueueTask(() => this._deliver(data));
     }
     close() { this._closed = true; }
-    addEventListener(type, fn, options) {
-      if (!fn || this._listeners.some(l => l.type === type && l.fn === fn)) return;
-      const once = !!(options && typeof options === 'object' && options.once);
-      this._listeners.push({ type: String(type), fn, once });
-    }
-    removeEventListener(type, fn) {
-      const i = this._listeners.findIndex(l => l.type === type && l.fn === fn);
-      if (i >= 0) this._listeners.splice(i, 1);
-    }
-    dispatchEvent(event) {
-      event.target = event.currentTarget = this;
-      event.eventPhase = 2;
-      const call = fn => {
-        try { typeof fn === 'function' ? fn.call(this, event) : fn.handleEvent(event); }
-        catch (e) { __wtReportError(e, event.type + ' listener'); }
-      };
-      if (event.type === 'message' && this._onmessage) call(this._onmessage);
-      for (const l of this._listeners.slice()) {
-        if (l.type !== event.type || !this._listeners.includes(l)) continue;
-        if (l.once) this.removeEventListener(l.type, l.fn);
-        call(l.fn);
-        if (event.__wtStopImmediate) break;
-      }
-      event.currentTarget = null;
-      event.eventPhase = 0;
-      return !event.defaultPrevented;
-    }
     _receive(data) {
       if (this._closed) return;
       if (this._started) this._deliver(data);
@@ -2119,21 +2138,26 @@ static const char kBootstrapJS[] = R"JS(
   Object.defineProperty(g, 'localStorage', { value: makeStorage(0), enumerable: true, configurable: true });
   Object.defineProperty(g, 'sessionStorage', { value: makeStorage(1), enumerable: true, configurable: true });
 
-  g.__wtResponse = function (status, url, body, contentType) {
+  // `rawHeaders`: the response's headers as [name, value, ...] (names
+  // lowercased, no Set-Cookie) - empty for a local file.
+  g.__wtResponse = function (status, url, body, contentType, rawHeaders, statusText) {
+    rawHeaders = rawHeaders || [];
     let used = false;
     const take = () => {
       if (used) return Promise.reject(new TypeError('Body has already been consumed'));
       used = true;
       return Promise.resolve(body);
     };
+    const headers = new Headers();
+    for (let i = 0; i + 1 < rawHeaders.length; i += 2) headers.append(rawHeaders[i], rawHeaders[i + 1]);
+    if (contentType && !headers.has('content-type')) headers.set('content-type', contentType);
     return {
-      ok: status >= 200 && status < 300, status, statusText: '', url,
-      redirected: false, type: 'basic',
-      headers: new Headers(contentType ? { 'content-type': contentType } : {}),
+      ok: status >= 200 && status < 300, status, statusText: statusText || '', url,
+      redirected: false, type: 'basic', headers,
       get bodyUsed() { return used; },
       text: () => take(),
       json: () => take().then(JSON.parse),
-      clone: () => g.__wtResponse(status, url, body, contentType),
+      clone: () => g.__wtResponse(status, url, body, contentType, rawHeaders, statusText),
     };
   };
 
@@ -2151,6 +2175,176 @@ static const char kBootstrapJS[] = R"JS(
       return Promise.reject(e);
     }
   };
+
+  class ProgressEvent extends Event {
+    constructor(type, init) {
+      super(type, init);
+      init = init || {};
+      this.lengthComputable = !!init.lengthComputable;
+      this.loaded = Number(init.loaded) || 0;
+      this.total = Number(init.total) || 0;
+    }
+  }
+  g.ProgressEvent = ProgressEvent;
+
+  // XMLHttpRequest, on the same native request fetch() uses (__wtFetch) -
+  // cookies, redirects and decompression included. Simplified:
+  // - asynchronous only: open(..., false) throws, since nothing in this
+  //   engine can wait on the network;
+  // - the response arrives in one piece, so readyState goes 2, 3, 4 back
+  //   to back, with one progress event;
+  // - responseType '' / 'text' / 'json'; 'arraybuffer', 'blob' and
+  //   'document' give a null response; responseXML is always null;
+  // - withCredentials is accepted and ignored (cookies go as for fetch()),
+  //   and `upload` never fires anything.
+  const xhrForbiddenHeaders = new Set(['accept-charset', 'accept-encoding', 'access-control-request-headers',
+    'access-control-request-method', 'connection', 'content-length', 'cookie', 'cookie2', 'date', 'dnt',
+    'expect', 'host', 'keep-alive', 'origin', 'referer', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'via']);
+  class XMLHttpRequestUpload extends EventTarget {}
+  class XMLHttpRequest extends EventTarget {
+    constructor() {
+      super();
+      // gen: bumped by open/abort/timeout, so a response for an earlier
+      // request is ignored when it arrives.
+      hidden(this, '_x', { method: 'GET', url: '', headers: new Headers(), sent: false, gen: 0,
+                           response: null, text: '', timer: null });
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.responseURL = '';
+      this.responseType = '';
+      this.timeout = 0;
+      this.withCredentials = false;
+      this.upload = new XMLHttpRequestUpload();
+      for (const t of ['readystatechange', 'loadstart', 'progress', 'abort', 'error', 'load', 'timeout', 'loadend'])
+        this['on' + t] = null;
+    }
+    open(method, url, async) {
+      if (arguments.length < 2) throw new TypeError("Failed to execute 'open' on 'XMLHttpRequest': 2 arguments required.");
+      if (async === false)
+        throw new DOMException("Failed to execute 'open' on 'XMLHttpRequest': synchronous requests are not supported.", 'InvalidAccessError');
+      const x = this._x;
+      clearTimeout(x.timer);
+      x.gen++;
+      x.method = String(method).toUpperCase();
+      x.url = String(url);
+      x.headers = new Headers();
+      x.sent = false;
+      x.response = null;
+      x.text = '';
+      this.status = 0;
+      this.statusText = '';
+      this.responseURL = '';
+      this._setState(1);
+    }
+    setRequestHeader(name, value) {
+      if (this.readyState !== 1 || this._x.sent)
+        throw new DOMException("Failed to execute 'setRequestHeader' on 'XMLHttpRequest': The object's state must be OPENED.", 'InvalidStateError');
+      const n = String(name).toLowerCase();
+      if (xhrForbiddenHeaders.has(n) || n.startsWith('proxy-') || n.startsWith('sec-')) return; // as browsers: silently dropped
+      this._x.headers.append(name, value);
+    }
+    send(body) {
+      const x = this._x;
+      if (this.readyState !== 1 || x.sent)
+        throw new DOMException("Failed to execute 'send' on 'XMLHttpRequest': The object's state must be OPENED.", 'InvalidStateError');
+      x.sent = true;
+      let data = '';
+      if (x.method !== 'GET' && x.method !== 'HEAD' && body != null) {
+        data = typeof body === 'string' ? body : String(body);
+        if (!x.headers.has('content-type')) x.headers.set('content-type', 'text/plain;charset=UTF-8');
+      }
+      const gen = x.gen;
+      this._progress('loadstart', 0, 0);
+      const flat = [];
+      x.headers.forEach((v, k) => flat.push(k, v));
+      let request;
+      try { request = __wtFetch(x.url, x.method, flat, data); } catch (e) { request = Promise.reject(e); }
+      if (this.timeout > 0) {
+        x.timer = setTimeout(() => {
+          if (gen !== x.gen) return;
+          x.gen++;
+          this._fail('timeout');
+        }, this.timeout);
+      }
+      request.then(res => res.text().then(text => {
+        if (gen !== x.gen) return; // aborted, timed out or reopened meanwhile
+        clearTimeout(x.timer);
+        x.response = res;
+        x.text = text;
+        this.status = res.status;
+        this.statusText = res.statusText;
+        this.responseURL = res.url;
+        this._setState(2);
+        this._setState(3);
+        this._progress('progress', text.length, text.length);
+        this._setState(4);
+        this._progress('load', text.length, text.length);
+        this._progress('loadend', text.length, text.length);
+      }), () => {
+        if (gen !== x.gen) return;
+        clearTimeout(x.timer);
+        this._fail('error');
+      });
+    }
+    abort() {
+      const x = this._x;
+      clearTimeout(x.timer);
+      x.gen++;
+      if ((this.readyState === 1 && x.sent) || this.readyState === 2 || this.readyState === 3) {
+        x.sent = false;
+        this._fail('abort');
+      }
+      if (this.readyState === 4) { this.readyState = 0; this.status = 0; this.statusText = ''; }
+    }
+    getResponseHeader(name) {
+      if (this.readyState < 2 || !this._x.response) return null;
+      return this._x.response.headers.get(name);
+    }
+    getAllResponseHeaders() {
+      if (this.readyState < 2 || !this._x.response) return '';
+      const lines = [];
+      this._x.response.headers.forEach((v, k) => lines.push(k + ': ' + v));
+      return lines.sort().map(l => l + '\r\n').join('');
+    }
+    overrideMimeType() {}
+    get responseText() {
+      if (this.responseType !== '' && this.responseType !== 'text')
+        throw new DOMException("Failed to read the 'responseText' property from 'XMLHttpRequest': The value is only accessible if the object's 'responseType' is '' or 'text'.", 'InvalidStateError');
+      return this.readyState >= 3 ? this._x.text : '';
+    }
+    get response() {
+      const t = this.responseType;
+      if (t === '' || t === 'text') return this.readyState >= 3 ? this._x.text : '';
+      if (this.readyState !== 4 || !this._x.response) return null;
+      if (t === 'json') { try { return JSON.parse(this._x.text); } catch (e) { return null; } }
+      return null;
+    }
+    get responseXML() { return null; }
+    _setState(s) {
+      this.readyState = s;
+      this.dispatchEvent(new Event('readystatechange'));
+    }
+    _progress(type, loaded, total) {
+      this.dispatchEvent(new ProgressEvent(type, { lengthComputable: total > 0, loaded, total }));
+    }
+    // A request that ends without a response: an error, a timeout or an abort.
+    _fail(type) {
+      const x = this._x;
+      x.response = null;
+      x.text = '';
+      this.status = 0;
+      this.statusText = '';
+      this._setState(4);
+      this._progress(type, 0, 0);
+      this._progress('loadend', 0, 0);
+    }
+  }
+  const xhrStates = { UNSENT: 0, OPENED: 1, HEADERS_RECEIVED: 2, LOADING: 3, DONE: 4 };
+  Object.assign(XMLHttpRequest, xhrStates);
+  Object.assign(XMLHttpRequest.prototype, xhrStates);
+  g.XMLHttpRequest = XMLHttpRequest;
+  g.XMLHttpRequestUpload = XMLHttpRequestUpload;
 
   const nodeProto = Object.getPrototypeOf(document);
 

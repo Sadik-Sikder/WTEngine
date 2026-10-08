@@ -172,6 +172,10 @@ struct RawResponse {
     std::string location;    // Location header, for the redirect loop (followRedirect)
     std::string contentType; // Content-Type header, for fetchHttpAsync
     std::vector<std::string> setCookies; // every Set-Cookie header, for the CookieJar (see fetch())
+    // Every other header (names lowercased), and the status line's reason
+    // phrase - for fetchHttpAsync's callers (JS fetch()/XMLHttpRequest).
+    std::vector<std::pair<std::string, std::string>> headers;
+    std::string statusText;
 
     std::wstring finalUrl;
     std::wstring error;
@@ -280,6 +284,14 @@ static void fillRawResponse(http::response<http::string_body>& res, RawResponse&
     // A response can set several cookies, one Set-Cookie header each.
     auto [first, last] = res.equal_range(http::field::set_cookie);
     for (auto it = first; it != last; ++it) out.setCookies.emplace_back(it->value());
+    // The rest, for scripts - which, as in browsers, never see Set-Cookie.
+    out.statusText.assign(res.reason());
+    for (const auto& field : res) {
+        std::string name(field.name_string());
+        for (auto& c : name) c = (char)std::tolower((unsigned char)c);
+        if (name == "set-cookie" || name == "set-cookie2") continue;
+        out.headers.emplace_back(std::move(name), std::string(field.value()));
+    }
 
     out.ok = true;
 
@@ -882,6 +894,8 @@ net::awaitable<void> runHttp(HttpRequest request, std::function<void(HttpRespons
         res.status = raw.status;
         res.body = std::move(raw.body);
         res.contentType = std::move(raw.contentType);
+        res.headers = std::move(raw.headers);
+        res.statusText = std::move(raw.statusText);
         res.finalUrl = raw.finalUrl;
         res.error = raw.error;
     }
