@@ -65,6 +65,11 @@ struct DOMBindingState {
     // .replace()/.assign(), and as location.href's own value.
     std::wstring pageUrl;
 
+    // The <script> element whose code is running (Engine::advanceScripts),
+    // for document.currentScript; empty between scripts. Owning, so a
+    // script that removes itself can still be read.
+    std::shared_ptr<Node> currentScript;
+
     // Set by location.href=/.replace()/.assign()/.reload(), or a bare
     // `location = url` / `window.location = url` assignment.
     // Engine::takeNavigation polls this once per frame, the same pattern

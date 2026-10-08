@@ -19,6 +19,7 @@
 #include <mutex>
 #include <deque>
 #include <chrono>
+#include <thread>
 
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
 
@@ -923,6 +924,13 @@ static JSValue js_get_relative(JSContext* ctx, JSValueConst this_val, int which)
 }
 
 // nodeType: 1 for an element, 3 for text; nodeName: the tag upper-cased, or "#text".
+// document.currentScript: the <script> element running now, else null.
+static JSValue js_get_currentScript(JSContext* ctx, JSValueConst) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state || !state->currentScript) return JS_NULL;
+    return wrapNode(ctx, state->currentScript.get(), &state->currentScript);
+}
+
 static JSValue js_get_nodeType(JSContext* ctx, JSValueConst this_val) {
     Node* n = unwrapNode(this_val);
     return JS_NewInt32(ctx, !n ? 0 : n->type == Node::TEXT ? 3 : 1);
@@ -1589,6 +1597,16 @@ void runQueuedTasks(JSContext* ctx, double budgetSeconds) {
         JS_FreeValue(ctx, fn);
         if (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= budgetSeconds) break;
     }
+}
+
+// __wtNavigatorInfo() -> [userAgent, Accept-Language list, CPU count]: what
+// navigator (kBootstrapJS) reports, from the same values requests send.
+static JSValue js_native_navigatorInfo(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+    JSValue arr = JS_NewArray(ctx);
+    JS_SetPropertyUint32(ctx, arr, 0, JS_NewString(ctx, userAgent()));
+    JS_SetPropertyUint32(ctx, arr, 1, JS_NewString(ctx, acceptLanguage().c_str()));
+    JS_SetPropertyUint32(ctx, arr, 2, JS_NewInt32(ctx, (int)std::max(1u, std::thread::hardware_concurrency())));
+    return arr;
 }
 
 // --- location: reading the page's URL, and JS-driven navigation --------
@@ -2457,13 +2475,17 @@ static const char kBootstrapJS[] = R"JS(
     };
   };
 
+  // The content type a URLSearchParams body is sent with, as in browsers.
+  const formType = 'application/x-www-form-urlencoded;charset=UTF-8';
   g.fetch = function (input, init) {
     try {
       init = init || {};
       const url = String(input && typeof input === 'object' && 'url' in input ? input.url : input);
       const method = String(init.method || 'GET').toUpperCase();
       const flat = [];
-      new Headers(init.headers).forEach((v, k) => flat.push(k, v));
+      const headers = new Headers(init.headers);
+      if (init.body instanceof g.URLSearchParams && !headers.has('content-type')) headers.set('content-type', formType);
+      headers.forEach((v, k) => flat.push(k, v));
       let body = init.body == null ? '' : init.body;
       if (typeof body !== 'string') body = String(body);
       return __wtFetch(url, method, flat, body);
@@ -2548,7 +2570,8 @@ static const char kBootstrapJS[] = R"JS(
       let data = '';
       if (x.method !== 'GET' && x.method !== 'HEAD' && body != null) {
         data = typeof body === 'string' ? body : String(body);
-        if (!x.headers.has('content-type')) x.headers.set('content-type', 'text/plain;charset=UTF-8');
+        if (!x.headers.has('content-type'))
+          x.headers.set('content-type', body instanceof g.URLSearchParams ? formType : 'text/plain;charset=UTF-8');
       }
       const gen = x.gen;
       this._progress('loadstart', 0, 0);
@@ -2900,6 +2923,519 @@ static const char kBootstrapJS[] = R"JS(
     },
   });
 })();
+
+// URL and URLSearchParams (the WHATWG URL Standard, simplified: no IDNA -
+// a non-ASCII host is kept as written - and no IPv4 number forms),
+// navigator, and location's parts.
+(() => {
+  const g = globalThis;
+  const defaultPorts = { 'http:': '80', 'https:': '443', 'ws:': '80', 'wss:': '443', 'ftp:': '21', 'file:': '' };
+  const isSpecial = p => Object.prototype.hasOwnProperty.call(defaultPorts, p);
+
+  // Percent-encoding: controls, non-ASCII (as UTF-8) and the set's own
+  // characters become %XX; existing escapes are left alone.
+  const pathSet = ' "#<>?`{}', querySet = ' "#<>', specialQuerySet = ' "#<>\'', fragmentSet = ' "<>`';
+  const userinfoSet = pathSet + '/:;=@[\\]^|';
+  const hex = c => '%' + c.toString(16).toUpperCase().padStart(2, '0');
+  const encode = (s, set) => {
+    let out = '';
+    for (const ch of s) {
+      const c = ch.codePointAt(0);
+      if (c < 0x20 || c === 0x7f || set.includes(ch)) out += hex(c);
+      else if (c > 0x7f) { try { out += encodeURIComponent(ch); } catch { out += '%EF%BF%BD'; } }
+      else out += ch;
+    }
+    return out;
+  };
+
+  // "a/./b/../c" -> "a/c", as URLs resolve dot segments (%2e counts as a dot).
+  const normalizePath = path => {
+    const segs = path.split('/'), out = [];
+    for (let i = 1; i < segs.length; i++) {
+      const s = segs[i].toLowerCase(), last = i === segs.length - 1;
+      if (s === '..' || s === '.%2e' || s === '%2e.' || s === '%2e%2e') { out.pop(); if (last) out.push(''); }
+      else if (s === '.' || s === '%2e') { if (last) out.push(''); }
+      else out.push(segs[i]);
+    }
+    return '/' + out.join('/');
+  };
+
+  // Splits "path?query#fragment"; query/fragment are null when absent.
+  const splitTail = s => {
+    let fragment = null, query = null;
+    const h = s.indexOf('#');
+    if (h >= 0) { fragment = s.slice(h + 1); s = s.slice(0, h); }
+    const q = s.indexOf('?');
+    if (q >= 0) { query = s.slice(q + 1); s = s.slice(0, q); }
+    return { path: s, query, fragment };
+  };
+
+  const invalid = input => new TypeError("Failed to construct 'URL': Invalid URL" + (input !== undefined ? " '" + input + "'" : ''));
+  const forbiddenHost = /[\x00-\x20#%\/:<>?@[\\\]^|]/;
+
+  // "host:port" -> [hostname, port]; throws on a bad port or host.
+  const parseHost = (protocol, hostport, input) => {
+    let host = hostport, port = '';
+    const close = hostport.lastIndexOf(']'), colon = hostport.lastIndexOf(':');
+    if (colon > close) { host = hostport.slice(0, colon); port = hostport.slice(colon + 1); }
+    if (port !== '') {
+      if (!/^\d+$/.test(port) || Number(port) > 65535) throw invalid(input);
+      port = String(Number(port));
+      if (defaultPorts[protocol] === port) port = '';
+    }
+    if (isSpecial(protocol)) {
+      try { host = decodeURIComponent(host); } catch { throw invalid(input); }
+      host = host.toLowerCase();
+      if (host === '' && protocol !== 'file:') throw invalid(input);
+    }
+    const inner = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1).replace(/:/g, '') : host;
+    if (forbiddenHost.test(inner)) throw invalid(input);
+    return [host, port];
+  };
+
+  // Everything after "scheme://": authority, then path, query, fragment.
+  const parseAuthority = (protocol, s, input) => {
+    let end = s.search(/[\/?#]/);
+    if (end < 0) end = s.length;
+    const auth = s.slice(0, end), r = { protocol, username: '', password: '', opaque: false };
+    let hostport = auth;
+    const at = auth.lastIndexOf('@');
+    if (at >= 0) {
+      const info = auth.slice(0, at), c = info.indexOf(':');
+      r.username = encode(c >= 0 ? info.slice(0, c) : info, userinfoSet);
+      r.password = c >= 0 ? encode(info.slice(c + 1), userinfoSet) : '';
+      hostport = auth.slice(at + 1);
+    }
+    [r.hostname, r.port] = parseHost(protocol, hostport, input);
+    setTail(r, s.slice(end));
+    return r;
+  };
+
+  const setTail = (r, tail) => {
+    const { path, query, fragment } = splitTail(tail);
+    r.pathname = path === '' && !isSpecial(r.protocol) ? '' : normalizePath(encode(path.startsWith('/') ? path : '/' + path, pathSet));
+    r.query = query === null ? null : encode(query, isSpecial(r.protocol) ? specialQuerySet : querySet);
+    r.fragment = fragment === null ? null : encode(fragment, fragmentSet);
+  };
+
+  // Backslashes count as slashes in a special URL's path (not its query).
+  const slashes = (s, special) => {
+    if (!special) return s;
+    const cut = s.search(/[?#]/);
+    return cut < 0 ? s.replace(/\\/g, '/') : s.slice(0, cut).replace(/\\/g, '/') + s.slice(cut);
+  };
+
+  const parse = (input, base) => {
+    const raw = String(input);
+    const s = raw.replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, '').replace(/[\t\n\r]/g, '');
+    const m = /^([a-zA-Z][a-zA-Z0-9+.\-]*):([\s\S]*)$/.exec(s);
+    if (m) {
+      const protocol = m[1].toLowerCase() + ':';
+      let rest = slashes(m[2], isSpecial(protocol));
+      if (protocol === 'file:') {
+        // file:///C:/x and file:/x have no host; file://server/x does. A
+        // drive letter is never a host.
+        const t = rest.startsWith('//') ? rest.slice(2) : rest;
+        if (!rest.startsWith('//') || t.startsWith('/') || /^[a-zA-Z][:|]/.test(t)) {
+          const r = { protocol, username: '', password: '', hostname: '', port: '', opaque: false };
+          setTail(r, t);
+          return r;
+        }
+        return parseAuthority(protocol, t, raw);
+      }
+      if (isSpecial(protocol)) {
+        // "http:foo" against an http: base is relative to it.
+        if (base && base.protocol === protocol && !rest.startsWith('/')) return relative(rest, base, raw);
+        return parseAuthority(protocol, rest.replace(/^\/*/, ''), raw);
+      }
+      if (rest.startsWith('//')) return parseAuthority(protocol, rest.slice(2), raw);
+      // An opaque path: mailto:, data:, javascript:, ...
+      const { path, query, fragment } = splitTail(rest);
+      return { protocol, username: '', password: '', hostname: null, port: '', opaque: true,
+               pathname: encode(path, ''), query: query === null ? null : encode(query, querySet),
+               fragment: fragment === null ? null : encode(fragment, fragmentSet) };
+    }
+    if (!base) throw invalid(raw);
+    return relative(slashes(s, isSpecial(base.protocol)), base, raw);
+  };
+
+  const relative = (s, base, raw) => {
+    if (base.opaque) {
+      if (!s.startsWith('#')) throw invalid(raw);
+      return Object.assign({}, base, { fragment: encode(s.slice(1), fragmentSet) });
+    }
+    if (s.startsWith('//')) return parseAuthority(base.protocol, s.slice(2), raw);
+    const r = Object.assign({}, base);
+    const { path, query, fragment } = splitTail(s);
+    if (path === '') {
+      r.query = query === null ? base.query : encode(query, isSpecial(r.protocol) ? specialQuerySet : querySet);
+      r.fragment = fragment === null ? null : encode(fragment, fragmentSet);
+      return r;
+    }
+    const dir = base.pathname.slice(0, base.pathname.lastIndexOf('/') + 1) || '/';
+    setTail(r, (path.startsWith('/') ? '' : dir) + s);
+    return r;
+  };
+
+  const serialize = r => {
+    let out = r.protocol;
+    if (r.hostname !== null) {
+      out += '//';
+      if (r.username || r.password) out += r.username + (r.password ? ':' + r.password : '') + '@';
+      out += r.hostname + (r.port ? ':' + r.port : '');
+    }
+    out += r.pathname;
+    if (r.query !== null) out += '?' + r.query;
+    if (r.fragment !== null) out += '#' + r.fragment;
+    return out;
+  };
+
+  // application/x-www-form-urlencoded, for URLSearchParams.
+  const formDecode = s => s.replace(/\+/g, ' ').replace(/(%[0-9a-fA-F]{2})+/g, run => {
+    try { return decodeURIComponent(run); } catch { return run; }
+  });
+  const formEncode = s => {
+    let out = '';
+    for (const ch of String(s)) {
+      if (/[A-Za-z0-9*\-._]/.test(ch)) out += ch;
+      else if (ch === ' ') out += '+';
+      else { try { out += encodeURIComponent(ch).replace(/[!'()~]/g, c => hex(c.charCodeAt(0))); } catch { out += '%EF%BF%BD'; } }
+    }
+    return out;
+  };
+
+  class URLSearchParams {
+    constructor(init) {
+      Object.defineProperty(this, '_list', { value: [], writable: true });
+      Object.defineProperty(this, '_url', { value: null, writable: true });
+      if (init == null) return;
+      if (typeof init === 'object' && typeof init[Symbol.iterator] === 'function') {
+        for (const pair of init) {
+          const p = Array.from(pair);
+          if (p.length !== 2) throw new TypeError("Failed to construct 'URLSearchParams': Each query pair must be an iterable [name, value] tuple");
+          this._list.push([String(p[0]), String(p[1])]);
+        }
+      }
+      else if (typeof init === 'object') {
+        for (const k of Object.keys(init)) this._list.push([k, String(init[k])]);
+      }
+      else this._parse(String(init));
+    }
+    _parse(s) {
+      this._list = [];
+      if (s.startsWith('?')) s = s.slice(1);
+      for (const part of s.split('&')) {
+        if (!part) continue;
+        const eq = part.indexOf('=');
+        this._list.push(eq < 0 ? [formDecode(part), ''] : [formDecode(part.slice(0, eq)), formDecode(part.slice(eq + 1))]);
+      }
+    }
+    _changed() {
+      if (!this._url) return;
+      const q = this.toString();
+      this._url._r.query = q === '' ? null : q;
+    }
+    get size() { return this._list.length; }
+    append(name, value) { this._list.push([String(name), String(value)]); this._changed(); }
+    delete(name, value) {
+      name = String(name);
+      this._list = this._list.filter(([k, v]) => k !== name || (value !== undefined && v !== String(value)));
+      this._changed();
+    }
+    get(name) { const e = this._list.find(([k]) => k === String(name)); return e ? e[1] : null; }
+    getAll(name) { return this._list.filter(([k]) => k === String(name)).map(([, v]) => v); }
+    has(name, value) { return this._list.some(([k, v]) => k === String(name) && (value === undefined || v === String(value))); }
+    set(name, value) {
+      name = String(name);
+      const i = this._list.findIndex(([k]) => k === name);
+      if (i < 0) this._list.push([name, String(value)]);
+      else {
+        this._list[i] = [name, String(value)];
+        this._list = this._list.filter(([k], j) => j <= i || k !== name);
+      }
+      this._changed();
+    }
+    sort() {
+      this._list = this._list.map((e, i) => [e, i])
+        .sort((a, b) => a[0][0] < b[0][0] ? -1 : a[0][0] > b[0][0] ? 1 : a[1] - b[1]).map(([e]) => e);
+      this._changed();
+    }
+    forEach(fn, thisArg) { for (const [k, v] of this._list.slice()) fn.call(thisArg, v, k, this); }
+    keys() { return this._list.map(([k]) => k)[Symbol.iterator](); }
+    values() { return this._list.map(([, v]) => v)[Symbol.iterator](); }
+    entries() { return this._list.map(([k, v]) => [k, v])[Symbol.iterator](); }
+    [Symbol.iterator]() { return this.entries(); }
+    toString() { return this._list.map(([k, v]) => formEncode(k) + '=' + formEncode(v)).join('&'); }
+    get [Symbol.toStringTag]() { return 'URLSearchParams'; }
+  }
+
+  class URL {
+    constructor(url, base) {
+      let b;
+      if (base !== undefined) b = base instanceof URL ? base._r : parse(base);
+      Object.defineProperty(this, '_r', { value: parse(url, b), writable: true });
+      Object.defineProperty(this, '_params', { value: null, writable: true });
+    }
+    static canParse(url, base) { try { new URL(url, base); return true; } catch { return false; } }
+    static parse(url, base) { try { return new URL(url, base); } catch { return null; } }
+    static createObjectURL() { throw new DOMException('URL.createObjectURL is not supported', 'NotSupportedError'); }
+    static revokeObjectURL() {}
+    get href() { return serialize(this._r); }
+    set href(v) {
+      this._r = parse(v);
+      if (this._params) this._params._parse(this._r.query || '');
+    }
+    get origin() {
+      const r = this._r;
+      return isSpecial(r.protocol) && r.protocol !== 'file:' ? r.protocol + '//' + this.host : 'null';
+    }
+    get protocol() { return this._r.protocol; }
+    set protocol(v) {
+      const p = String(v).replace(/:.*$/, '').toLowerCase() + ':';
+      if (!/^[a-z][a-z0-9+.\-]*:$/.test(p) || isSpecial(p) !== isSpecial(this._r.protocol)) return;
+      this._r.protocol = p;
+      if (defaultPorts[p] === this._r.port) this._r.port = '';
+    }
+    get username() { return this._r.username; }
+    set username(v) { if (this._r.hostname) this._r.username = encode(String(v), userinfoSet); }
+    get password() { return this._r.password; }
+    set password(v) { if (this._r.hostname) this._r.password = encode(String(v), userinfoSet); }
+    get host() { const r = this._r; return r.hostname === null ? '' : r.hostname + (r.port ? ':' + r.port : ''); }
+    set host(v) {
+      if (this._r.opaque) return;
+      try { [this._r.hostname, this._r.port] = parseHost(this._r.protocol, String(v).split(/[\/?#]/)[0]); } catch {}
+    }
+    get hostname() { return this._r.hostname || ''; }
+    set hostname(v) {
+      if (this._r.opaque) return;
+      try { this._r.hostname = parseHost(this._r.protocol, String(v).split(/[\/?#:]/)[0])[0]; } catch {}
+    }
+    get port() { return this._r.port; }
+    set port(v) {
+      if (this._r.opaque || !this._r.hostname) return;
+      v = String(v);
+      if (v === '') { this._r.port = ''; return; }
+      const digits = /^\d+/.exec(v);
+      if (!digits || Number(digits[0]) > 65535) return;
+      const port = String(Number(digits[0]));
+      this._r.port = defaultPorts[this._r.protocol] === port ? '' : port;
+    }
+    get pathname() { return this._r.pathname; }
+    set pathname(v) {
+      if (this._r.opaque) return;
+      const p = slashes(String(v), isSpecial(this._r.protocol)).replace(/[?#]/g, c => hex(c.charCodeAt(0)));
+      this._r.pathname = normalizePath(encode(p.startsWith('/') ? p : '/' + p, pathSet));
+    }
+    get search() { return this._r.query ? '?' + this._r.query : ''; }
+    set search(v) {
+      v = String(v).replace(/^\?/, '');
+      this._r.query = v === '' ? null : encode(v, isSpecial(this._r.protocol) ? specialQuerySet : querySet);
+      if (this._params) this._params._parse(v);
+    }
+    get searchParams() {
+      if (!this._params) {
+        this._params = new URLSearchParams(this._r.query || '');
+        this._params._url = this;
+      }
+      return this._params;
+    }
+    get hash() { return this._r.fragment ? '#' + this._r.fragment : ''; }
+    set hash(v) {
+      v = String(v).replace(/^#/, '');
+      this._r.fragment = v === '' ? null : encode(v, fragmentSet);
+    }
+    toString() { return this.href; }
+    toJSON() { return this.href; }
+    get [Symbol.toStringTag]() { return 'URL'; }
+  }
+  g.URL = URL;
+  g.URLSearchParams = URLSearchParams;
+
+  // navigator: what requests already say about the browser - the same
+  // User-Agent and languages (Fetcher's userAgent/acceptLanguage).
+  const [ua, acceptLanguages, cpus] = __wtNavigatorInfo();
+  const languages = Object.freeze(acceptLanguages.split(',').map(s => s.split(';')[0].trim()).filter(Boolean));
+  class Navigator {
+    get userAgent() { return ua; }
+    get appVersion() { return ua.replace(/^Mozilla\//, ''); }
+    get appName() { return 'Netscape'; }
+    get appCodeName() { return 'Mozilla'; }
+    get product() { return 'Gecko'; }
+    get productSub() { return '20030107'; }
+    get vendor() { return ''; }
+    get vendorSub() { return ''; }
+    get platform() { return 'Win32'; }
+    get language() { return languages[0] || 'en-US'; }
+    get languages() { return languages; }
+    get onLine() { return true; }
+    get cookieEnabled() { return true; }
+    get hardwareConcurrency() { return cpus; }
+    get maxTouchPoints() { return 0; }
+    get webdriver() { return false; }
+    get doNotTrack() { return null; }
+    get pdfViewerEnabled() { return false; }
+    javaEnabled() { return false; }
+    // Sent in the background like any fetch(); its result is ignored.
+    sendBeacon(url, data) {
+      fetch(String(url), { method: 'POST', body: data == null ? '' : data, keepalive: true }).catch(() => {});
+      return true;
+    }
+    get [Symbol.toStringTag]() { return 'Navigator'; }
+  }
+  g.Navigator = Navigator;
+  g.navigator = new Navigator();
+  g.clientInformation = g.navigator;
+
+  // location: the native object only has href and the navigation methods;
+  // this one adds the URL's parts. A page loaded from disk (a Windows
+  // path) shows as a file: URL. Setting a part navigates to the URL with
+  // it changed - except the hash, which (as in browsers) doesn't reload:
+  // it's kept here, read back by href/hash, and fires hashchange.
+  const nativeLocation = Object.getOwnPropertyDescriptor(g, 'location').get;
+  const native = () => nativeLocation.call(g);
+  // The URL scripts see, when history.pushState/replaceState or a hash
+  // change has moved it away from the loaded page's (null: the page's).
+  let urlOverride = null;
+  const loaded = () => {
+    let href = native().href;
+    if (/^[a-zA-Z]:[\\/]/.test(href) || href.startsWith('\\\\')) href = 'file:///' + href.replace(/\\/g, '/').replace(/^\/+/, '');
+    return href;
+  };
+  const current = () => {
+    try { return new URL(urlOverride !== null ? urlOverride : loaded()); } catch { return null; }
+  };
+  const fireHashChange = (before, after) => {
+    setTimeout(() => {
+      const ev = new Event('hashchange');
+      ev.oldURL = before;
+      ev.newURL = after;
+      g.dispatchEvent(ev);
+    }, 0);
+  };
+  const setHash = v => {
+    const u = current();
+    if (!u) return;
+    const before = u.href;
+    u.hash = String(v).replace(/^#/, '');
+    if (u.href === before) return;
+    urlOverride = u.href;
+    entries[index] = { url: u.href, state: null };
+    fireHashChange(before, u.href);
+  };
+  // A URL as the page would resolve it now (after any pushState).
+  const resolve = v => { try { return new URL(v, current().href).href; } catch { return v; } };
+  const navigateTo = (change, replace) => {
+    const u = current();
+    if (!u) return;
+    change(u);
+    urlOverride = null;
+    if (replace) native().replace(u.href);
+    else native().href = u.href;
+  };
+
+  // history: the entries pushState adds on top of the loaded page, which
+  // back/forward/go move through (firing popstate) without loading
+  // anything. Going back past the first or forward past the last does
+  // nothing - the engine's own Back button is separate.
+  const entries = [{ url: null, state: null }];
+  let index = 0;
+  const sameOrigin = url => { const u = current(); return u && (url.origin === u.origin || url.protocol === 'file:'); };
+  const setEntry = (state, url, push) => {
+    let target = current();
+    if (url !== undefined && url !== null) {
+      try { target = new URL(String(url), current() ? current().href : undefined); }
+      catch { throw new DOMException("Failed to execute 'pushState' on 'History': '" + url + "' is not a valid URL.", 'SecurityError'); }
+      if (!sameOrigin(target)) throw new DOMException("Failed to execute 'pushState' on 'History': a history state object with URL '" + target.href + "' cannot be created in a document with origin '" + location.origin + "'.", 'SecurityError');
+    }
+    const entry = { url: target ? target.href : null, state: state === undefined ? null : structuredCloneish(state) };
+    if (push) { entries.splice(index + 1); entries.push(entry); index++; }
+    else entries[index] = entry;
+    urlOverride = entry.url;
+  };
+  // Not a real structured clone: JSON round-trip where that works, else as is.
+  const structuredCloneish = v => { try { return JSON.parse(JSON.stringify(v)); } catch { return v; } };
+  class History {
+    get length() { return entries.length; }
+    get state() { return entries[index].state; }
+    get scrollRestoration() { return this._scroll || 'auto'; }
+    set scrollRestoration(v) { if (v === 'auto' || v === 'manual') Object.defineProperty(this, '_scroll', { value: v, writable: true, configurable: true }); }
+    pushState(state, unused, url) { setEntry(state, url, true); }
+    replaceState(state, unused, url) { setEntry(state, url, false); }
+    go(delta) {
+      delta = Number(delta) || 0;
+      if (delta === 0) { location.reload(); return; }
+      const to = index + delta;
+      if (to < 0 || to >= entries.length) return;
+      const before = current() ? current().href : '';
+      index = to;
+      urlOverride = entries[index].url;
+      const after = current() ? current().href : '';
+      setTimeout(() => {
+        const ev = new Event('popstate');
+        ev.state = entries[index].state;
+        g.dispatchEvent(ev);
+        if (before.split('#')[0] === after.split('#')[0] && before !== after) fireHashChange(before, after);
+      }, 0);
+    }
+    back() { this.go(-1); }
+    forward() { this.go(1); }
+    get [Symbol.toStringTag]() { return 'History'; }
+  }
+  g.History = History;
+  g.history = new History();
+  class Location {
+    get href() { const u = current(); return u ? u.href : native().href; }
+    set href(v) {
+      v = String(v);
+      if (v.startsWith('#')) setHash(v);
+      else { const to = resolve(v); urlOverride = null; native().href = to; }
+    }
+    get origin() { const u = current(); return u ? u.origin : 'null'; }
+    get protocol() { const u = current(); return u ? u.protocol : ''; }
+    set protocol(v) { navigateTo(u => { u.protocol = v; }); }
+    get host() { const u = current(); return u ? u.host : ''; }
+    set host(v) { navigateTo(u => { u.host = v; }); }
+    get hostname() { const u = current(); return u ? u.hostname : ''; }
+    set hostname(v) { navigateTo(u => { u.hostname = v; }); }
+    get port() { const u = current(); return u ? u.port : ''; }
+    set port(v) { navigateTo(u => { u.port = v; }); }
+    get pathname() { const u = current(); return u ? u.pathname : ''; }
+    set pathname(v) { navigateTo(u => { u.pathname = v; }); }
+    get search() { const u = current(); return u ? u.search : ''; }
+    set search(v) { navigateTo(u => { u.search = v; }); }
+    get hash() { const u = current(); return u ? u.hash : ''; }
+    set hash(v) { setHash(v); }
+    assign(v) { this.href = v; }
+    replace(v) {
+      v = String(v);
+      if (v.startsWith('#')) setHash(v);
+      else { const to = resolve(v); urlOverride = null; native().replace(to); }
+    }
+    reload() { native().reload(); }
+    toString() { return this.href; }
+    get [Symbol.toStringTag]() { return 'Location'; }
+  }
+  g.Location = Location;
+  const location = new Location();
+  Object.defineProperty(g, 'location', {
+    configurable: true, enumerable: true,
+    get: () => location,
+    set: v => { location.href = v; },
+  });
+  Object.defineProperty(g, 'origin', { configurable: true, enumerable: true, get: () => location.origin });
+  Object.defineProperty(g, 'isSecureContext', {
+    configurable: true, enumerable: true,
+    get: () => location.protocol === 'https:' || location.protocol === 'file:' || location.hostname === 'localhost',
+  });
+  // document.location / URL / domain / referrer.
+  Object.defineProperties(document, {
+    location: { configurable: true, get: () => location, set: v => { location.href = v; } },
+    URL: { configurable: true, get: () => location.href },
+    documentURI: { configurable: true, get: () => location.href },
+    domain: { configurable: true, get: () => location.hostname },
+    referrer: { configurable: true, get: () => '' },
+  });
+})();
 )JS";
 
 // ---------------------------------------------------------------------
@@ -2937,6 +3473,7 @@ static const JSCFunctionListEntry js_node_proto_funcs[] = {
     JS_CGETSET_DEF("body", js_get_body, nullptr),
     JS_CGETSET_DEF("head", js_get_head, nullptr),
     JS_CGETSET_DEF("documentElement", js_get_documentElement, nullptr),
+    JS_CGETSET_DEF("currentScript", js_get_currentScript, nullptr),
     JS_CFUNC_DEF("getAttribute", 1, js_getAttribute),
     JS_CFUNC_DEF("setAttribute", 2, js_setAttribute),
     JS_CFUNC_DEF("hasAttribute", 1, js_hasAttribute),
@@ -2982,6 +3519,7 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("cancelAnimationFrame", 1, js_cancelAnimationFrame),
     JS_CFUNC_DEF("__wtQueueTask", 1, js_native_queueTask), // behind postMessage - see kBootstrapJS
     JS_CFUNC_DEF("__wtNow", 0, js_native_now),             // behind performance.now()
+    JS_CFUNC_DEF("__wtNavigatorInfo", 0, js_native_navigatorInfo), // behind navigator
     JS_CFUNC_DEF("__wtReportError", 2, js_native_reportError),
     JS_CGETSET_DEF("location", js_get_location, js_set_location),
     JS_CFUNC_DEF("addEventListener", 2, js_window_addEventListener),

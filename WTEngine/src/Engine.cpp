@@ -266,6 +266,13 @@ static bool isClassicScript(Element* scriptEl) {
     return t == L"text/javascript" || t == L"application/javascript" || t == L"application/ecmascript";
 }
 
+// The shared_ptr that holds a <script> found in the tree: its parent's slot.
+static std::shared_ptr<Node> owningScript(Element* scriptEl) {
+    if (scriptEl->parent)
+        for (auto& c : scriptEl->parent->children) if (c.get() == scriptEl) return c;
+    return {};
+}
+
 // Sets up every <script> on the page to run once, in document order, after
 // the whole DOM is built (see Layout.h's LayoutRoot::loadImage comment for
 // the same "batch, not streaming" simplification applied to images - here
@@ -313,12 +320,14 @@ void Engine::beginScripts() {
             ScriptTask task;
             task.external = true;
             task.fetchIndex = urls.size();
+            task.el = owningScript(scriptEl);
             scriptTasks_.push_back(task);
             urls.push_back(resolved);
         }
         else {
             ScriptTask task;
             task.external = false;
+            task.el = owningScript(scriptEl);
             for (auto& child : scriptEl->children) {
                 if (child->type == Node::TEXT) task.inlineCode += static_cast<TextNode*>(child.get())->text;
             }
@@ -359,7 +368,9 @@ void Engine::advanceScripts() {
 
         std::string filename; // URLs are ASCII; anything else just degrades the label
         for (wchar_t c : name) filename.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+        domState.currentScript = task.el; // document.currentScript, while it runs
         JSEngine::Result result = jsEngine->eval(code, filename.c_str());
+        domState.currentScript.reset();
         if (!result.ok) consoleLog().add(LogLevel::Error, L"script", result.text);
         domState.domDirty = true; // conservatively assume the script may have mutated the DOM
     }

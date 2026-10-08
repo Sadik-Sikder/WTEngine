@@ -326,11 +326,12 @@ using HeaderList = std::vector<std::pair<std::string, std::string>>;
 // Overflow - still refuse: those need a real browser's TLS and JS.)
 
 static const char* kUserAgent = "WTEngine/0.1";
+const char* userAgent() { return kUserAgent; }
 
 // The Windows display language as an Accept-Language list, e.g.
 // "bn-BD,bn;q=0.9,en-US;q=0.8,en;q=0.7" - English always comes last, as a
 // fallback most sites have.
-static const std::string& acceptLanguage() {
+const std::string& acceptLanguage() {
     static const std::string value = [] {
         wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
         std::string locale = GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH) ? wideToUtf8(name) : "en-US";

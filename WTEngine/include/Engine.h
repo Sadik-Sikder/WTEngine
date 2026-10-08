@@ -240,6 +240,7 @@ private:
         bool external;
         size_t fetchIndex;       // valid if external
         std::wstring inlineCode; // valid if !external
+        std::shared_ptr<Node> el; // the <script> element, for document.currentScript
     };
     ResourceLoader styleLoader_;
     ResourceLoader scriptLoader_;

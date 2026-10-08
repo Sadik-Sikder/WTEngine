@@ -99,3 +99,8 @@ std::string urlEncodeForm(const std::wstring& text);
 
 // Replaces any query string and fragment on `url` with `?query`.
 std::wstring withQuery(const std::wstring& url, const std::string& query);
+
+// What requests send as User-Agent and Accept-Language (the Windows display
+// language, then English) - also what JS's navigator reports.
+const char* userAgent();
+const std::string& acceptLanguage();
