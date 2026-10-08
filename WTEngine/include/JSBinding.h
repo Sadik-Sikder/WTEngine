@@ -70,6 +70,12 @@ struct DOMBindingState {
     // script that removes itself can still be read.
     std::shared_ptr<Node> currentScript;
 
+    // The viewport as layout sees it (page pixels: the window over the zoom)
+    // and the zoom - for innerWidth/innerHeight, devicePixelRatio and
+    // matchMedia. Kept current by setViewport.
+    int viewportWidth = 0, viewportHeight = 0;
+    float pixelRatio = 1.0f;
+
     // Set by location.href=/.replace()/.assign()/.reload(), or a bare
     // `location = url` / `window.location = url` assignment.
     // Engine::takeNavigation polls this once per frame, the same pattern
@@ -128,6 +134,11 @@ bool fireKeyboardEvent(JSContext* ctx, Element* target, const wchar_t* type, con
 void fireInputEvent(JSContext* ctx, Element* target, const wchar_t* inputType, const std::wstring& data);
 // "submit" on `form`; `submitter` is the button that submitted it, if any.
 bool fireSubmitEvent(JSContext* ctx, Element* form, Element* submitter);
+
+// Records the viewport size (and zoom) scripts see. When it changes after
+// the first call, re-checks every matchMedia() list (firing "change" on
+// those that flip) and fires "resize" at window. Called by Engine::doLayout.
+void setViewport(JSContext* ctx, int width, int height, float pixelRatio);
 
 // Sets document.readyState ("interactive" / "complete") and fires
 // "readystatechange" at document.

@@ -293,6 +293,9 @@ void Engine::beginScripts() {
     // destroyed while any value is still alive. So: state, then old realm, then new.
     domState = DOMBindingState{};
     domState.pageUrl = pageBaseUrl; // so location.href/.replace()/.assign() have a base
+    domState.viewportWidth = layoutRoot.viewportWidth; // innerWidth/matchMedia, from the first script on
+    domState.viewportHeight = viewHeight();
+    domState.pixelRatio = zoom_;
     consoleLog().clear(); // a new page starts with an empty console, as in browsers
     jsEngine.reset();
     jsEngine = std::make_unique<JSEngine>(); // fresh realm per page
@@ -698,6 +701,11 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     // A setTimeout/setInterval callback may mutate the DOM below (sets
     // domDirty, same as any other script), so this runs before that check.
     if (jsEngine) fireDueTimers(jsEngine->context());
+
+    // The viewport layout last used, for innerWidth/matchMedia; a change
+    // fires resize (and matchMedia change events) here, with the other
+    // callbacks, not from inside layout.
+    if (jsEngine) setViewport(jsEngine->context(), layoutRoot.viewportWidth, viewHeight(), zoom_);
 
     // postMessage deliveries (window and MessageChannel) - tasks a page
     // queues to run "as soon as possible", without setTimeout's one-frame

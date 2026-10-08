@@ -248,6 +248,14 @@ static Element* unwrapElement(JSValueConst v) {
     return (n && n->type == Node::ELEMENT) ? static_cast<Element*>(n) : nullptr;
 }
 
+// A DocumentFragment is an element with this tag - one no parser or
+// createElement can make, and that never stays in the tree (inserting it
+// moves its children instead - see insertNode).
+static const wchar_t kFragmentTag[] = L"#document-fragment";
+static bool isFragment(const Node* n) {
+    return n && n->type == Node::ELEMENT && static_cast<const Element*>(n)->tag == kFragmentTag;
+}
+
 static void markDirty(JSContext* ctx) {
     if (DOMBindingState* s = bindingState(ctx)) s->domDirty = true;
 }
@@ -397,7 +405,7 @@ static JSValue js_set_innerHTML(JSContext* ctx, JSValueConst this_val, JSValueCo
 
 static JSValue js_get_tagName(JSContext* ctx, JSValueConst this_val) {
     Element* el = unwrapElement(this_val);
-    if (!el) return JS_NULL;
+    if (!el || isFragment(el)) return JS_NULL;
     std::wstring upper = el->tag;
     for (auto& c : upper) c = (wchar_t)towupper(c);
     return jsStr(ctx, upper);
@@ -470,6 +478,12 @@ static JSValue js_createElement(JSContext* ctx, JSValueConst /*this_val*/, int a
     auto el = std::make_shared<Element>(tag);
     if (DOMBindingState* s = bindingState(ctx)) s->detachedNodes.push_back(el);
     return wrapNode(ctx, el.get());
+}
+
+static JSValue js_createDocumentFragment(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+    auto frag = std::make_shared<Element>(kFragmentTag);
+    if (DOMBindingState* s = bindingState(ctx)) s->detachedNodes.push_back(frag);
+    return wrapNode(ctx, frag.get());
 }
 
 static JSValue js_createTextNode(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
@@ -570,6 +584,21 @@ static JSValue insertNode(JSContext* ctx, Element* parent, JSValueConst nodeVal,
         return JS_ThrowTypeError(ctx, "Failed to execute 'insertBefore' on 'Node': parameter 1 is not of type 'Node'.");
     if (!checkInsertable(ctx, parent, node)) return JS_EXCEPTION;
     if (ref == node) return JS_DupValue(ctx, nodeVal); // already exactly there
+
+    // A DocumentFragment isn't inserted itself: its children move in, in
+    // order, and it's left empty.
+    if (isFragment(node)) {
+        auto* frag = static_cast<Element*>(node);
+        std::vector<std::shared_ptr<Node>> moved = std::move(frag->children);
+        frag->children.clear();
+        auto& kids = parent->children;
+        auto pos = kids.end();
+        if (ref) pos = std::find_if(kids.begin(), kids.end(), [&](const auto& c) { return c.get() == ref; });
+        for (auto& c : moved) if (c->type == Node::ELEMENT) static_cast<Element*>(c.get())->parent = parent;
+        kids.insert(pos, moved.begin(), moved.end());
+        markDirty(ctx);
+        return JS_DupValue(ctx, nodeVal);
+    }
 
     std::shared_ptr<Node> owned = takeNode(state, node);
     if (!owned) return throwDOMException(ctx, "HierarchyRequestError", "The node can't be moved.");
@@ -933,13 +962,14 @@ static JSValue js_get_currentScript(JSContext* ctx, JSValueConst) {
 
 static JSValue js_get_nodeType(JSContext* ctx, JSValueConst this_val) {
     Node* n = unwrapNode(this_val);
-    return JS_NewInt32(ctx, !n ? 0 : n->type == Node::TEXT ? 3 : 1);
+    return JS_NewInt32(ctx, !n ? 0 : n->type == Node::TEXT ? 3 : isFragment(n) ? 11 : 1);
 }
 
 static JSValue js_get_nodeName(JSContext* ctx, JSValueConst this_val) {
     Node* n = unwrapNode(this_val);
     if (!n) return JS_NULL;
     if (n->type == Node::TEXT) return jsStr(ctx, L"#text");
+    if (isFragment(n)) return jsStr(ctx, L"#document-fragment");
     std::wstring upper = static_cast<Element*>(n)->tag;
     for (auto& c : upper) c = (wchar_t)towupper(c);
     return jsStr(ctx, upper);
@@ -1502,6 +1532,36 @@ static void callCallback(JSContext* ctx, JSValueConst fn, int argc, JSValueConst
     if (JS_IsException(result)) reportException(ctx, JS_GetException(ctx), source);
     JS_FreeValue(ctx, result);
     runPendingJobs(ctx);
+}
+
+// --- Viewport ------------------------------------------------------------
+
+void setViewport(JSContext* ctx, int width, int height, float pixelRatio) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state) return;
+    const bool first = state->viewportWidth == 0 && state->viewportHeight == 0;
+    const bool changed = width != state->viewportWidth || height != state->viewportHeight || pixelRatio != state->pixelRatio;
+    state->viewportWidth = width;
+    state->viewportHeight = height;
+    state->pixelRatio = pixelRatio;
+    if (first || !changed) return;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue fn = JS_GetPropertyStr(ctx, global, "__wtViewportChanged"); // kBootstrapJS
+    JS_FreeValue(ctx, global);
+    if (JS_IsFunction(ctx, fn)) callCallback(ctx, fn, 0, nullptr, L"resize");
+    JS_FreeValue(ctx, fn);
+}
+
+// __wtViewport() -> [width, height, pixel ratio, screen width, screen height].
+static JSValue js_native_viewport(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+    DOMBindingState* state = bindingState(ctx);
+    JSValue arr = JS_NewArray(ctx);
+    JS_SetPropertyUint32(ctx, arr, 0, JS_NewInt32(ctx, state ? state->viewportWidth : 0));
+    JS_SetPropertyUint32(ctx, arr, 1, JS_NewInt32(ctx, state ? state->viewportHeight : 0));
+    JS_SetPropertyUint32(ctx, arr, 2, JS_NewFloat64(ctx, state ? state->pixelRatio : 1.0));
+    JS_SetPropertyUint32(ctx, arr, 3, JS_NewInt32(ctx, GetSystemMetrics(SM_CXSCREEN)));
+    JS_SetPropertyUint32(ctx, arr, 4, JS_NewInt32(ctx, GetSystemMetrics(SM_CYSCREEN)));
+    return arr;
 }
 
 static double performanceNow(const TimerStorage& ts) {
@@ -3436,6 +3496,345 @@ static const char kBootstrapJS[] = R"JS(
     referrer: { configurable: true, get: () => '' },
   });
 })();
+
+// DOM interface classes: Node, Element, HTMLElement, Text, the per-tag
+// HTML*Element classes, Document, Window, ... Every node shares one native
+// prototype here, so each class answers instanceof by looking at the node
+// (element or text, its tag, inside an <svg> or not), and every class's
+// .prototype is that shared prototype - so a polyfill that patches
+// Element.prototype or HTMLElement.prototype reaches every node. None can
+// be constructed (new HTMLElement() throws, as without custom elements).
+(() => {
+  const g = globalThis;
+  const nodeProto = Object.getPrototypeOf(document);
+  const isNode = v => v !== null && typeof v === 'object' && Object.getPrototypeOf(v) === nodeProto;
+  const tagOf = v => (v.tagName || '').toLowerCase();
+  const isElement = v => isNode(v) && v.nodeType === 1;
+  const inSvg = v => {
+    for (let n = v; n; n = n.parentNode) {
+      const t = tagOf(n);
+      if (t === 'svg') return true;
+      if (t === 'foreignobject' && n !== v) return false;
+    }
+    return false;
+  };
+  const isHTML = v => isElement(v) && !inSvg(v);
+
+  const iface = (name, test, parent) => {
+    const C = { [name]: function () { throw new TypeError('Illegal constructor'); } }[name];
+    C.prototype = nodeProto;
+    Object.defineProperty(C, Symbol.hasInstance, { value: v => !!test(v), configurable: true });
+    if (parent) Object.setPrototypeOf(C, parent);
+    Object.defineProperty(g, name, { value: C, writable: true, configurable: true });
+    return C;
+  };
+
+  const Node = iface('Node', isNode, g.EventTarget);
+  const nodeConstants = {
+    ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4, PROCESSING_INSTRUCTION_NODE: 7,
+    COMMENT_NODE: 8, DOCUMENT_NODE: 9, DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11,
+    DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2, DOCUMENT_POSITION_FOLLOWING: 4,
+    DOCUMENT_POSITION_CONTAINS: 8, DOCUMENT_POSITION_CONTAINED_BY: 16,
+  };
+  for (const [k, v] of Object.entries(nodeConstants)) {
+    Object.defineProperty(Node, k, { value: v, enumerable: true });
+    Object.defineProperty(nodeProto, k, { value: v, configurable: true });
+  }
+  const CharacterData = iface('CharacterData', v => isNode(v) && v.nodeType === 3, Node);
+  iface('Text', v => isNode(v) && v.nodeType === 3, CharacterData);
+  iface('Comment', () => false, CharacterData); // the parser drops comments
+  iface('DocumentFragment', v => isNode(v) && v.nodeType === 11, Node);
+  // `document` wraps <body> here (so it's an Element too).
+  const Document = iface('Document', v => v === document, Node);
+  iface('HTMLDocument', v => v === document, Document);
+  const Element = iface('Element', isElement, Node);
+  const HTMLElement = iface('HTMLElement', isHTML, Element);
+  const SVGElement = iface('SVGElement', v => isElement(v) && inSvg(v), Element);
+  iface('SVGSVGElement', v => isElement(v) && tagOf(v) === 'svg', SVGElement);
+  iface('SVGGraphicsElement', v => isElement(v) && inSvg(v) && tagOf(v) !== 'svg', SVGElement);
+
+  const tagClasses = {
+    HTMLAnchorElement: 'a', HTMLAreaElement: 'area', HTMLBRElement: 'br', HTMLBaseElement: 'base',
+    HTMLBodyElement: 'body', HTMLButtonElement: 'button', HTMLCanvasElement: 'canvas', HTMLDListElement: 'dl',
+    HTMLDataElement: 'data', HTMLDataListElement: 'datalist', HTMLDetailsElement: 'details',
+    HTMLDialogElement: 'dialog', HTMLDivElement: 'div', HTMLEmbedElement: 'embed', HTMLFieldSetElement: 'fieldset',
+    HTMLFormElement: 'form', HTMLHRElement: 'hr', HTMLHeadElement: 'head',
+    HTMLHeadingElement: 'h1 h2 h3 h4 h5 h6', HTMLHtmlElement: 'html', HTMLIFrameElement: 'iframe',
+    HTMLImageElement: 'img', HTMLInputElement: 'input', HTMLLIElement: 'li', HTMLLabelElement: 'label',
+    HTMLLegendElement: 'legend', HTMLLinkElement: 'link', HTMLMapElement: 'map', HTMLMetaElement: 'meta',
+    HTMLMeterElement: 'meter', HTMLModElement: 'ins del', HTMLOListElement: 'ol', HTMLObjectElement: 'object',
+    HTMLOptGroupElement: 'optgroup', HTMLOptionElement: 'option', HTMLOutputElement: 'output',
+    HTMLParagraphElement: 'p', HTMLPictureElement: 'picture', HTMLPreElement: 'pre listing xmp',
+    HTMLProgressElement: 'progress', HTMLQuoteElement: 'q blockquote', HTMLScriptElement: 'script',
+    HTMLSelectElement: 'select', HTMLSlotElement: 'slot', HTMLSourceElement: 'source', HTMLSpanElement: 'span',
+    HTMLStyleElement: 'style', HTMLTableCaptionElement: 'caption', HTMLTableCellElement: 'td th',
+    HTMLTableColElement: 'col colgroup', HTMLTableElement: 'table', HTMLTableRowElement: 'tr',
+    HTMLTableSectionElement: 'thead tbody tfoot', HTMLTemplateElement: 'template',
+    HTMLTextAreaElement: 'textarea', HTMLTimeElement: 'time', HTMLTitleElement: 'title',
+    HTMLTrackElement: 'track', HTMLUListElement: 'ul', HTMLMediaElement: 'audio video',
+  };
+  for (const [name, tags] of Object.entries(tagClasses)) {
+    const list = tags.split(' ');
+    iface(name, v => isHTML(v) && list.includes(tagOf(v)), HTMLElement);
+  }
+  for (const [name, tag] of [['HTMLAudioElement', 'audio'], ['HTMLVideoElement', 'video']])
+    iface(name, v => isHTML(v) && tagOf(v) === tag, g.HTMLMediaElement);
+
+  // Query results are plain arrays here.
+  iface('NodeList', v => Array.isArray(v));
+  iface('HTMLCollection', v => Array.isArray(v));
+
+  iface('Window', v => v === g, g.EventTarget);
+  // EventTarget (a real class, for XMLHttpRequest and MessagePort) also
+  // covers nodes and window. A subclass inherits this, so it falls back to
+  // the ordinary prototype check for anything but EventTarget itself.
+  Object.defineProperty(g.EventTarget, Symbol.hasInstance, {
+    configurable: true,
+    value(v) {
+      if (Function.prototype[Symbol.hasInstance].call(this, v)) return true;
+      return this === g.EventTarget && (isNode(v) || v === g);
+    },
+  });
+
+  // el.click() fires a click as a real one would, and follows a link
+  // unless a listener prevented it. focus()/blur() don't move the
+  // engine's focus yet; they're here so calling them doesn't throw.
+  Object.defineProperty(nodeProto, 'click', {
+    configurable: true, writable: true,
+    value() {
+      const ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: g, detail: 1 });
+      const go = this.dispatchEvent(ev);
+      if (go && tagOf(this) === 'a' && this.hasAttribute('href')) location.href = this.getAttribute('href');
+    },
+  });
+  Object.defineProperty(nodeProto, 'focus', { configurable: true, writable: true, value() {} });
+  Object.defineProperty(nodeProto, 'blur', { configurable: true, writable: true, value() {} });
+})();
+
+// The viewport: innerWidth/innerHeight (what layout lays the page out at,
+// in CSS pixels), devicePixelRatio (the zoom), screen, and matchMedia.
+(() => {
+  const g = globalThis;
+  const vp = () => __wtViewport();
+  const getter = (name, fn) => Object.defineProperty(g, name, { configurable: true, enumerable: true, get: fn });
+  getter('innerWidth', () => vp()[0]);
+  getter('innerHeight', () => vp()[1]);
+  getter('outerWidth', () => vp()[0]);
+  getter('outerHeight', () => vp()[1]);
+  getter('devicePixelRatio', () => vp()[2]);
+  class Screen {
+    get width() { return vp()[3]; }
+    get height() { return vp()[4]; }
+    get availWidth() { return vp()[3]; }
+    get availHeight() { return vp()[4]; }
+    get colorDepth() { return 24; }
+    get pixelDepth() { return 24; }
+    get orientation() {
+      const [, , , w, h] = vp();
+      return { type: w >= h ? 'landscape-primary' : 'portrait-primary', angle: 0, addEventListener() {}, removeEventListener() {} };
+    }
+  }
+  g.Screen = Screen;
+  const screen = new Screen();
+  getter('screen', () => screen);
+  getter('screenX', () => 0);
+  getter('screenY', () => 0);
+  getter('screenLeft', () => 0);
+  getter('screenTop', () => 0);
+
+  // Media queries, as a browser on a desktop screen with a mouse answers
+  // them: a light colour scheme, no reduced motion, hover and a fine
+  // pointer. Sizes are the viewport's; em/rem are 16px, as in media
+  // queries everywhere.
+  const length = v => {
+    const m = /^(-?[\d.]+)(px|em|rem|vw|vh|cm|mm|in|pt|pc)?$/.exec(v.trim());
+    if (!m) return NaN;
+    const n = parseFloat(m[1]);
+    const [w, h] = vp();
+    switch (m[2]) {
+      case 'em': case 'rem': return n * 16;
+      case 'vw': return n * w / 100;
+      case 'vh': return n * h / 100;
+      case 'cm': return n * 96 / 2.54;
+      case 'mm': return n * 96 / 25.4;
+      case 'in': return n * 96;
+      case 'pt': return n * 4 / 3;
+      case 'pc': return n * 16;
+      default: return m[2] || n === 0 ? n : NaN;
+    }
+  };
+  const resolution = v => {
+    const m = /^([\d.]+)(dppx|x|dpi|dpcm)$/.exec(v.trim());
+    if (!m) return NaN;
+    const n = parseFloat(m[1]);
+    return m[2] === 'dpi' ? n / 96 : m[2] === 'dpcm' ? n * 2.54 / 96 : n;
+  };
+  const ratio = v => {
+    const m = /^([\d.]+)\s*(?:\/\s*([\d.]+))?$/.exec(v.trim());
+    return m ? parseFloat(m[1]) / (m[2] ? parseFloat(m[2]) : 1) : NaN;
+  };
+  const discrete = {
+    'prefers-color-scheme': 'light', 'prefers-reduced-motion': 'no-preference', 'prefers-contrast': 'no-preference',
+    'prefers-reduced-transparency': 'no-preference', 'prefers-reduced-data': 'no-preference', 'forced-colors': 'none',
+    'inverted-colors': 'none', 'hover': 'hover', 'any-hover': 'hover', 'pointer': 'fine', 'any-pointer': 'fine',
+    'display-mode': 'browser', 'scripting': 'enabled', 'update': 'fast', 'color-gamut': 'srgb',
+    'dynamic-range': 'standard', 'video-dynamic-range': 'standard', 'overflow-block': 'scroll', 'overflow-inline': 'scroll',
+  };
+  // A feature's current value, as a number (sizes, ratios) or a keyword.
+  const featureValue = name => {
+    const [w, h, dpr, sw, sh] = vp();
+    switch (name) {
+      case 'width': return w;
+      case 'height': return h;
+      case 'device-width': return sw;
+      case 'device-height': return sh;
+      case 'aspect-ratio': return w / h;
+      case 'device-aspect-ratio': return sw / sh;
+      case 'resolution': case '-webkit-device-pixel-ratio': case 'device-pixel-ratio': return dpr;
+      case 'orientation': return h >= w ? 'portrait' : 'landscape';
+      case 'color': return 8;
+      case 'color-index': case 'monochrome': case 'grid': return 0;
+    }
+    return discrete[name];
+  };
+  const parseValue = (name, v) => {
+    const base = name.replace(/^(-webkit-)?(min|max)-+/, '').replace(/^-webkit-/, '');
+    if (/^(device-)?(width|height)$/.test(base)) return length(v);
+    if (/^(device-)?aspect-ratio$/.test(base)) return ratio(v);
+    if (base === 'resolution') return resolution(v);
+    if (/pixel-ratio$/.test(base) || ['color', 'color-index', 'monochrome', 'grid'].includes(base)) return parseFloat(v);
+    return v.trim();
+  };
+  const compare = (a, op, b) => op === '<' ? a < b : op === '<=' ? a <= b : op === '>' ? a > b : op === '>=' ? a >= b : a === b;
+  // One "(...)": name: value, a bare name, or the range forms
+  // "(width >= 600px)" and "(400px <= width < 800px)".
+  const feature = text => {
+    let t = text.trim();
+    if (/^not\s/.test(t)) return !condition(t.slice(4));
+    const range = /^([^<>=]+?)\s*(<=|>=|<|>|=)\s*([^<>=]+?)(?:\s*(<=|>=|<|>|=)\s*([^<>=]+?))?$/.exec(t);
+    if (range) {
+      const isName = s => /^[a-z-]+$/.test(s.trim()) && featureValue(s.trim()) !== undefined;
+      if (range[4]) {
+        const name = range[3].trim(), value = featureValue(name);
+        return compare(parseValue(name, range[1]), range[2], value) && compare(value, range[4], parseValue(name, range[5]));
+      }
+      if (isName(range[1])) { const name = range[1].trim(); return compare(featureValue(name), range[2], parseValue(name, range[3])); }
+      const name = range[3].trim();
+      return compare(parseValue(name, range[1]), range[2], featureValue(name));
+    }
+    const colon = t.indexOf(':');
+    if (colon < 0) {
+      const v = featureValue(t);
+      return v !== undefined && v !== 0 && v !== 'none' && v !== 'no-preference';
+    }
+    let name = t.slice(0, colon).trim();
+    const raw = t.slice(colon + 1);
+    let op = '=';
+    const prefix = /^(-webkit-)?(min|max)-+/.exec(name);
+    if (prefix) { op = prefix[2] === 'min' ? '>=' : '<='; name = name.slice(prefix[0].length); }
+    if (name === 'device-pixel-ratio' || name === 'moz-device-pixel-ratio') name = 'device-pixel-ratio';
+    const current = featureValue(name);
+    if (current === undefined) return false;
+    const wanted = parseValue(prefix ? prefix[0] + name : name, raw);
+    if (typeof current === 'string') return op === '=' && current === wanted;
+    return !Number.isNaN(wanted) && compare(current, op, wanted);
+  };
+  // "(a) and (b)", "(a) or (b)", nested parentheses.
+  const condition = text => {
+    const parts = [], ops = [];
+    let depth = 0, start = -1, i = 0;
+    const s = text.trim();
+    for (; i < s.length; i++) {
+      const c = s[i];
+      if (c === '(') { if (depth++ === 0) start = i + 1; }
+      else if (c === ')') { if (--depth === 0) parts.push(s.slice(start, i)); }
+      else if (depth === 0) {
+        const word = /^(and|or)\b/.exec(s.slice(i));
+        if (word) { ops.push(word[1]); i += word[1].length - 1; }
+        else if (!/\s/.test(c)) return false; // not a condition
+      }
+    }
+    if (depth !== 0 || !parts.length) return false;
+    // A part with parentheses inside is itself a condition ("(a) or (b)",
+    // "not (a)"); otherwise it's one feature.
+    const values = parts.map(p => !p.includes('(') ? feature(p)
+      : /^\s*not\s/.test(p) ? !condition(p.trim().slice(4)) : condition(p));
+    return ops.includes('or') ? values.some(Boolean) : values.every(Boolean);
+  };
+  // One query: [not|only] [type] [and <condition>], or a bare condition.
+  const query = text => {
+    let t = text.trim().toLowerCase();
+    if (!t) return true;
+    let negate = false;
+    const lead = /^(not|only)\s+/.exec(t);
+    if (lead && !t.slice(lead[0].length).startsWith('(')) { negate = lead[1] === 'not'; t = t.slice(lead[0].length); }
+    else if (lead && lead[1] === 'not') return !condition(t.slice(4));
+    let result;
+    const type = /^([a-z-]+)(?:\s+and\s+([\s\S]*))?$/.exec(t);
+    if (type && !t.startsWith('(')) {
+      const typeOk = type[1] === 'all' || type[1] === 'screen';
+      result = typeOk && (type[2] === undefined || condition(type[2]));
+    }
+    else result = condition(t);
+    return negate ? !result : result;
+  };
+  const splitList = s => {
+    const out = [];
+    let depth = 0, cur = '';
+    for (const c of s) {
+      if (c === '(') depth++;
+      else if (c === ')') depth--;
+      if (c === ',' && depth === 0) { out.push(cur); cur = ''; }
+      else cur += c;
+    }
+    out.push(cur);
+    return out;
+  };
+  const evaluate = media => media.trim() === '' || splitList(media).some(query);
+
+  class MediaQueryListEvent extends Event {
+    constructor(type, init) {
+      super(type, init);
+      this.media = (init && init.media) || '';
+      this.matches = !!(init && init.matches);
+    }
+  }
+  g.MediaQueryListEvent = MediaQueryListEvent;
+  const lists = [];
+  class MediaQueryList extends EventTarget {
+    constructor(media) {
+      super();
+      Object.defineProperty(this, '_media', { value: media });
+      Object.defineProperty(this, '_last', { value: evaluate(media), writable: true });
+      this.onchange = null;
+    }
+    get media() { return this._media; }
+    get matches() { return evaluate(this._media); }
+    // The old API: addListener(fn) is addEventListener('change', fn).
+    addListener(fn) { this.addEventListener('change', fn); }
+    removeListener(fn) { this.removeEventListener('change', fn); }
+  }
+  g.MediaQueryList = MediaQueryList;
+  g.matchMedia = function matchMedia(media) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'matchMedia' on 'Window': 1 argument required, but only 0 present.");
+    const list = new MediaQueryList(String(media));
+    lists.push(list); // kept: one with a listener must outlive the script's own reference
+    return list;
+  };
+
+  // Called by the engine (setViewport) when the viewport changes.
+  Object.defineProperty(g, '__wtViewportChanged', {
+    value() {
+      for (const list of lists.slice()) {
+        const now = evaluate(list._media);
+        if (now === list._last) continue;
+        list._last = now;
+        list.dispatchEvent(new MediaQueryListEvent('change', { media: list._media, matches: now }));
+      }
+      g.dispatchEvent(new Event('resize'));
+    },
+  });
+})();
 )JS";
 
 // ---------------------------------------------------------------------
@@ -3495,6 +3894,7 @@ static const JSCFunctionListEntry js_node_proto_funcs[] = {
     JS_CFUNC_DEF("getAttributeNames", 0, js_getAttributeNames),
     JS_CFUNC_DEF("createElement", 1, js_createElement),
     JS_CFUNC_DEF("createTextNode", 1, js_createTextNode),
+    JS_CFUNC_DEF("createDocumentFragment", 0, js_createDocumentFragment),
     JS_CFUNC_DEF("addEventListener", 2, js_addEventListener),
     JS_CFUNC_DEF("removeEventListener", 2, js_removeEventListener),
     JS_CFUNC_DEF("dispatchEvent", 1, js_dispatchEvent),
@@ -3520,6 +3920,7 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("__wtQueueTask", 1, js_native_queueTask), // behind postMessage - see kBootstrapJS
     JS_CFUNC_DEF("__wtNow", 0, js_native_now),             // behind performance.now()
     JS_CFUNC_DEF("__wtNavigatorInfo", 0, js_native_navigatorInfo), // behind navigator
+    JS_CFUNC_DEF("__wtViewport", 0, js_native_viewport), // behind innerWidth, matchMedia, screen
     JS_CFUNC_DEF("__wtReportError", 2, js_native_reportError),
     JS_CGETSET_DEF("location", js_get_location, js_set_location),
     JS_CFUNC_DEF("addEventListener", 2, js_window_addEventListener),
