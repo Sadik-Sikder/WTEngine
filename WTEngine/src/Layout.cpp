@@ -1014,6 +1014,11 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
                                                      bool inheritedVisuallyHidden, const TextPaint& inheritedPaint) {
     ComputedStyle sv;
     sv.fontSize = inheritedFontSize; // inherited unless a rule below overrides it
+    if (e->tag.empty()) { // an anonymous item (anonymousItem): no rule applies to it
+        sv.paint = inheritedPaint;
+        sv.visuallyHidden = inheritedVisuallyHidden;
+        return sv;
+    }
     sv.display = isInlineTag(e->tag) ? Display::Inline : Display::Block;
     const std::wstring& tag = e->tag;
 
@@ -2280,6 +2285,7 @@ void LayoutRoot::layout() {
     nextAnchor_ = 1;
     measuring_ = false;
     listOrdinals_.clear();
+    anonymousItems_.clear();
     insideMarker_.clear();
     insideMarkerFor_ = nullptr;
     rebuildRuleIndex();
@@ -2526,7 +2532,9 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
         // Case 1: Text node (simple paragraph text)
         if (child->type == Node::TEXT) {
             auto tnode = static_cast<TextNode*>(child.get());
-            appendWords(tnode->text, inheritedFontSize, currentHref, el, pendingInline, inheritedVisuallyHidden, inheritedPaint);
+            // An anonymous item's text belongs to its container (anonymousItem).
+            appendWords(tnode->text, inheritedFontSize, currentHref, el->tag.empty() ? el->parent : el, pendingInline,
+                        inheritedVisuallyHidden, inheritedPaint);
         }
 
         //  Case 2: Element node (<div>, <p>, <span>, etc.)
@@ -3109,9 +3117,9 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
         int rowStart = -1, rowEnd = -1;
     };
     std::vector<ItemPlacement> placements;
-    for (auto& child : el->children) {
-        if (child->type != Node::ELEMENT) continue;
-        auto* ce = static_cast<Element*>(child.get());
+    for (size_t c = 0; c < el->children.size(); c++) {
+        Element* ce = el->children[c]->type == Node::TEXT ? anonymousItem(el, c) : static_cast<Element*>(el->children[c].get());
+        if (!ce) continue;
         if (ce->tag == L"head" || ce->tag == L"script" || ce->tag == L"style" ||
             ce->tag == L"title" || ce->tag == L"meta" || ce->tag == L"link" || ce->tag == L"base")
             continue;
@@ -3377,6 +3385,23 @@ void LayoutRoot::layoutGrid(Element* el, int x, int& y, int containingWidth, con
     ancestorStack.pop_back();
 }
 
+Element* LayoutRoot::anonymousItem(Element* el, size_t& i) {
+    const size_t first = i;
+    bool blank = true;
+    for (; i < el->children.size() && el->children[i]->type == Node::TEXT; i++)
+        for (wchar_t ch : static_cast<TextNode*>(el->children[i].get())->text)
+            if (!iswspace(ch)) { blank = false; break; }
+    i--; // the run's last text node
+    if (blank) return nullptr;
+    auto& item = anonymousItems_[el->children[first].get()];
+    if (!item) {
+        item = std::make_unique<Element>(L"");
+        item->parent = el;
+        item->children.assign(el->children.begin() + first, el->children.begin() + i + 1);
+    }
+    return item.get();
+}
+
 // Places `el`'s flex items along style.flexDirection's main axis. Row and
 // column direction are different enough (which axis is "main" swaps
 // entirely) that they're really two algorithms sharing one function.
@@ -3415,9 +3440,9 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
 
     std::vector<Element*> items;
     std::vector<ComputedStyle> itemStyles; // against containingWidth - re-resolved against each item's real width below
-    for (auto& child : el->children) {
-        if (child->type != Node::ELEMENT) continue;
-        auto* ce = static_cast<Element*>(child.get());
+    for (size_t c = 0; c < el->children.size(); c++) {
+        Element* ce = el->children[c]->type == Node::TEXT ? anonymousItem(el, c) : static_cast<Element*>(el->children[c].get());
+        if (!ce) continue;
         if (ce->tag == L"head" || ce->tag == L"script" || ce->tag == L"style" ||
             ce->tag == L"title" || ce->tag == L"meta" || ce->tag == L"link" || ce->tag == L"base")
             continue;

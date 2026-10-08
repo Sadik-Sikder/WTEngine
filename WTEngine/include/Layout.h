@@ -592,6 +592,13 @@ private:
     // that axis - the same behavior real CSS shows for an auto-height
     // flex column, not a shortcut unique to this engine.
     void layoutFlex(Element* el, int x, int& y, int containingWidth, const ComputedStyle& style);
+    // A flex or grid item for the run of text nodes starting at el->children[i]
+    // (`i` is moved to the run's last one): CSS's anonymous item - an element
+    // with no tag, holding that text, which computeStyle gives only inherited
+    // style and whose words layoutElement credits to the container. Made once
+    // per layout() pass; nullptr for a run of only whitespace, which makes none.
+    Element* anonymousItem(Element* el, size_t& i);
+    std::unordered_map<const Node*, std::unique_ptr<Element>> anonymousItems_;
     // Lays out one flex/grid item (a control, an image, or a block) at
     // local origin (0, 0) and `width`, returning its boxes instead of
     // appending them to `boxes`; `height` receives how tall it came out.
