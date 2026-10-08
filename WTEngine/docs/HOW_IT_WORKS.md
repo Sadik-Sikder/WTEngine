@@ -404,6 +404,8 @@ This still means **explicit CSS `height` isn't supported** - a box is always exa
 ### Flex (`layoutFlex`)
 `display: flex` runs `layoutFlex` instead of the usual vertical flow, the same way `display: grid` runs `layoutGrid` - only for the container's own children, box model unchanged. Row and column direction are different enough (which axis is "main" swaps entirely) that they're really two algorithms sharing one function.
 
+**Text items** (`anonymousItem`, shared with `layoutGrid`): a run of text directly inside a flex or grid container (`<div style="display:flex">Hello <b>x</b> there</div>`) becomes an item of its own, as CSS's anonymous items - an `Element` with an empty tag holding the run's text nodes (shared, not moved; the DOM is untouched), made once per `layout()` pass. `computeStyle` gives it only what it inherits (no rule can match it), and `layoutElement` credits its words to the container, so clicks and JS events never see it. A run of only whitespace makes no item, so whitespace between elements still vanishes, as in browsers.
+
 **Row direction** (`flex-direction: row`, the default):
 1. **Hypothetical size.** Each item's starting outer width is its `flex-basis` if set, else its explicit `width`, else its content's width (never less than its own padding+border). The content width is a shrink-to-fit measurement (`shrinkToFitWidth`, below), standing in for CSS's max-content size; as in CSS, an item only grows past it if `flex-grow` says so.
 2. **Lines.** With `flex-wrap: wrap`/`wrap-reverse`, items are packed greedily into lines (an item wider than the container gets a line to itself); `wrap-reverse` stacks the lines bottom-up. Otherwise everything is one line.
