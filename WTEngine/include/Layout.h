@@ -243,6 +243,15 @@ private:
         ListStyle listType = ListStyle::Disc;
         bool listInside = false;
         std::wstring listString;
+
+        // Same values (custom properties: the same layer) - styleCache_'s key.
+        bool operator==(const TextPaint& o) const {
+            return bold == o.bold && italic == o.italic && family == o.family && vars == o.vars &&
+                   align == o.align && centerBlocks == o.centerBlocks && lineHeight == o.lineHeight &&
+                   lineHeightPx == o.lineHeightPx && underline == o.underline && lineThrough == o.lineThrough &&
+                   transform == o.transform && whiteSpace == o.whiteSpace && listType == o.listType &&
+                   listInside == o.listInside && color == o.color && listString == o.listString;
+        }
     };
     // The height a line of `fontSize` text needs under this line-height.
     static int lineBand(const TextPaint& p, int fontSize);
@@ -500,8 +509,28 @@ private:
         // headings are bold) set them.
         TextPaint paint;
     };
+    // An element's style - from styleCache_ when it was already computed this
+    // pass from the same inputs (computeStyleUncached does the work).
     ComputedStyle computeStyle(Element* e, int inheritedFontSize, int containingWidth,
                                 bool inheritedVisuallyHidden, const TextPaint& inheritedPaint);
+    ComputedStyle computeStyleUncached(Element* e, int inheritedFontSize, int containingWidth,
+                                       bool inheritedVisuallyHidden, const TextPaint& inheritedPaint);
+    // Styles computed this layout() pass. Flex, grid, tables, floats and
+    // shrink-to-fit lay the same subtree out several times (to measure it,
+    // then for real), nested containers multiplying that, so an element's
+    // style is asked for many times (12 on average on CNN's home page, at
+    // 8,000+ rules each). Within one pass the DOM, the rules, the hover set
+    // and the viewport can't change, so the answer depends only on the
+    // arguments plus containingHeight_ (height: %) and measuring_ (width:
+    // %) - the key. Since a cached parent returns the same custom-property
+    // layer (TextPaint::vars), its children's lookups match too.
+    struct StyleCacheEntry {
+        int fontSize, containingWidth, containingHeight;
+        bool visuallyHidden, measuring;
+        TextPaint paint;
+        ComputedStyle style;
+    };
+    std::unordered_map<const Element*, std::vector<StyleCacheEntry>> styleCache_;
     // Parses one corner radius: px, %, em/rem (against `fontSize`), or 0.
     static bool parseRadius(const std::wstring& v, int fontSize, LayoutBox::CornerRadius& out);
     // Splits a shorthand value like "4px 8px" on whitespace and expands it

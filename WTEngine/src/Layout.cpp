@@ -1068,6 +1068,28 @@ static std::vector<std::pair<std::wstring, std::wstring>> tableHints(Element* e)
 
 LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFontSize, int containingWidth,
                                                      bool inheritedVisuallyHidden, const TextPaint& inheritedPaint) {
+    auto& entries = styleCache_[e];
+    for (const auto& c : entries) {
+        if (c.fontSize == inheritedFontSize && c.containingWidth == containingWidth &&
+            c.containingHeight == containingHeight_ && c.visuallyHidden == inheritedVisuallyHidden &&
+            c.measuring == measuring_ && c.paint == inheritedPaint) {
+            emBase_ = c.style.fontSize; // as computing it would have left it
+            return c.style;
+        }
+    }
+    ComputedStyle sv = computeStyleUncached(e, inheritedFontSize, containingWidth, inheritedVisuallyHidden, inheritedPaint);
+    // Looked up again: `entries` would dangle if computing ever filled the
+    // cache (a rehash). A few variants per element at most (one per width
+    // it's measured at); past that, the oldest makes room.
+    auto& slot = styleCache_[e];
+    if (slot.size() >= 6) slot.erase(slot.begin());
+    slot.push_back({ inheritedFontSize, containingWidth, containingHeight_, inheritedVisuallyHidden, measuring_,
+                     inheritedPaint, sv });
+    return sv;
+}
+
+LayoutRoot::ComputedStyle LayoutRoot::computeStyleUncached(Element* e, int inheritedFontSize, int containingWidth,
+                                                             bool inheritedVisuallyHidden, const TextPaint& inheritedPaint) {
     ComputedStyle sv;
     sv.fontSize = inheritedFontSize; // inherited unless a rule below overrides it
     if (e->tag.empty()) { // an anonymous item (anonymousItem): no rule applies to it
@@ -2364,6 +2386,7 @@ void LayoutRoot::layout() {
     measuring_ = false;
     listOrdinals_.clear();
     anonymousItems_.clear();
+    styleCache_.clear(); // styles hold for one pass only - the DOM and rules can change between passes
     insideMarker_.clear();
     insideMarkerFor_ = nullptr;
     rebuildRuleIndex();
