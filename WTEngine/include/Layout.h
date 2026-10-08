@@ -205,6 +205,9 @@ private:
     // is only made where one does.
     enum class TextAlign { Left, Center, Right };
     enum class TextTransform { None, Uppercase, Lowercase, Capitalize };
+    // list-style-type. String: a quoted string, used as the marker as written.
+    enum class ListStyle { Disc, Circle, Square, Decimal, DecimalLeadingZero, LowerAlpha, UpperAlpha,
+                           LowerRoman, UpperRoman, LowerGreek, String, None };
     struct TextPaint {
         std::wstring color;
         bool bold = false;
@@ -228,6 +231,12 @@ private:
         bool underline = false;
         bool lineThrough = false;
         TextTransform transform = TextTransform::None;
+        // list-style-type and list-style-position: inherited, so set on a list
+        // and used by its items (see addListMarker). `listString` is the marker
+        // for ListStyle::String.
+        ListStyle listType = ListStyle::Disc;
+        bool listInside = false;
+        std::wstring listString;
     };
     // The height a line of `fontSize` text needs under this line-height.
     static int lineBand(const TextPaint& p, int fontSize);
@@ -464,6 +473,8 @@ private:
         enum class Float { None, Left, Right } floatSide = Float::None;
         enum class Clear { None, Left, Right, Both } clear = Clear::None;
         bool flowRoot = false; // display: flow-root - a block that contains its floats
+        // display: list-item - an <li> by default. It gets a marker (addListMarker).
+        bool listItem = false;
         // Tables: border-collapse and border-spacing (horizontal, vertical)
         // on the table; vertical-align on a cell, row or row group.
         bool borderCollapse = false;
@@ -813,4 +824,25 @@ private:
     // Sticky elements whose parent block is still being laid out, by
     // level; the parent sets their maxShift when it ends.
     std::vector<std::vector<int>> openStickies_;
+
+    // --- List markers ------------------------------------------------
+    // An <li>'s number: from its `value`, else one on from the <li> before it
+    // (one back in a <ol reversed>), else the list's `start` (default 1, or
+    // the item count when reversed). Computed for a whole list at once and
+    // kept for this layout() pass.
+    int listOrdinal(Element* li);
+    std::unordered_map<Element*, int> listOrdinals_;
+    // The marker's text for a counter style ("3.", "c.", "iv."), or empty for
+    // the shapes (disc, circle, square), which are drawn as boxes.
+    static std::wstring markerText(const TextPaint& p, int ordinal);
+    // A disc/circle/square marker, sized for `fontSize`, at (0, 0).
+    static LayoutBox markerShape(const TextPaint& p, int fontSize);
+    // An outside marker: placed left of the list item's content box
+    // (`contentX`), level with the first line among the boxes from `from`
+    // on, or with `contentTop` when the item has none.
+    void addListMarker(Element* e, const ComputedStyle& sv, int contentX, int contentTop, size_t from);
+    // An inside marker waits here for layoutElement to put it at the start
+    // of `insideMarkerFor_`'s inline content.
+    std::vector<InlineItem> insideMarker_;
+    Element* insideMarkerFor_ = nullptr;
 };

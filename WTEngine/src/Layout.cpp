@@ -944,6 +944,19 @@ static std::vector<std::pair<std::wstring, std::wstring>> tableHints(Element* e)
         if (tag == L"br" && (v == L"left" || v == L"right" || v == L"all" || v == L"both")) out.push_back({ L"clear", v });
         return out;
     }
+    if (tag == L"ol" || tag == L"ul" || tag == L"li") {
+        // <ol type=a|A|i|I|1>, <ul type=disc|circle|square> (and the same on
+        // an <li>). The letters are case-sensitive.
+        auto a = e->attrs.find(L"type");
+        if (a == e->attrs.end()) return out;
+        std::wstring v = trimmed(a->second);
+        const wchar_t* type = v == L"1" ? L"decimal" : v == L"a" ? L"lower-alpha" : v == L"A" ? L"upper-alpha"
+                            : v == L"i" ? L"lower-roman" : v == L"I" ? L"upper-roman" : nullptr;
+        v = lowerCase(v);
+        if (!type && (v == L"disc" || v == L"circle" || v == L"square" || v == L"none")) type = v.c_str();
+        if (type) out.push_back({ L"list-style-type", type });
+        return out;
+    }
     if (tag == L"div") {
         auto a = e->attrs.find(L"align");
         if (a != e->attrs.end()) {
@@ -1050,6 +1063,16 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
     // browser's built-in stylesheet would give it), then author rules.
     sv.paint = inheritedPaint;
     sv.centeredByParent = inheritedPaint.centerBlocks;
+    // Lists: <ol> counts; <ul> has discs, circles in a <ul> nested in a list,
+    // squares deeper still - as in browsers. An <li> is a list item.
+    if (tag == L"ol") sv.paint.listType = ListStyle::Decimal;
+    else if (list) {
+        int depth = 0;
+        for (Element* a = e->parent; a && depth < 2; a = a->parent)
+            if (a->tag == L"ul" || a->tag == L"ol" || a->tag == L"menu" || a->tag == L"dir") depth++;
+        sv.paint.listType = depth == 0 ? ListStyle::Disc : depth == 1 ? ListStyle::Circle : ListStyle::Square;
+    }
+    sv.listItem = tag == L"li";
     if (tag == L"table" && quirks) {
         // Quirks mode: a table starts its text styling afresh.
         sv.fontSize = 14;
@@ -1108,6 +1131,31 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
         if (recognized) sv.paint.family = face;
     };
 
+    // list-style-type: a keyword, or a quoted string used as the marker. A
+    // counter style this engine doesn't know falls back to decimal, as CSS
+    // does for an undefined one.
+    auto listType = [&](const std::wstring& raw) {
+        std::wstring v = trimmed(raw);
+        if (v.size() >= 2 && (v[0] == L'"' || v[0] == L'\'') && v.back() == v[0]) {
+            sv.paint.listType = ListStyle::String;
+            sv.paint.listString = v.substr(1, v.size() - 2);
+            return;
+        }
+        static const std::unordered_map<std::wstring, ListStyle> kTypes = {
+            { L"disc", ListStyle::Disc }, { L"circle", ListStyle::Circle }, { L"square", ListStyle::Square },
+            { L"decimal", ListStyle::Decimal }, { L"decimal-leading-zero", ListStyle::DecimalLeadingZero },
+            { L"lower-alpha", ListStyle::LowerAlpha }, { L"lower-latin", ListStyle::LowerAlpha },
+            { L"upper-alpha", ListStyle::UpperAlpha }, { L"upper-latin", ListStyle::UpperAlpha },
+            { L"lower-roman", ListStyle::LowerRoman }, { L"upper-roman", ListStyle::UpperRoman },
+            { L"lower-greek", ListStyle::LowerGreek }, { L"none", ListStyle::None },
+            { L"initial", ListStyle::Disc },
+        };
+        v = lowerCase(v);
+        auto it = kTypes.find(v);
+        if (it != kTypes.end()) sv.paint.listType = it->second;
+        else if (!v.empty() && iswalpha(v[0]) && v != L"inherit" && v != L"unset") sv.paint.listType = ListStyle::Decimal;
+    };
+
     auto applyDecl = [&](const std::wstring& k, const std::wstring& v) {
         // The property, identified once - then compared as a number down the
         // chain below rather than as a string. Most pages also declare plenty
@@ -1123,8 +1171,9 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             P_font, P_font_family, P_font_size, P_font_style, P_font_weight, P_gap, P_grid_area,
             P_grid_column, P_grid_column_end, P_grid_column_start, P_grid_gap, P_grid_row, P_grid_row_end,
             P_grid_row_start, P_grid_template, P_grid_template_areas, P_grid_template_columns,
-            P_grid_template_rows, P_height, P_inset, P_justify_content, P_left, P_line_height, P_margin,
-            P_margin_bottom, P_margin_left, P_margin_right, P_margin_top, P_max_height, P_max_width,
+            P_grid_template_rows, P_height, P_inset, P_justify_content, P_left, P_line_height, P_list_style,
+            P_list_style_position, P_list_style_type, P_margin, P_margin_bottom, P_margin_left, P_margin_right,
+            P_margin_top, P_max_height, P_max_width,
             P_min_height, P_min_width, P_opacity, P_overflow, P_overflow_x, P_overflow_y, P_padding,
             P_padding_bottom, P_padding_left, P_padding_right, P_padding_top, P_position, P_right,
             P_row_gap, P_text_align, P_text_decoration, P_text_decoration_line, P_text_transform, P_top,
@@ -1156,6 +1205,8 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             { L"grid-template-columns", P_grid_template_columns },
             { L"grid-template-rows", P_grid_template_rows }, { L"height", P_height }, { L"inset", P_inset },
             { L"justify-content", P_justify_content }, { L"left", P_left }, { L"line-height", P_line_height },
+            { L"list-style", P_list_style }, { L"list-style-position", P_list_style_position },
+            { L"list-style-type", P_list_style_type },
             { L"margin", P_margin }, { L"margin-bottom", P_margin_bottom }, { L"margin-left", P_margin_left },
             { L"margin-right", P_margin_right }, { L"margin-top", P_margin_top },
             { L"max-height", P_max_height }, { L"max-width", P_max_width }, { L"min-height", P_min_height },
@@ -1221,6 +1272,39 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             if (known) sv.paint.centerBlocks = a == L"-webkit-center";
         }
         else if (prop == P_line_height) lineHeightRaw = trimmed(v);
+        else if (prop == P_list_style_type) listType(v);
+        else if (prop == P_list_style_position) {
+            std::wstring p = lowerCase(trimmed(v));
+            if (p == L"inside") sv.paint.listInside = true;
+            else if (p == L"outside" || p == L"initial") sv.paint.listInside = false;
+        }
+        else if (prop == P_list_style) {
+            // Unset parts go back to their initial values (disc, outside);
+            // "none" is the type unless one is given (then it's the image).
+            std::wstring rest = trimmed(v);
+            std::wstring lower = lowerCase(rest);
+            if (lower == L"inherit" || lower == L"unset") return;
+            bool typeSet = false;
+            int nones = 0;
+            size_t q = rest.find_first_of(L"\"'");
+            if (q != std::wstring::npos) {
+                size_t end = rest.find(rest[q], q + 1);
+                if (end != std::wstring::npos) {
+                    listType(rest.substr(q, end - q + 1));
+                    typeSet = true;
+                    rest.erase(q, end - q + 1);
+                }
+            }
+            sv.paint.listInside = false;
+            for (const auto& tok : cssTokens(lowerCase(rest))) {
+                if (tok == L"inside") sv.paint.listInside = true;
+                else if (tok == L"outside" || tok == L"initial") {}
+                else if (tok == L"none") nones++;
+                else if (tok.rfind(L"url(", 0) == 0) {} // list-style-image: not drawn
+                else { listType(tok); typeSet = true; }
+            }
+            if (!typeSet) sv.paint.listType = nones ? ListStyle::None : ListStyle::Disc;
+        }
         else if (prop == P_text_decoration || prop == P_text_decoration_line) {
             // Only the line part matters here; a value naming no line
             // (just a color or style) leaves it alone.
@@ -1472,8 +1556,10 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyle(Element* e, int inheritedFont
             else if (v == L"table-footer-group") sv.display = Display::TableFooterGroup;
             else if (v == L"table-caption") sv.display = Display::TableCaption;
             else if (v == L"table-column" || v == L"table-column-group") sv.display = Display::None;
+            else if (v.find(L"list-item") != std::wstring::npos) sv.display = Display::Block;
             else if (v == L"flow-root") sv.display = Display::Block;
             sv.flowRoot = v == L"flow-root";
+            sv.listItem = v.find(L"list-item") != std::wstring::npos;
         }
         else if (prop == P_float) {
             std::wstring f = lowerCase(trimmed(v));
@@ -2193,6 +2279,9 @@ void LayoutRoot::layout() {
     if (measureScale != cachedScale_) { textCache_.clear(); textCacheSize_ = 0; cachedScale_ = measureScale; } // widths change with zoom
     nextAnchor_ = 1;
     measuring_ = false;
+    listOrdinals_.clear();
+    insideMarker_.clear();
+    insideMarkerFor_ = nullptr;
     rebuildRuleIndex();
     if (!rootNode) return;
 
@@ -2424,6 +2513,12 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
             pendingInline.clear();
         }
     };
+    // An inside list marker goes first in the item's content (addListMarker).
+    if (insideMarkerFor_ == el) {
+        pendingInline = std::move(insideMarker_);
+        insideMarker_.clear();
+        insideMarkerFor_ = nullptr;
+    }
 
     // Loop over each child node
     for (auto& child : el->children) {
@@ -2531,6 +2626,163 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
 // largest positive one plus the most negative one.
 static int combineMargins(int a, int b) {
     return std::max(std::max(a, b), 0) + std::min(std::min(a, b), 0);
+}
+
+// --- List markers ----------------------------------------------------------
+
+int LayoutRoot::listOrdinal(Element* li) {
+    auto found = listOrdinals_.find(li);
+    if (found != listOrdinals_.end()) return found->second;
+    Element* list = li->parent;
+    if (!list) return 1;
+    auto intAttr = [](Element* el, const wchar_t* name, int& out) {
+        auto it = el->attrs.find(name);
+        if (it == el->attrs.end()) return false;
+        try { out = std::stoi(it->second); return true; } catch (...) { return false; }
+    };
+    std::vector<Element*> items;
+    for (auto& c : list->children)
+        if (c->type == Node::ELEMENT && static_cast<Element*>(c.get())->tag == L"li")
+            items.push_back(static_cast<Element*>(c.get()));
+    const bool ol = list->tag == L"ol";
+    const bool reversed = ol && list->attrs.count(L"reversed");
+    int n;
+    if (!ol || !intAttr(list, L"start", n)) n = reversed ? (int)items.size() : 1;
+    for (Element* item : items) {
+        int value;
+        if (intAttr(item, L"value", value)) n = value;
+        listOrdinals_[item] = n;
+        n += reversed ? -1 : 1;
+    }
+    found = listOrdinals_.find(li);
+    return found != listOrdinals_.end() ? found->second : 1;
+}
+
+std::wstring LayoutRoot::markerText(const TextPaint& p, int n) {
+    std::wstring s;
+    switch (p.listType) {
+    case ListStyle::String: return p.listString;
+    case ListStyle::Disc: case ListStyle::Circle: case ListStyle::Square: case ListStyle::None: return s;
+    case ListStyle::LowerAlpha: case ListStyle::UpperAlpha: case ListStyle::LowerGreek:
+        if (n >= 1) {
+            // a..z, then aa, ab, ... (base 26 with no zero digit).
+            static const wchar_t kGreek[] = L"\x3B1\x3B2\x3B3\x3B4\x3B5\x3B6\x3B7\x3B8\x3B9\x3BA\x3BB\x3BC"
+                                            L"\x3BD\x3BE\x3BF\x3C0\x3C1\x3C3\x3C4\x3C5\x3C6\x3C7\x3C8\x3C9";
+            const int base = p.listType == ListStyle::LowerGreek ? 24 : 26;
+            for (int v = n; v > 0; v = (v - 1) / base) {
+                int d = (v - 1) % base;
+                wchar_t c = p.listType == ListStyle::LowerGreek ? kGreek[d]
+                          : (wchar_t)((p.listType == ListStyle::UpperAlpha ? L'A' : L'a') + d);
+                s.insert(s.begin(), c);
+            }
+            return s + L".";
+        }
+        break;
+    case ListStyle::LowerRoman: case ListStyle::UpperRoman:
+        if (n >= 1 && n <= 3999) {
+            static const std::pair<int, const wchar_t*> kRoman[] = {
+                { 1000, L"m" }, { 900, L"cm" }, { 500, L"d" }, { 400, L"cd" }, { 100, L"c" }, { 90, L"xc" },
+                { 50, L"l" }, { 40, L"xl" }, { 10, L"x" }, { 9, L"ix" }, { 5, L"v" }, { 4, L"iv" }, { 1, L"i" } };
+            int v = n;
+            for (const auto& [value, digits] : kRoman)
+                for (; v >= value; v -= value) s += digits;
+            if (p.listType == ListStyle::UpperRoman) for (auto& c : s) c = (wchar_t)towupper(c);
+            return s + L".";
+        }
+        break;
+    default: break;
+    }
+    // decimal - and what the others fall back to outside their range.
+    s = std::to_wstring(std::abs(n));
+    if (p.listType == ListStyle::DecimalLeadingZero && s.size() < 2) s.insert(s.begin(), L'0');
+    if (n < 0) s.insert(s.begin(), L'-');
+    return s + L".";
+}
+
+LayoutBox LayoutRoot::markerShape(const TextPaint& p, int fontSize) {
+    LayoutBox b;
+    b.x = b.y = 0;
+    b.width = b.height = std::max(3, (int)std::lround(fontSize * 0.35));
+    const std::wstring color = p.color.empty() ? L"#000000" : p.color;
+    if (p.listType != ListStyle::Square)
+        for (auto& r : b.radius) r = { 50, true };
+    if (p.listType == ListStyle::Circle) { b.borderWidth = 1; b.borderColor = color; }
+    else b.background = color;
+    return b;
+}
+
+// A marker is in the list item's font, and sits in the space before its
+// content: a counter's text ends a space short of where the content's text
+// starts (text is drawn 4px into its box - see layoutInlineRun), as does a
+// shape. `from` == SIZE_MAX makes it an inside marker instead: the first
+// thing on the item's first line (insideMarker_).
+void LayoutRoot::addListMarker(Element* e, const ComputedStyle& sv, int contentX, int contentTop, size_t from) {
+    const TextPaint& p = sv.paint;
+    const int textInset = 4;
+    std::wstring text = markerText(p, listOrdinal(e));
+    if (text.empty() && p.listType == ListStyle::String) return;
+    const float space = textWidth(L" ", sv.fontSize, p);
+    const bool inside = from == SIZE_MAX;
+
+    if (inside) {
+        insideMarker_.clear();
+        insideMarkerFor_ = e;
+        if (text.empty()) {
+            InlineItem item{ L"", sv.fontSize, currentHref, e, false, sv.visuallyHidden, p };
+            auto shape = std::make_shared<LayoutBox>(markerShape(p, sv.fontSize));
+            shape->el = e;
+            shape->visuallyHidden = sv.visuallyHidden;
+            item.image = shape;
+            // The text after it starts about 1.4em from its left, as in Chrome.
+            item.marginRight = std::max((int)std::lround(sv.fontSize * 1.375f) - shape->width - textInset, 0);
+            insideMarker_.push_back(std::move(item));
+        }
+        else {
+            insideMarker_.push_back({ text, sv.fontSize, L"", e, false, sv.visuallyHidden, p });
+            if (p.listType != ListStyle::String) {
+                InlineItem gap{ L"", sv.fontSize, L"", e, false, sv.visuallyHidden, p };
+                gap.isSpace = true;
+                insideMarker_.push_back(std::move(gap));
+            }
+        }
+        return;
+    }
+
+    // Level with the first line: its first word, image or control, wherever
+    // it is among the item's descendants - or the top of an empty item.
+    const int natural = sv.fontSize + 8; // the height of a text box (layoutInlineRun)
+    int lineTop = contentTop + (lineBand(p, sv.fontSize) - natural) / 2;
+    for (size_t i = from; i < boxes.size(); i++) {
+        const LayoutBox& b = boxes[i];
+        if (b.anchor) continue;
+        if (!b.text.empty() && b.control == LayoutBox::NoControl) { lineTop = b.y + (b.height - natural) / 2; break; }
+        if (!b.imageSrc.empty() || b.control != LayoutBox::NoControl) { lineTop = b.y + b.height - natural; break; }
+    }
+
+    LayoutBox m;
+    if (text.empty()) {
+        m = markerShape(p, sv.fontSize);
+        m.x = contentX + textInset - (int)std::lround(space * 1.4f) - m.width;
+        m.y = lineTop + textInset + (int)std::lround(sv.fontSize * 0.58f) - m.height / 2;
+    }
+    else {
+        float w = textWidth(text, sv.fontSize, p);
+        float gap = p.listType == ListStyle::String ? 0 : space;
+        m.x = contentX - (int)std::lround(w + gap);
+        m.y = lineTop;
+        m.width = (int)std::lround(w);
+        m.height = natural;
+        m.decorationWidth = m.width;
+        m.text = text;
+        m.fontSize = sv.fontSize;
+        m.color = p.color;
+        m.bold = p.bold;
+        m.italic = p.italic;
+        m.family = p.family;
+    }
+    m.el = e;
+    m.visuallyHidden = sv.visuallyHidden;
+    boxes.push_back(std::move(m));
 }
 
 // See the declaration in Layout.h. This is exactly what layoutElement's own
@@ -2711,10 +2963,14 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
 
     int childX = boxX + sv.borderWidth + sv.paddingLeft;
     int contentTop = y;
+    const bool listMarker = sv.listItem && sv.display == Display::Block && !table &&
+                            sv.paint.listType != ListStyle::None;
+    if (listMarker && sv.paint.listInside) addListMarker(e, sv, childX, y, SIZE_MAX);
     if (sv.display == Display::Grid) layoutGrid(e, childX, y, contentWidth, sv);
     else if (sv.display == Display::Flex) layoutFlex(e, childX, y, contentWidth, sv);
     else if (table) layoutTable(e, childX, y, contentWidth, sv, *table);
     else layoutElement(e, childX, y, contentWidth, sv.fontSize, sv.visuallyHidden, sv.paint);
+    if (insideMarkerFor_ == e) { insideMarker_.clear(); insideMarkerFor_ = nullptr; } // not taken
 
     floatCtx_ = savedFloats;
     currentHref = savedHref;
@@ -2739,6 +2995,7 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
             if (bgIndex != static_cast<size_t>(-1)) boxes[bgIndex].y = newTop;
         }
     }
+    if (listMarker && !sv.paint.listInside) addListMarker(e, sv, childX, contentTop, firstBox);
     // Likewise at the bottom: with no border, padding or set height below
     // its content, its last child's bottom margin (or, if it's empty, its
     // own top margin) carries through to merge with its bottom margin.
