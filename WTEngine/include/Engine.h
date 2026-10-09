@@ -306,6 +306,27 @@ private:
     // on screen), the current sticking distance for a sticky one, else 0.
     // Everything that paints or hit-tests a box adds it to `y`.
     int boxShift(const LayoutBox& b) const;
+    int shiftFor(bool fixed, int sticky) const; // boxShift's rule, for a LayoutRoot::ElementRect too
+
+    // --- Geometry for scripts (DOMBindingState::geometry) ---------------
+    // A script reading geometry or computed style after changing the DOM
+    // gets an answer that reflects the change: the page is laid out on the
+    // spot, as browsers do. Unless layouts are slow (over 16 ms) and one
+    // ended less than its own duration ago - so a script alternating
+    // writes and reads can't spend more than about half the time laying
+    // out; it then gets the last layout's geometry (styles are recomputed).
+    void layoutForScript();
+    unsigned layoutChangeCount_ = 0; // DOMBindingState::changeCount as of the last layout
+    unsigned styleChangeCount_ = 0;  // ... as of the last time computed styles were current
+    bool pageLaidOut_ = false; // the current page has been laid out at least once
+    // The element's border box in viewport coordinates: its block box if
+    // layout recorded one, else the union of its own boxes and its
+    // children's (an inline element, a table row).
+    bool scriptElementRect(Element* el, double& x, double& y, double& w, double& h);
+    bool unionRect(const Element* el, int& x0, int& y0, int& x1, int& y1, int depth);
+    // layoutRoot.boxes by element, rebuilt once per layout when needed.
+    std::unordered_map<const Element*, std::vector<size_t>> boxesByElement_;
+    unsigned layoutGeneration_ = 0, boxIndexGeneration_ = ~0u;
     // Whether page point (docX, docY) is inside the box and its clip.
     bool boxContains(const LayoutBox& b, int docX, int docY) const;
     // A box's box-shadows (outer ones; inset shadows aren't drawn).

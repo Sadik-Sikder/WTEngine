@@ -125,6 +125,11 @@ struct LayoutBox {
     // reads the element's static position from it. Removed at the end of
     // layout(); never painted.
     int anchor = 0;
+    // Not a real box either: a block-level element's border box, for
+    // scripts (getBoundingClientRect, offsetWidth, ...). Moves like the
+    // boxes around it; layout() turns these into LayoutRoot::elementRects
+    // and removes them. Never painted.
+    bool geometryOnly = false;
     bool fixed = false;
     int sticky = -1;
     bool clipped = false;
@@ -202,6 +207,27 @@ struct LayoutRoot {
     std::unordered_set<std::wstring> imagesSizedByGuess;
 
     void layout(); // compute boxes from rootNode
+
+    // Each block-level element's border box from the last layout() (see
+    // LayoutBox::geometryOnly), in document coordinates - except a fixed
+    // one's `y`, from the top of the viewport, and a sticky one's, before
+    // its scroll shift (as for LayoutBox). Inline elements have none; their
+    // geometry is the union of their boxes (Engine::elementRect).
+    struct ElementRect {
+        int x, y, width, height;
+        bool fixed;
+        int sticky;
+    };
+    std::unordered_map<const Element*, ElementRect> elementRects;
+
+    // getComputedStyle: `el`'s style as the cascade resolved it, as CSS
+    // property/value pairs (colours as rgb(), lengths in px). `rect` (its
+    // border box, if it has one) gives the used width/height. Computed
+    // top-down from the root on demand and kept until the next layout().
+    std::vector<std::pair<std::wstring, std::wstring>> computedStyleOf(Element* el, const ElementRect* rect);
+    // The DOM changed without a layout (Engine::layoutForScript held one
+    // back): styles remembered from the last pass may be stale.
+    void forgetStyles() { styleCache_.clear(); described_.clear(); }
 private:
     // The inherited properties besides font-size: `color` (a raw CSS color
     // string, empty = default black), bold (font-weight), and custom
@@ -537,6 +563,12 @@ private:
         ComputedStyle style;
     };
     std::unordered_map<const Element*, std::vector<StyleCacheEntry>> styleCache_;
+    // computedStyleOf's styles, each computed from its parent's as layout
+    // would (font size, inherited paint, the parent's content width).
+    // Cleared by layout().
+    struct Described { ComputedStyle style; int contentWidth; };
+    std::unordered_map<const Element*, Described> described_;
+    const Described& describe(Element* el);
     // Parses one corner radius: px, %, em/rem (against `fontSize`), or 0.
     static bool parseRadius(const std::wstring& v, int fontSize, LayoutBox::CornerRadius& out);
     // Splits a shorthand value like "4px 8px" on whitespace and expands it

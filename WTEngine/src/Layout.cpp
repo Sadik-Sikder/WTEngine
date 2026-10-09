@@ -2391,6 +2391,8 @@ void LayoutRoot::layout() {
     anonymousItems_.clear();
     styleCache_.clear(); // styles hold for one pass only - the DOM and rules can change between passes
     imagesSizedByGuess.clear();
+    elementRects.clear();
+    described_.clear();
     insideMarker_.clear();
     insideMarkerFor_ = nullptr;
     rebuildRuleIndex();
@@ -2449,6 +2451,12 @@ void LayoutRoot::layout() {
     positioned_.clear();
     // The anchors have served their purpose (LayoutBox::anchor).
     boxes.erase(std::remove_if(boxes.begin(), boxes.end(), [](const LayoutBox& b) { return b.anchor != 0; }), boxes.end());
+    // Likewise the element border boxes, kept for scripts. An element laid
+    // out more than once in the final boxes (it can't be, but a measuring
+    // copy that slipped through would come first) keeps its last box.
+    for (const auto& b : boxes)
+        if (b.geometryOnly && b.el) elementRects[b.el] = { b.x, b.y, b.width, b.height, b.fixed, b.sticky };
+    boxes.erase(std::remove_if(boxes.begin(), boxes.end(), [](const LayoutBox& b) { return b.geometryOnly; }), boxes.end());
 
     // A sticky element inside a flex/grid item was laid out at (0, 0) and
     // then moved, so its recorded top is off; its boxes say where it ended
@@ -3133,6 +3141,19 @@ void LayoutRoot::layoutBlockChild(Element* e, int x, int& y, int containingWidth
     const int borderHeight = y - contentStartY;
     if (bgIndex != static_cast<size_t>(-1)) boxes[bgIndex].height = borderHeight;
 
+    // Its border box, for scripts (elementRects). Pushed before the
+    // relative/sticky handling below so it moves with the element.
+    {
+        LayoutBox geometry;
+        geometry.x = boxX;
+        geometry.y = contentStartY;
+        geometry.width = outerWidth;
+        geometry.height = borderHeight;
+        geometry.el = e;
+        geometry.geometryOnly = true;
+        boxes.push_back(std::move(geometry));
+    }
+
     // Its absolute descendants, against its padding box.
     if (positioned) {
         positioned_.pop_back();
@@ -3785,7 +3806,12 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
             // background/border has nothing visible to stretch anyway.
             // Only an item whose height is auto stretches, as in CSS.
             if (style.alignItems == AlignItems::Stretch && itemStyles[i].height < 0) {
-                for (auto& box : itemBoxes[k]) if (box.el == items[i]) { box.height = lineHeight; break; }
+                bool stretched = false;
+                for (auto& box : itemBoxes[k]) {
+                    if (box.el != items[i]) continue;
+                    if (box.geometryOnly) box.height = lineHeight; // its border box too
+                    else if (!stretched) { box.height = lineHeight; stretched = true; }
+                }
             }
 
             for (LayoutBox box : itemBoxes[k]) {
@@ -3855,7 +3881,7 @@ int LayoutRoot::contentWidth(Element* item, const ComputedStyle& style, int widt
     measuring_ = wasMeasuring;
     int right = 0;
     for (const auto& b : trial) {
-        if (b.anchor) continue; // marks a position; has no size of its own
+        if (b.anchor || b.geometryOnly) continue; // marks a position or a border box; no content of its own
         // Content has a natural width. A background box, when laid out
         // wide, just spans whatever width it was given, so it says nothing
         // about fit; laid out narrow, it's only as wide as it must be.
@@ -3972,7 +3998,7 @@ void LayoutRoot::placeFloat(const FloatItem& item, int cbX, int cbW, int y) {
     std::vector<LayoutBox> laid = layoutItemDetached(item.el, width, s, height);
     if (sizesItself) {
         int right = 0;
-        for (const auto& b : laid) if (!b.anchor) right = std::max(right, b.x + b.width);
+        for (const auto& b : laid) if (!b.anchor && !b.geometryOnly) right = std::max(right, b.x + b.width);
         if (replaced) { // layoutImage/layoutControl leave horizontal margins out
             for (auto& b : laid) b.x += s.marginLeft;
             right += s.marginLeft;
@@ -4290,7 +4316,7 @@ std::unique_ptr<LayoutRoot::TableModel> LayoutRoot::buildTable(Element* table, c
     auto rightEdge = [](const std::vector<LayoutBox>& laid, const TableCell& c, bool narrow) {
         int right = 0;
         for (const auto& b : laid) {
-            if (b.anchor) continue; // marks a position; has no size of its own
+            if (b.anchor || b.geometryOnly) continue; // marks a position or a border box; no content of its own
             bool text = !b.text.empty() && b.control == LayoutBox::NoControl;
             bool content = text || !b.imageSrc.empty() || b.control != LayoutBox::NoControl;
             if (!content) {
@@ -4460,7 +4486,9 @@ void LayoutRoot::layoutTable(Element* el, int x, int& y, int contentWidth, const
         bool first = true;
         for (LayoutBox& b : laid[i].first) {
             // layoutBlockChild puts a cell's own background box first.
-            bool own = first && b.el == c.el && b.text.empty() && b.imageSrc.empty() && b.control == LayoutBox::NoControl;
+            // Its border box (geometryOnly) spans the row the same way.
+            bool own = (first && b.el == c.el && b.text.empty() && b.imageSrc.empty() && b.control == LayoutBox::NoControl) ||
+                       (b.geometryOnly && b.el == c.el);
             first = false;
             if (own) b.height = height;
             moveBox(b, colX[c.col], rowY[c.row] + (own ? 0 : shift));
@@ -4469,4 +4497,178 @@ void LayoutRoot::layoutTable(Element* el, int x, int& y, int contentWidth, const
     }
 
     y = rowY[numRows - 1] + rowH[numRows - 1] + t.edgeY;
+}
+
+// --- Styles for scripts (getComputedStyle) ------------------------------------
+
+const LayoutRoot::Described& LayoutRoot::describe(Element* el) {
+    auto found = described_.find(el);
+    if (found != described_.end()) return found->second;
+
+    // What layout would have passed down: the parent's font size, paint and
+    // content width (from its border box, when it has one).
+    int fontSize = 14, width = viewportWidth - 20;
+    bool hidden = false;
+    TextPaint paint;
+    if (el->parent) {
+        const Described& p = describe(el->parent);
+        fontSize = p.style.fontSize;
+        width = p.contentWidth;
+        hidden = p.style.visuallyHidden;
+        paint = p.style.paint;
+    }
+    if (el == rootNode) fontSize = 14; // <html>'s font size doesn't reach <body> (see layout())
+
+    std::vector<Element*> chain;
+    for (Element* a = el->parent; a; a = a->parent) chain.push_back(a);
+    std::reverse(chain.begin(), chain.end());
+    std::vector<Element*> savedStack = std::move(ancestorStack);
+    ancestorStack = std::move(chain);
+    const bool savedMeasuring = measuring_;
+    const int savedHeight = containingHeight_;
+    measuring_ = false;
+    containingHeight_ = -1;
+    ComputedStyle s = computeStyle(el, fontSize, width, hidden, paint);
+    measuring_ = savedMeasuring;
+    containingHeight_ = savedHeight;
+    ancestorStack = std::move(savedStack);
+
+    int contentWidth = width;
+    auto r = elementRects.find(el);
+    if (r != elementRects.end())
+        contentWidth = std::max(r->second.width - s.paddingLeft - s.paddingRight - 2 * s.borderWidth, 0);
+    return described_.emplace(el, Described{ std::move(s), contentWidth }).first->second;
+}
+
+std::vector<std::pair<std::wstring, std::wstring>> LayoutRoot::computedStyleOf(Element* el, const ElementRect* rect) {
+    const ComputedStyle& s = describe(el).style;
+    std::vector<std::pair<std::wstring, std::wstring>> out;
+    auto add = [&](const wchar_t* name, std::wstring value) { out.emplace_back(name, std::move(value)); };
+    auto num = [](double v) {
+        wchar_t buf[32];
+        swprintf(buf, 32, L"%g", std::round(v * 1000) / 1000);
+        return std::wstring(buf);
+    };
+    auto px = [&](double v) { return num(v) + L"px"; };
+    auto rgb = [&](const std::wstring& css, const std::wstring& fallback) {
+        Color c;
+        if (!tryParseColor(css.empty() ? fallback : css, c) && !tryParseColor(fallback, c)) c = { 0, 0, 0, 1 };
+        std::wstring channels = std::to_wstring(std::lround(c.r * 255)) + L", " + std::to_wstring(std::lround(c.g * 255)) +
+                                L", " + std::to_wstring(std::lround(c.b * 255));
+        return c.a >= 1 ? L"rgb(" + channels + L")" : L"rgba(" + channels + L", " + num(c.a) + L")";
+    };
+    auto len = [&](const Len& l) {
+        if (l.isAuto) return std::wstring(L"auto");
+        return l.percent ? num(l.value) + L"%" : px(l.value);
+    };
+    const TextPaint& p = s.paint;
+    const std::wstring color = rgb(p.color, L"#000000");
+
+    static const wchar_t* const kDisplay[] = { L"block", L"inline", L"none", L"grid", L"flex", L"table",
+        L"table-row-group", L"table-header-group", L"table-footer-group", L"table-row", L"table-cell", L"table-caption" };
+    std::wstring display = kDisplay[(int)s.display];
+    if (s.display == Display::Block && s.listItem) display = L"list-item";
+    else if (s.display == Display::Block && s.flowRoot) display = L"flow-root";
+    add(L"display", display);
+    static const wchar_t* const kPosition[] = { L"static", L"relative", L"absolute", L"fixed", L"sticky" };
+    add(L"position", kPosition[(int)s.position]);
+    add(L"float", s.floatSide == ComputedStyle::Float::Left ? L"left" : s.floatSide == ComputedStyle::Float::Right ? L"right" : L"none");
+    static const wchar_t* const kClear[] = { L"none", L"left", L"right", L"both" };
+    add(L"clear", kClear[(int)s.clear]);
+    add(L"visibility", s.visibilityHidden ? L"hidden" : L"visible");
+    add(L"opacity", num(s.opacity));
+    add(L"z-index", s.zAuto ? L"auto" : std::to_wstring(s.zIndex));
+    add(L"top", len(s.top));
+    add(L"right", len(s.right));
+    add(L"bottom", len(s.bottom));
+    add(L"left", len(s.left));
+
+    // Text.
+    add(L"color", color);
+    add(L"font-size", px(s.fontSize));
+    add(L"font-weight", p.bold ? L"700" : L"400");
+    add(L"font-style", p.italic ? L"italic" : L"normal");
+    add(L"font-family", p.family ? L"\"" + *p.family + L"\"" : L"\"Segoe UI\"");
+    add(L"line-height", p.lineHeightPx >= 0 ? px(p.lineHeightPx) : p.lineHeight >= 0 ? px(p.lineHeight * s.fontSize) : L"normal");
+    add(L"text-align", p.align == TextAlign::Center ? L"center" : p.align == TextAlign::Right ? L"right" : L"start");
+    std::wstring decoration = p.underline && p.lineThrough ? L"underline line-through" : p.underline ? L"underline"
+                            : p.lineThrough ? L"line-through" : L"none";
+    add(L"text-decoration-line", decoration);
+    add(L"text-decoration", decoration + L" solid " + color);
+    static const wchar_t* const kTransform[] = { L"none", L"uppercase", L"lowercase", L"capitalize" };
+    add(L"text-transform", kTransform[(int)p.transform]);
+    static const wchar_t* const kWhiteSpace[] = { L"normal", L"nowrap", L"pre", L"pre-wrap", L"pre-line" };
+    add(L"white-space", kWhiteSpace[(int)p.whiteSpace]);
+    static const wchar_t* const kListStyle[] = { L"disc", L"circle", L"square", L"decimal", L"decimal-leading-zero",
+        L"lower-alpha", L"upper-alpha", L"lower-roman", L"upper-roman", L"lower-greek", L"", L"none" };
+    add(L"list-style-type", p.listType == ListStyle::String ? L"\"" + p.listString + L"\"" : std::wstring(kListStyle[(int)p.listType]));
+    add(L"list-style-position", p.listInside ? L"inside" : L"outside");
+
+    // Box. width/height are the used size (content box, or border box with
+    // box-sizing: border-box); "auto" for an inline element or no box.
+    add(L"box-sizing", s.boxSizing == BoxSizing::BorderBox ? L"border-box" : L"content-box");
+    const int chromeX = s.paddingLeft + s.paddingRight + 2 * s.borderWidth;
+    const int chromeY = s.paddingTop + s.paddingBottom + 2 * s.borderWidth;
+    const bool sized = rect && s.display != Display::Inline && s.display != Display::None;
+    const bool borderBox = s.boxSizing == BoxSizing::BorderBox;
+    add(L"width", sized ? px(borderBox ? rect->width : std::max(rect->width - chromeX, 0)) : L"auto");
+    add(L"height", sized ? px(borderBox ? rect->height : std::max(rect->height - chromeY, 0)) : L"auto");
+    add(L"min-width", s.minWidth >= 0 ? px(s.minWidth) : L"0px");
+    add(L"min-height", s.minHeight >= 0 ? px(s.minHeight) : L"0px");
+    add(L"max-width", s.maxWidth >= 0 ? px(s.maxWidth) : L"none");
+    add(L"max-height", s.maxHeight >= 0 ? px(s.maxHeight) : L"none");
+    add(L"margin-top", px(s.marginTop));
+    add(L"margin-right", px(s.marginRight));
+    add(L"margin-bottom", px(s.marginBottom));
+    add(L"margin-left", px(s.marginLeft));
+    add(L"padding-top", px(s.paddingTop));
+    add(L"padding-right", px(s.paddingRight));
+    add(L"padding-bottom", px(s.paddingBottom));
+    add(L"padding-left", px(s.paddingLeft));
+    const std::wstring borderColor = rgb(s.borderColor, p.color.empty() ? L"#000000" : p.color);
+    for (const wchar_t* side : { L"top", L"right", L"bottom", L"left" }) {
+        std::wstring base = std::wstring(L"border-") + side;
+        out.emplace_back(base + L"-width", px(s.borderWidth));
+        out.emplace_back(base + L"-style", s.borderWidth > 0 ? L"solid" : L"none");
+        out.emplace_back(base + L"-color", borderColor);
+    }
+    static const wchar_t* const kCorner[] = { L"border-top-left-radius", L"border-top-right-radius",
+                                              L"border-bottom-right-radius", L"border-bottom-left-radius" };
+    for (int i = 0; i < 4; i++) add(kCorner[i], s.radius[i].percent ? num(s.radius[i].value) + L"%" : px(s.radius[i].value));
+    add(L"background-color", rgb(s.background, L"transparent"));
+    std::wstring image = L"none";
+    if (!s.backgrounds.empty() && !s.backgrounds[0].image.empty()) image = L"url(\"" + s.backgrounds[0].image + L"\")";
+    else if (!s.backgrounds.empty() && s.backgrounds[0].gradient) image = L"linear-gradient(rgba(0, 0, 0, 0), rgba(0, 0, 0, 0))";
+    add(L"background-image", image);
+    add(L"overflow-x", s.clipX ? L"hidden" : L"visible");
+    add(L"overflow-y", s.clipY ? L"hidden" : L"visible");
+    add(L"overflow", s.clipX == s.clipY ? (s.clipX ? L"hidden" : L"visible") : (s.clipX ? L"hidden visible" : L"visible hidden"));
+
+    // Flex, grid and tables.
+    add(L"flex-direction", s.flexDirection == FlexDirection::Column ? L"column" : L"row");
+    static const wchar_t* const kWrap[] = { L"nowrap", L"wrap", L"wrap-reverse" };
+    add(L"flex-wrap", kWrap[(int)s.flexWrap]);
+    static const wchar_t* const kJustify[] = { L"normal", L"center", L"flex-end", L"space-between", L"space-around" };
+    add(L"justify-content", kJustify[(int)s.justifyContent]);
+    static const wchar_t* const kAlign[] = { L"normal", L"flex-start", L"center", L"flex-end" };
+    add(L"align-items", kAlign[(int)s.alignItems]);
+    add(L"flex-grow", num(s.flexGrow));
+    add(L"flex-shrink", num(s.flexShrink));
+    add(L"flex-basis", s.flexBasis >= 0 ? px(s.flexBasis) : L"auto");
+    const std::wstring rowGap = s.rowGap ? px(s.rowGap) : L"normal", columnGap = s.columnGap ? px(s.columnGap) : L"normal";
+    add(L"row-gap", rowGap);
+    add(L"column-gap", columnGap);
+    add(L"gap", rowGap == columnGap ? rowGap : rowGap + L" " + columnGap);
+    static const wchar_t* const kVAlign[] = { L"baseline", L"top", L"middle", L"bottom" };
+    add(L"vertical-align", kVAlign[(int)s.verticalAlign]);
+    add(L"border-collapse", s.borderCollapse ? L"collapse" : L"separate");
+    add(L"cursor", L"auto");
+    add(L"pointer-events", L"auto");
+
+    // Custom properties in effect, nearest definition first.
+    std::set<std::wstring> seen;
+    for (const CSSVars* v = p.vars.get(); v; v = v->parent.get())
+        for (const auto& [name, value] : v->own)
+            if (seen.insert(name).second) out.emplace_back(name, value);
+    return out;
 }

@@ -9,6 +9,7 @@
 #include "DevConsole.h"
 #include <windows.h>
 #include <algorithm>
+#include <climits>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -296,6 +297,29 @@ void Engine::beginScripts() {
     domState.viewportWidth = layoutRoot.viewportWidth; // innerWidth/matchMedia, from the first script on
     domState.viewportHeight = viewHeight();
     domState.pixelRatio = zoom_;
+    pageLaidOut_ = false; // this page's layout hasn't run yet (layoutForScript)
+    // Geometry, computed style and scrolling for scripts (see PageGeometry).
+    domState.geometry.elementRect = [this](Element* el, double& x, double& y, double& w, double& h) {
+        return scriptElementRect(el, x, y, w, h);
+    };
+    domState.geometry.computedStyle = [this](Element* el) {
+        layoutForScript();
+        auto r = layoutRoot.elementRects.find(el);
+        return layoutRoot.computedStyleOf(el, r != layoutRoot.elementRects.end() ? &r->second : nullptr);
+    };
+    domState.geometry.scrollInfo = [this](int& sx, int& sy, int& w, int& h) {
+        layoutForScript();
+        int right = layoutRoot.viewportWidth;
+        for (const auto& b : layoutRoot.boxes) if (!b.fixed) right = std::max(right, b.x + b.width);
+        sx = 0;
+        sy = scrollY;
+        w = right;
+        h = std::max(documentHeight, viewHeight());
+    };
+    domState.geometry.scrollTo = [this](int, int y) {
+        layoutForScript(); // so the page's full height is known
+        scrollY = std::clamp(y, 0, maxScroll()); // no horizontal scrolling
+    };
     consoleLog().clear(); // a new page starts with an empty console, as in browsers
     jsEngine.reset();
     jsEngine = std::make_unique<JSEngine>(); // fresh realm per page
@@ -477,6 +501,7 @@ void Engine::pollResources() {
                                  std::make_move_iterator(extra.begin()),
                                  std::make_move_iterator(extra.end()));
         domState.domDirty = true;
+        domState.changeCount++; // new rules: the layout no longer reflects the page
     }
     advanceScripts();
 }
@@ -640,6 +665,9 @@ void Engine::doLayout() {
     // relayout, loosely matching how a native select popup also closes on
     // scroll/resize in a real browser.
     openSelect = nullptr;
+    layoutChangeCount_ = styleChangeCount_ = domState.changeCount; // what this layout reflects (layoutForScript)
+    pageLaidOut_ = true;
+    layoutGeneration_++;
 
     auto layoutStart = std::chrono::steady_clock::now();
     layoutRoot.boxes.clear();
@@ -722,6 +750,8 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     // fires resize (and matchMedia change events) here, with the other
     // callbacks, not from inside layout.
     if (jsEngine) setViewport(jsEngine->context(), layoutRoot.viewportWidth, viewHeight(), zoom_);
+    // Likewise a scroll (by the user or a script) fires "scroll".
+    if (jsEngine) setScrollPosition(jsEngine->context(), scrollY);
 
     // postMessage deliveries (window and MessageChannel) - tasks a page
     // queues to run "as soon as possible", without setTimeout's one-frame
@@ -760,7 +790,9 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
             std::wstring v = it == focusedEl->attrs.end() ? L"" : it->second;
             if (v != editor.text()) editor.setText(v);
         }
-        doLayout();
+        // Unless a script already forced a layout since its last change
+        // (reading geometry - see layoutForScript).
+        if (domState.changeCount != layoutChangeCount_) doLayout();
     }
 
     // A width change deferred by onResize (see there): relayout once a frame
@@ -894,12 +926,85 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
 }
 
 int Engine::boxShift(const LayoutBox& b) const {
-    if (b.fixed) return scrollY;
-    if (b.sticky >= 0 && b.sticky < (int)layoutRoot.stickies.size()) {
-        const LayoutRoot::Sticky& s = layoutRoot.stickies[b.sticky];
+    return shiftFor(b.fixed, b.sticky);
+}
+
+int Engine::shiftFor(bool fixed, int sticky) const {
+    if (fixed) return scrollY;
+    if (sticky >= 0 && sticky < (int)layoutRoot.stickies.size()) {
+        const LayoutRoot::Sticky& s = layoutRoot.stickies[sticky];
         return std::clamp(scrollY + s.top - s.naturalTop, 0, std::max(s.maxShift, 0));
     }
     return 0;
+}
+
+// --- Geometry for scripts -------------------------------------------------
+
+void Engine::layoutForScript() {
+    // A script running while the page loads comes before its first layout.
+    const bool laidOut = pageLaidOut_;
+    if (laidOut && domState.changeCount == layoutChangeCount_) return; // the layout is current
+    double sinceMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lastLayoutEnd_).count();
+    if (laidOut && lastLayoutMs > 16 && sinceMs < lastLayoutMs) {
+        // Held back (see the declaration): geometry stays as it was, but
+        // styles must not be the ones from before the change.
+        if (styleChangeCount_ != domState.changeCount) {
+            layoutRoot.forgetStyles();
+            styleChangeCount_ = domState.changeCount;
+        }
+        return;
+    }
+    // domDirty stays set: render() still runs its checks for elements the
+    // script freed; it skips the relayout itself, since this one is current.
+    doLayout();
+}
+
+bool Engine::unionRect(const Element* el, int& x0, int& y0, int& x1, int& y1, int depth) {
+    auto add = [&](int x, int y, int w, int h) {
+        x0 = std::min(x0, x); y0 = std::min(y0, y);
+        x1 = std::max(x1, x + w); y1 = std::max(y1, y + h);
+    };
+    auto r = layoutRoot.elementRects.find(el);
+    if (r != layoutRoot.elementRects.end()) {
+        const auto& e = r->second;
+        add(e.x, e.y + shiftFor(e.fixed, e.sticky), e.width, e.height);
+        return true;
+    }
+    bool any = false;
+    auto own = boxesByElement_.find(el);
+    if (own != boxesByElement_.end()) {
+        for (size_t i : own->second) {
+            const LayoutBox& b = layoutRoot.boxes[i];
+            // A word is drawn 4px into its box (see layoutInlineRun).
+            const int inset = !b.text.empty() && b.control == LayoutBox::NoControl ? 4 : 0;
+            add(b.x + inset, b.y + boxShift(b), b.width, b.height);
+            any = true;
+        }
+    }
+    if (depth < 200) {
+        for (const auto& c : el->children)
+            if (c->type == Node::ELEMENT && unionRect(static_cast<const Element*>(c.get()), x0, y0, x1, y1, depth + 1)) any = true;
+    }
+    return any;
+}
+
+bool Engine::scriptElementRect(Element* el, double& x, double& y, double& w, double& h) {
+    layoutForScript();
+    if (boxIndexGeneration_ != layoutGeneration_) {
+        boxesByElement_.clear();
+        for (size_t i = 0; i < layoutRoot.boxes.size(); i++)
+            if (layoutRoot.boxes[i].el) boxesByElement_[layoutRoot.boxes[i].el].push_back(i);
+        boxIndexGeneration_ = layoutGeneration_;
+    }
+    int x0 = INT_MAX, y0 = INT_MAX, x1 = INT_MIN, y1 = INT_MIN;
+    if (!unionRect(el, x0, y0, x1, y1, 0)) return false;
+    // Document coordinates to the viewport's (fixed boxes already carry the
+    // scroll offset from shiftFor).
+    x = x0;
+    y = y0 - scrollY;
+    w = x1 - x0;
+    h = y1 - y0;
+    return true;
 }
 
 bool Engine::boxContains(const LayoutBox& b, int docX, int docY) const {

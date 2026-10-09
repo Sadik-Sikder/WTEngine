@@ -19,6 +19,7 @@
 #include <mutex>
 #include <deque>
 #include <chrono>
+#include <cmath>
 #include <thread>
 
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
@@ -257,7 +258,7 @@ static bool isFragment(const Node* n) {
 }
 
 static void markDirty(JSContext* ctx) {
-    if (DOMBindingState* s = bindingState(ctx)) s->domDirty = true;
+    if (DOMBindingState* s = bindingState(ctx)) { s->domDirty = true; s->changeCount++; }
 }
 
 // Empties `el`. Its old child elements no longer have it as their parent
@@ -1562,6 +1563,70 @@ static JSValue js_native_viewport(JSContext* ctx, JSValueConst, int, JSValueCons
     JS_SetPropertyUint32(ctx, arr, 3, JS_NewInt32(ctx, GetSystemMetrics(SM_CXSCREEN)));
     JS_SetPropertyUint32(ctx, arr, 4, JS_NewInt32(ctx, GetSystemMetrics(SM_CYSCREEN)));
     return arr;
+}
+
+void setScrollPosition(JSContext* ctx, int scrollY) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state) return;
+    const bool first = state->lastScrollY < 0;
+    const bool changed = scrollY != state->lastScrollY;
+    state->lastScrollY = scrollY;
+    if (!first && changed && state->documentEl) fireEvent(ctx, state->documentEl, L"scroll", true, false);
+}
+
+// --- Geometry (kBootstrapJS builds getBoundingClientRect, offset*,
+// client*, scroll*, getComputedStyle and window scrolling on these) -------
+
+// __wtRect(el) -> [x, y, width, height] in viewport coordinates, or null.
+static JSValue js_native_rect(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    DOMBindingState* state = bindingState(ctx);
+    Element* el = argc >= 1 ? unwrapElement(argv[0]) : nullptr;
+    double x, y, w, h;
+    if (!state || !el || !state->geometry.elementRect || !state->geometry.elementRect(el, x, y, w, h)) return JS_NULL;
+    JSValue arr = JS_NewArray(ctx);
+    JS_SetPropertyUint32(ctx, arr, 0, JS_NewFloat64(ctx, x));
+    JS_SetPropertyUint32(ctx, arr, 1, JS_NewFloat64(ctx, y));
+    JS_SetPropertyUint32(ctx, arr, 2, JS_NewFloat64(ctx, w));
+    JS_SetPropertyUint32(ctx, arr, 3, JS_NewFloat64(ctx, h));
+    return arr;
+}
+
+// __wtComputedStyle(el) -> [name, value, name, value, ...].
+static JSValue js_native_computedStyle(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    DOMBindingState* state = bindingState(ctx);
+    Element* el = argc >= 1 ? unwrapElement(argv[0]) : nullptr;
+    JSValue arr = JS_NewArray(ctx);
+    if (!state || !el || !state->geometry.computedStyle) return arr;
+    uint32_t i = 0;
+    for (const auto& [name, value] : state->geometry.computedStyle(el)) {
+        JS_SetPropertyUint32(ctx, arr, i++, jsStr(ctx, name));
+        JS_SetPropertyUint32(ctx, arr, i++, jsStr(ctx, value));
+    }
+    return arr;
+}
+
+// __wtScrollInfo() -> [scrollX, scrollY, page width, page height].
+static JSValue js_native_scrollInfo(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+    DOMBindingState* state = bindingState(ctx);
+    int sx = 0, sy = 0, w = 0, h = 0;
+    if (state && state->geometry.scrollInfo) state->geometry.scrollInfo(sx, sy, w, h);
+    JSValue arr = JS_NewArray(ctx);
+    JS_SetPropertyUint32(ctx, arr, 0, JS_NewInt32(ctx, sx));
+    JS_SetPropertyUint32(ctx, arr, 1, JS_NewInt32(ctx, sy));
+    JS_SetPropertyUint32(ctx, arr, 2, JS_NewInt32(ctx, w));
+    JS_SetPropertyUint32(ctx, arr, 3, JS_NewInt32(ctx, h));
+    return arr;
+}
+
+// __wtScrollTo(x, y): scrolls the page (clamped to what it can scroll).
+static JSValue js_native_scrollTo(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    DOMBindingState* state = bindingState(ctx);
+    double x = 0, y = 0;
+    if (argc >= 1) JS_ToFloat64(ctx, &x, argv[0]);
+    if (argc >= 2) JS_ToFloat64(ctx, &y, argv[1]);
+    if (state && state->geometry.scrollTo && std::isfinite(x) && std::isfinite(y))
+        state->geometry.scrollTo((int)std::lround(x), (int)std::lround(y));
+    return JS_UNDEFINED;
 }
 
 static double performanceNow(const TimerStorage& ts) {
@@ -3835,6 +3900,214 @@ static const char kBootstrapJS[] = R"JS(
     },
   });
 })();
+
+// Geometry, scrolling and computed style, from the layout (PageGeometry,
+// through __wtRect, __wtScrollInfo, __wtScrollTo and __wtComputedStyle).
+// Only the page scrolls - an element with overflow: auto/scroll is clipped,
+// not scrollable - so element scroll positions are 0 and scrollWidth is the
+// element's own width, except for the root (<html>/<body>), which stands
+// for the page.
+(() => {
+  const g = globalThis;
+  const nodeProto = Object.getPrototypeOf(document);
+  const def = (name, desc) => Object.defineProperty(nodeProto, name, Object.assign({ configurable: true }, desc));
+  const method = (name, fn) => def(name, { value: fn, writable: true });
+
+  class DOMRectReadOnly {
+    constructor(x = 0, y = 0, width = 0, height = 0) {
+      for (const [k, v] of [['x', x], ['y', y], ['width', width], ['height', height]])
+        Object.defineProperty(this, '_' + k, { value: Number(v), writable: true });
+    }
+    get x() { return this._x; }
+    get y() { return this._y; }
+    get width() { return this._width; }
+    get height() { return this._height; }
+    get top() { return Math.min(this._y, this._y + this._height); }
+    get bottom() { return Math.max(this._y, this._y + this._height); }
+    get left() { return Math.min(this._x, this._x + this._width); }
+    get right() { return Math.max(this._x, this._x + this._width); }
+    toJSON() {
+      const { x, y, width, height, top, right, bottom, left } = this;
+      return { x, y, width, height, top, right, bottom, left };
+    }
+    static fromRect(r) { r = r || {}; return new this(r.x, r.y, r.width, r.height); }
+  }
+  class DOMRect extends DOMRectReadOnly {
+    set x(v) { this._x = Number(v); }
+    set y(v) { this._y = Number(v); }
+    set width(v) { this._width = Number(v); }
+    set height(v) { this._height = Number(v); }
+    get x() { return this._x; }
+    get y() { return this._y; }
+    get width() { return this._width; }
+    get height() { return this._height; }
+  }
+  g.DOMRectReadOnly = DOMRectReadOnly;
+  g.DOMRect = DOMRect;
+
+  const html = () => document.documentElement;
+  // The root stands for the page: <html> always, and <body> for scroll*.
+  const isRoot = el => el === html() || el === document.body;
+  const page = () => __wtScrollInfo(); // [scrollX, scrollY, width, height]
+  // [x, y, width, height] in viewport coordinates, or null.
+  const rectOf = el => {
+    if (!el || el.nodeType !== 1) return null;
+    if (el === html()) { const [sx, sy, w, h] = page(); return [-sx, -sy, Math.max(w, innerWidth), h]; }
+    return __wtRect(el);
+  };
+  const styleOf = el => {
+    const a = __wtComputedStyle(el), m = new Map();
+    for (let i = 0; i < a.length; i += 2) m.set(a[i], a[i + 1]);
+    return m;
+  };
+  const px = v => parseFloat(v) || 0;
+
+  method('getBoundingClientRect', function () { const r = rectOf(this); return r ? new DOMRect(...r) : new DOMRect(); });
+  method('getClientRects', function () { const r = rectOf(this); return r ? [new DOMRect(...r)] : []; });
+
+  // offsetParent: the nearest positioned ancestor (or, for a static
+  // element, a td/th/table), else <body>; null for an element with no box,
+  // a fixed one, and <body>/<html> themselves.
+  def('offsetParent', {
+    get() {
+      if (this.nodeType !== 1 || isRoot(this) || !rectOf(this)) return null;
+      const own = styleOf(this).get('position');
+      if (own === 'fixed') return null;
+      for (let p = this.parentNode; p && p.nodeType === 1; p = p.parentNode) {
+        if (p === document.body) return p;
+        if (styleOf(p).get('position') !== 'static') return p;
+        if (own === 'static' && ['td', 'th', 'table'].includes(p.localName)) return p;
+      }
+      return document.body;
+    },
+  });
+  // offsetTop/Left: from the offsetParent's padding edge, or the page's
+  // top left when that's <body> (or there's none).
+  const offset = (el, i) => {
+    const r = rectOf(el);
+    if (!r) return 0;
+    const parent = el.offsetParent;
+    if (!parent || parent === document.body) return Math.round(r[i] + page()[i]);
+    const pr = rectOf(parent);
+    const border = px(styleOf(parent).get(i === 0 ? 'border-left-width' : 'border-top-width'));
+    return Math.round(r[i] - pr[i] - border);
+  };
+  def('offsetLeft', { get() { return offset(this, 0); } });
+  def('offsetTop', { get() { return offset(this, 1); } });
+  def('offsetWidth', { get() { const r = rectOf(this); return r ? Math.round(r[2]) : 0; } });
+  def('offsetHeight', { get() { const r = rectOf(this); return r ? Math.round(r[3]) : 0; } });
+
+  // client*: the padding box (inside the border) - 0 for an inline
+  // element; the viewport for <html>.
+  const client = (el, i) => {
+    if (el === html()) return i === 0 ? innerWidth : innerHeight;
+    const r = rectOf(el);
+    if (!r) return 0;
+    const s = styleOf(el);
+    if (s.get('display') === 'inline') return 0;
+    const borders = i === 0 ? px(s.get('border-left-width')) + px(s.get('border-right-width'))
+                            : px(s.get('border-top-width')) + px(s.get('border-bottom-width'));
+    return Math.max(Math.round(r[i + 2] - borders), 0);
+  };
+  def('clientWidth', { get() { return client(this, 0); } });
+  def('clientHeight', { get() { return client(this, 1); } });
+  def('clientLeft', { get() { return rectOf(this) ? Math.round(px(styleOf(this).get('border-left-width'))) : 0; } });
+  def('clientTop', { get() { return rectOf(this) ? Math.round(px(styleOf(this).get('border-top-width'))) : 0; } });
+
+  // scroll*: the page's, for the root.
+  def('scrollWidth', { get() { return isRoot(this) ? Math.max(page()[2], innerWidth) : client(this, 0); } });
+  def('scrollHeight', { get() { return isRoot(this) ? Math.max(page()[3], innerHeight) : client(this, 1); } });
+  def('scrollTop', {
+    get() { return isRoot(this) ? page()[1] : 0; },
+    set(v) { if (isRoot(this)) __wtScrollTo(page()[0], Number(v) || 0); },
+  });
+  def('scrollLeft', {
+    get() { return isRoot(this) ? page()[0] : 0; },
+    set(v) { if (isRoot(this)) __wtScrollTo(Number(v) || 0, page()[1]); },
+  });
+
+  // scrollTo(x, y) / scrollTo({ left, top, behavior }) - behavior is
+  // ignored (scrolling is always instant).
+  const target = (args, [sx, sy], relative) => {
+    let x, y;
+    if (args.length === 1 && args[0] !== null && typeof args[0] === 'object') { x = args[0].left; y = args[0].top; }
+    else { x = args[0]; y = args[1]; }
+    x = x === undefined ? (relative ? 0 : sx) : Number(x) || 0;
+    y = y === undefined ? (relative ? 0 : sy) : Number(y) || 0;
+    return relative ? [sx + x, sy + y] : [x, y];
+  };
+  const scrollTo = (...args) => __wtScrollTo(...target(args, page(), false));
+  const scrollBy = (...args) => __wtScrollTo(...target(args, page(), true));
+  g.scrollTo = g.scroll = scrollTo;
+  g.scrollBy = scrollBy;
+  for (const name of ['scrollX', 'pageXOffset']) Object.defineProperty(g, name, { configurable: true, enumerable: true, get: () => page()[0] });
+  for (const name of ['scrollY', 'pageYOffset']) Object.defineProperty(g, name, { configurable: true, enumerable: true, get: () => page()[1] });
+  method('scrollTo', function (...args) { if (isRoot(this)) scrollTo(...args); });
+  method('scroll', function (...args) { if (isRoot(this)) scrollTo(...args); });
+  method('scrollBy', function (...args) { if (isRoot(this)) scrollBy(...args); });
+  // scrollIntoView(alignToTop | { block: start|center|end|nearest }).
+  method('scrollIntoView', function (arg) {
+    const r = rectOf(this);
+    if (!r) return;
+    const block = arg === false ? 'end' : (arg && typeof arg === 'object' && arg.block) || 'start';
+    const [sx, sy] = page(), top = sy + r[1], height = r[3];
+    let y = top;
+    if (block === 'end') y = top + height - innerHeight;
+    else if (block === 'center') y = top + height / 2 - innerHeight / 2;
+    else if (block === 'nearest') {
+      if (r[1] >= 0 && r[1] + height <= innerHeight) return; // already in view
+      y = r[1] < 0 || height > innerHeight ? top : top + height - innerHeight;
+    }
+    __wtScrollTo(sx, y);
+  });
+  Object.defineProperty(document, 'scrollingElement', { configurable: true, get: () => html() });
+
+  // getComputedStyle: a read-only snapshot of the element's computed
+  // style, read as getPropertyValue('font-size'), .fontSize or ['font-size'].
+  const kebab = p => p === 'cssFloat' ? 'float' : p.replace(/[A-Z]/g, c => '-' + c.toLowerCase());
+  class CSSStyleDeclaration {
+    constructor(pairs) {
+      Object.defineProperty(this, '_map', { value: new Map() });
+      Object.defineProperty(this, '_names', { value: [] });
+      for (let i = 0; i < pairs.length; i += 2) {
+        if (!this._map.has(pairs[i])) this._names.push(pairs[i]);
+        this._map.set(pairs[i], pairs[i + 1]);
+      }
+    }
+    get length() { return this._names.length; }
+    get cssText() { return ''; }
+    item(i) { return this._names[i] || ''; }
+    getPropertyValue(name) {
+      name = String(name);
+      if (!name.startsWith('--')) name = name.toLowerCase();
+      const v = this._map.get(name);
+      return v === undefined ? '' : v;
+    }
+    getPropertyPriority() { return ''; }
+    setProperty() { throw new DOMException('These styles are computed, and therefore read-only.', 'NoModificationAllowedError'); }
+    removeProperty() { throw new DOMException('These styles are computed, and therefore read-only.', 'NoModificationAllowedError'); }
+    [Symbol.iterator]() { return this._names[Symbol.iterator](); }
+  }
+  g.CSSStyleDeclaration = CSSStyleDeclaration;
+  const proxied = decl => new Proxy(decl, {
+    get(t, p, receiver) {
+      if (typeof p !== 'string' || p in t) return Reflect.get(t, p, t);
+      if (/^\d+$/.test(p)) return t.item(Number(p));
+      return t.getPropertyValue(p.startsWith('--') ? p : kebab(p));
+    },
+    set(t, p) {
+      throw new DOMException("Failed to set a named property '" + String(p) + "' on 'CSSStyleDeclaration': These styles are computed, and therefore the '" + String(p) + "' property is read-only.", 'NoModificationAllowedError');
+    },
+  });
+  g.getComputedStyle = function getComputedStyle(el, pseudo) {
+    if (!(el instanceof Element))
+      throw new TypeError("Failed to execute 'getComputedStyle' on 'Window': parameter 1 is not of type 'Element'.");
+    const pairs = __wtComputedStyle(el);
+    // ::before/::after don't exist here: they have no content.
+    if (pseudo && /^::?(before|after|marker|placeholder)$/i.test(String(pseudo))) pairs.push('content', 'none');
+    return proxied(new CSSStyleDeclaration(pairs));
+  };
+})();
 )JS";
 
 // ---------------------------------------------------------------------
@@ -3921,6 +4194,10 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("__wtNow", 0, js_native_now),             // behind performance.now()
     JS_CFUNC_DEF("__wtNavigatorInfo", 0, js_native_navigatorInfo), // behind navigator
     JS_CFUNC_DEF("__wtViewport", 0, js_native_viewport), // behind innerWidth, matchMedia, screen
+    JS_CFUNC_DEF("__wtRect", 1, js_native_rect),                 // behind getBoundingClientRect, offset*, client*
+    JS_CFUNC_DEF("__wtComputedStyle", 1, js_native_computedStyle), // behind getComputedStyle
+    JS_CFUNC_DEF("__wtScrollInfo", 0, js_native_scrollInfo),     // behind scrollX/scrollY, scrollHeight
+    JS_CFUNC_DEF("__wtScrollTo", 2, js_native_scrollTo),         // behind scrollTo/scrollBy/scrollIntoView
     JS_CFUNC_DEF("__wtReportError", 2, js_native_reportError),
     JS_CGETSET_DEF("location", js_get_location, js_set_location),
     JS_CFUNC_DEF("addEventListener", 2, js_window_addEventListener),

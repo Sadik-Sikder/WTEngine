@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <functional>
+#include <utility>
 
 struct JSContext;
 struct Element;
@@ -35,6 +37,22 @@ struct NodeWrappers;    // opaque, same treatment again: the one JS object per w
 //    memory.
 // Owned by whoever calls installDOMBindings (Engine); installDOMBindings
 // only stores a pointer to it, so it must outlive the JSContext.
+// What scripts can ask about the laid-out page: element geometry, computed
+// style and the scroll position. Only Engine has the layout, scroll
+// position and zoom, so it fills these in (beginScripts); unset, scripts
+// get zeros.
+struct PageGeometry {
+    // The element's border box in viewport (client) coordinates - laid out
+    // afresh first if a script changed the DOM since. False if it has no
+    // box (display: none, not in the page).
+    std::function<bool(Element*, double& x, double& y, double& width, double& height)> elementRect;
+    // getComputedStyle's property/value pairs.
+    std::function<std::vector<std::pair<std::wstring, std::wstring>>(Element*)> computedStyle;
+    // The page's scroll position and full size, in CSS pixels.
+    std::function<void(int& scrollX, int& scrollY, int& width, int& height)> scrollInfo;
+    std::function<void(int x, int y)> scrollTo;
+};
+
 struct DOMBindingState {
     DOMBindingState();
     ~DOMBindingState();
@@ -45,6 +63,13 @@ struct DOMBindingState {
 
     std::vector<std::shared_ptr<Node>> detachedNodes;
     bool domDirty = false;
+    // Bumped by every change to the page that a layout must reflect (a
+    // script's DOM mutation, a stylesheet arriving). Engine compares it with
+    // the value its last layout saw, so a layout a script forced (reading
+    // geometry) isn't repeated when nothing changed since.
+    unsigned changeCount = 0;
+    PageGeometry geometry;
+    int lastScrollY = -1; // as last reported to scripts (setScrollPosition)
     std::unique_ptr<ListenerStorage> listeners;
     std::unique_ptr<TimerStorage> timers; // pending setTimeout/setInterval callbacks
     std::unique_ptr<FetchStorage> fetches; // in-flight fetch() calls - see pollFetches
@@ -139,6 +164,11 @@ bool fireSubmitEvent(JSContext* ctx, Element* form, Element* submitter);
 // the first call, re-checks every matchMedia() list (firing "change" on
 // those that flip) and fires "resize" at window. Called by Engine::doLayout.
 void setViewport(JSContext* ctx, int width, int height, float pixelRatio);
+
+// Records the scroll position scripts see; when it changed since the last
+// call (not the first), fires "scroll" at document (bubbling to window).
+// Called by Engine::render every frame.
+void setScrollPosition(JSContext* ctx, int scrollY);
 
 // Sets document.readyState ("interactive" / "complete") and fires
 // "readystatechange" at document.
