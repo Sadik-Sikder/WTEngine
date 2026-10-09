@@ -866,6 +866,7 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 
 **Project**
 - The source file list lives in two places (`WTEngine.vcxproj` and `CMakeLists.txt`); keep them in sync (§2).
+- The app icon is `resources/WTEngine.ico`, embedded by `resources/WTEngine.rc` (listed in both build files) under the name `GLFW_ICON`: Explorer shows it for the exe, and GLFW gives it to the window (title bar, taskbar, Alt+Tab) with no code. `resources/make_icon.ps1` draws it (every size from 16 to 256 px, simpler at the small ones) and writes the `.ico`; `-previewOnly` draws a preview sheet instead.
 - The window is titled "WTEngine" until the first page sets it.
 - Build artefacts (`x64/`, `build/`, `.vs/`, `*.obj`) are present in the working tree; check `.gitignore` before committing.
 

@@ -50,6 +50,7 @@ add_executable(WTEngine
     src/ResourceLoader.cpp
     src/WebStorage.cpp
     src/Svg.cpp
+    resources/WTEngine.rc # the app icon
 )
 
 target_include_directories(WTEngine PRIVATE include)

@@ -157,6 +157,11 @@
     <ClCompile Include="src\Svg.cpp" />
     <ClCompile Include="src\CookieJar.cpp" />
   </ItemGroup>
+  <!-- The app icon (see resources\WTEngine.rc). -->
+  <ItemGroup>
+    <ResourceCompile Include="resources\WTEngine.rc" />
+    <Image Include="resources\WTEngine.ico" />
+  </ItemGroup>
   <!-- The vendored quickjs-ng engine, compiled straight into this project. Mirrors the
        "qjs" target in third_party/quickjs-ng/CMakeLists.txt (only these four files, C11 with
        MSVC's C11 atomics). CMake builds the same thing as a static library instead. -->

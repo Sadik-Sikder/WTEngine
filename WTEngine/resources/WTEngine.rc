@@ -1,0 +1,8 @@
+// Windows resources for WTEngine.exe.
+//
+// GLFW_ICON is the app icon. Explorer shows an exe's first icon, and GLFW
+// gives its windows the icon resource with this name (title bar, taskbar,
+// Alt+Tab) - so no code sets it. resources/make_icon.ps1 regenerates
+// WTEngine.ico (all its sizes); -previewOnly draws a preview sheet instead.
+
+GLFW_ICON ICON "WTEngine.ico"
