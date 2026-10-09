@@ -197,6 +197,12 @@ private:
     Renderer* measurer = nullptr;
     std::wstring pageBaseUrl; // current page's URL, for resolving <img src> against
     int lastImageGeneration = -1; // renderer's imageGeneration() as of the last layout
+    // An image layout sized by a guess has arrived since the last layout;
+    // render() re-lays-out for it once enough time has passed since the
+    // last layout (lastLayoutEnd_), so images streaming in are taken in
+    // batches rather than one full layout each.
+    bool imageRelayoutPending_ = false;
+    std::chrono::steady_clock::time_point lastLayoutEnd_;
 
     // A fresh JS realm per page (recreated on every loadHTML(), matching
     // how navigation already discards and re-parses the whole DOM).

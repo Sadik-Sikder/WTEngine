@@ -647,6 +647,8 @@ void Engine::doLayout() {
     layoutRoot.measureScale = measurer ? zoom_ : -1.0f; // text widths depend on these (measurePageText)
     layoutRoot.layout();
     lastLayoutMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - layoutStart).count();
+    lastLayoutEnd_ = std::chrono::steady_clock::now();
+    imageRelayoutPending_ = false; // this layout used every image that's arrived
 
     // Calculate document height. A fixed box doesn't scroll with the page,
     // so it doesn't make it longer; clipped content only counts as far as
@@ -689,13 +691,27 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     // Renderer should clear framebuffer first:
     // glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    // A background image load finished since the last layout: an <img> box
-    // sized from a guess (no width/height attrs, natural size unknown at
-    // the time) may need to be resized now that the real size is known.
+    // An image load finished since the last layout. Only an <img> the last
+    // layout had to size by a guess (its size depends on the image, and it
+    // wasn't there yet) changes the layout by arriving; any other - sized by
+    // CSS or width/height, a background image, a failed load - just gets
+    // painted. A page with hundreds of images would otherwise re-lay-out
+    // for each one.
     int gen = renderer.imageGeneration();
     if (gen != lastImageGeneration) {
         lastImageGeneration = gen;
-        doLayout();
+        for (const auto& src : layoutRoot.imagesSizedByGuess) {
+            int w, h;
+            if (layoutRoot.loadImage && layoutRoot.loadImage(src, w, h)) { imageRelayoutPending_ = true; break; }
+        }
+    }
+    // Those that do are taken in batches: a relayout no sooner than 100 ms,
+    // or twice what the last layout took, after the last one - so while
+    // images stream in, most of each second is left for input and painting
+    // (one layout picks up every image that arrived meanwhile).
+    if (imageRelayoutPending_) {
+        double sinceMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lastLayoutEnd_).count();
+        if (sinceMs >= std::max(100.0, 2 * lastLayoutMs)) doLayout();
     }
 
     // A setTimeout/setInterval callback may mutate the DOM below (sets

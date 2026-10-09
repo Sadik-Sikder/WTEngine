@@ -532,10 +532,10 @@ Each stylesheet's own rules come back from `parseStylesheet` numbered from 0 (it
 ### `doLayout()`
 Clears any open dropdown, runs `layoutRoot.layout()`, recomputes `documentHeight` (max box bottom), and clamps `scrollY`.
 
-**When a re-layout happens:** page load, window resize, `setRenderer`, `setTopInset`, when a background image finishes loading (`imageGeneration` changed), and when JS mutated the DOM (`domDirty`).
+**When a re-layout happens:** page load, window resize, `setRenderer`, `setTopInset`, when an `<img>` whose size layout had to guess finishes loading (see below), and when JS mutated the DOM (`domDirty`).
 
 ### `render(renderer, time)` — per frame
-1. If `renderer.imageGeneration()` changed → re-layout (so image-sized boxes get their real size).
+1. If `renderer.imageGeneration()` changed and one of `LayoutRoot::imagesSizedByGuess` - the `<img>`s the last layout sized by a guess because their size depends on the image (no CSS size or `width`/`height` for both sides) and it hadn't arrived - is now ready, a re-layout is due. It runs once at least 100 ms, or twice the last layout's time, has passed since the last layout (`imageRelayoutPending_`, `lastLayoutEnd_`), so images streaming in are taken in batches. Any other image (sized by CSS or attributes, a background image, a failed load) is just painted. On CNN's home page this took image re-layouts from 55 to 3, with an identical final layout.
 2. `fireDueTimers` (JS `setTimeout`/`setInterval`).
 3. If `domDirty` → clear it and re-layout.
 4. For each box: convert to screen space (`screenY = b.y − scrollY + topInset`), cull if off-screen, then
@@ -802,9 +802,9 @@ layout/draw asks for URL ──► getOrCreateImageTexture ──► reserve slo
         main thread, start of next beginFrame(): drainPendingImageUploads
             → glTexImage2D (Ready) or Failed;  imageGen++
                                                                │
-        Engine::render sees imageGeneration changed → doLayout()
+        Engine::render sees imageGeneration changed → doLayout(), if an image layout sized by a guess is now ready (batched)
 ```
-Only the main thread makes GL calls. A `Failed` image is not retried. While an image loads, `drawImage` draws nothing and layout uses the 200×150 placeholder (or the `width`/`height` attributes); when it finishes, the page re-lays-out to the real size. Any WIC format works (PNG, JPEG, GIF first frame, BMP, TIFF, ICO, and WebP/HEIC/AVIF/JPEG XL where their Windows extensions are installed). Textures get mipmaps when OpenGL is 1.4+ (`supportsAutoMipmaps`), so images drawn smaller than their pixels stay smooth. There is no `srcset`. (CSS `background-image` is drawn by `Engine::paintBackgroundLayers` - §8.)
+Only the main thread makes GL calls. A `Failed` image is not retried. While an image loads, `drawImage` draws nothing and layout uses the 200×150 placeholder (or the `width`/`height` attributes); when it finishes, the page re-lays-out to the real size - only if that size wasn't already fixed by CSS or the attributes (see When a re-layout happens). Any WIC format works (PNG, JPEG, GIF first frame, BMP, TIFF, ICO, and WebP/HEIC/AVIF/JPEG XL where their Windows extensions are installed). Textures get mipmaps when OpenGL is 1.4+ (`supportsAutoMipmaps`), so images drawn smaller than their pixels stay smooth. There is no `srcset`. (CSS `background-image` is drawn by `Engine::paintBackgroundLayers` - §8.)
 
 ### SVG (`Svg.h`/`.cpp`)
 - **Files** (`<img src="x.svg">`, or an SVG `data:` URI): the decode thread sniffs the bytes (`looksLikeSvg`) and draws them with Direct2D's SVG renderer (`ID2D1DeviceContext5`, Windows 10 1703+) into a WIC bitmap (`rasterizeSvg`). The intrinsic size comes from the root's `width`/`height`/`viewBox` (`svgIntrinsicSize`); it's rasterized at 2× (4× for icons up to 64px, capped at 4096px a side) so it stays sharp when shown larger or zoomed, and `ImageTexture` keeps the intrinsic size for layout. Pixels are converted from premultiplied BGRA to straight RGBA, and colour is bled into fully transparent pixels so filtering doesn't darken edges.

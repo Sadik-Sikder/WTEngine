@@ -5,6 +5,7 @@
 #include <memory>
 #include <functional>
 #include <map>
+#include <unordered_set>
 #include <climits>
 #include "DOM.h"
 #include "CSS.h"
@@ -194,6 +195,11 @@ struct LayoutRoot {
     // outH). Used to size a box that doesn't give explicit width/height.
     // Returns false if unset or the fetch/decode fails.
     std::function<bool(const std::wstring& src, int& outW, int& outH)> loadImage;
+    // The <img> sources the last layout() had to size by a guess (200x150, or
+    // from just one of width/height) because loadImage didn't have them yet
+    // and CSS or the attributes didn't fix both sides. Only one of these
+    // arriving changes the layout; Engine re-lays-out for those alone.
+    std::unordered_set<std::wstring> imagesSizedByGuess;
 
     void layout(); // compute boxes from rootNode
 private:

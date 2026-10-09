@@ -2244,6 +2244,9 @@ LayoutBox LayoutRoot::makeImageBox(Element* e, int containingWidth, const Comput
         std::wstring wAttr = getAttr(e, L"width", L""), hAttr = getAttr(e, L"height", L"");
         if (width < 0 && !wAttr.empty()) width = parseFontSize(wAttr, defaultWidth);
         if (height < 0 && !hAttr.empty()) height = parseFontSize(hAttr, defaultHeight);
+        // Its size depends on the image, which hasn't arrived: it gets a
+        // guess now, and its arrival means a relayout (imagesSizedByGuess).
+        if (!haveNatural && !src.empty() && (width < 0 || height < 0)) imagesSizedByGuess.insert(src);
     }
     if (haveNatural && naturalW > 0 && naturalH > 0) {
         if (width < 0 && height < 0) { width = naturalW; height = naturalH; }
@@ -2387,6 +2390,7 @@ void LayoutRoot::layout() {
     listOrdinals_.clear();
     anonymousItems_.clear();
     styleCache_.clear(); // styles hold for one pass only - the DOM and rules can change between passes
+    imagesSizedByGuess.clear();
     insideMarker_.clear();
     insideMarkerFor_ = nullptr;
     rebuildRuleIndex();
