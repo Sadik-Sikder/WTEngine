@@ -72,6 +72,12 @@ struct App {
     GLFWcursor* ibeamCursor = nullptr;
     GLFWcursor* shownCursor = nullptr; // what's set now; nullptr = default arrow
     bool drawing = false;              // inside drawFrame - see there
+    // Fullscreen (Engine::takeFullscreenChange): the window fills its
+    // monitor without a frame, the address bar, find bar and console
+    // hidden. Where it was before, to go back to.
+    bool fullscreen = false;
+    bool wasMaximized = false;
+    int savedX = 0, savedY = 0, savedW = 0, savedH = 0;
 };
 
 static std::string toUtf8(const std::wstring& w) {
@@ -255,6 +261,38 @@ static void stepZoom(App& app, int direction) {
     app.engine->setZoom(kZoomLevels[next]);
 }
 
+// Fullscreen on: a frameless window covering the monitor it's on (Windows
+// treats that as fullscreen and puts it over the taskbar), the page from
+// the top edge. Off: the frame, size and place it had, maximized again if
+// it was.
+static void setWindowFullscreen(App& app, bool on) {
+    if (on == app.fullscreen) return;
+    GLFWwindow* window = app.window;
+    if (on) {
+        app.wasMaximized = glfwGetWindowAttrib(window, GLFW_MAXIMIZED) == GLFW_TRUE;
+        if (app.wasMaximized) glfwRestoreWindow(window);
+        glfwGetWindowPos(window, &app.savedX, &app.savedY);
+        glfwGetWindowSize(window, &app.savedW, &app.savedH);
+        MONITORINFO mi{ sizeof(mi) };
+        GetMonitorInfoW(MonitorFromWindow(glfwGetWin32Window(window), MONITOR_DEFAULTTONEAREST), &mi);
+        glfwSetWindowAttrib(window, GLFW_DECORATED, GLFW_FALSE);
+        glfwSetWindowPos(window, mi.rcMonitor.left, mi.rcMonitor.top);
+        // One pixel taller than the monitor: a window exactly covering it
+        // makes the GL driver switch to exclusive fullscreen, which screen
+        // capture, Alt+Tab and notifications don't play well with.
+        glfwSetWindowSize(window, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top + 1);
+        app.engine->setTopInset(0);
+    }
+    else {
+        glfwSetWindowAttrib(window, GLFW_DECORATED, GLFW_TRUE);
+        glfwSetWindowPos(window, app.savedX, app.savedY);
+        glfwSetWindowSize(window, app.savedW, app.savedH);
+        if (app.wasMaximized) glfwMaximizeWindow(window);
+        app.engine->setTopInset(AddressBar::kHeight);
+    }
+    app.fullscreen = on;
+}
+
 // Cursor position in framebuffer pixels (matches the engine's coordinate space).
 static void cursorInFramebuffer(GLFWwindow* window, int& x, int& y) {
     double cx, cy;
@@ -272,6 +310,7 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
     App* app = static_cast<App*>(glfwGetWindowUserPointer(window));
     if (action == GLFW_RELEASE && button == GLFW_MOUSE_BUTTON_LEFT) {
         app->engine->endScrollbarDrag();
+        app->engine->endMediaDrag();
         return;
     }
     if (action != GLFW_PRESS) return;
@@ -284,8 +323,9 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
     int x, y;
     cursorInFramebuffer(window, x, y);
 
-    // Click on the address bar: Back / Forward / Reload buttons, or focus the field
-    if (y < AddressBar::kHeight) {
+    // Click on the address bar: Back / Forward / Reload buttons, or focus
+    // the field. (In fullscreen there's only the page, here and below.)
+    if (y < AddressBar::kHeight && !app->fullscreen) {
         switch (app->bar.navButtonAt(x, y)) {
         case AddressBar::NavButton::Back:    app->pendingHistory = -1; return;
         case AddressBar::NavButton::Forward: app->pendingHistory = 1; return;
@@ -311,7 +351,7 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
     // Click on the find bar: its buttons, or its search field
     int fbW, fbH;
     glfwGetFramebufferSize(window, &fbW, &fbH);
-    if (app->find.contains(x, y, fbW)) {
+    if (app->find.contains(x, y, fbW) && !app->fullscreen) {
         app->engine->blurInput();
         app->console.blur();
         applyFindAction(*app, app->find.onClick(x, y, fbW, *app->renderer, glfwGetTime()));
@@ -320,7 +360,7 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
     app->find.blur(); // stays open, with its highlights, until closed
 
     // Click on the developer console: its buttons, or its input line
-    if (app->console.contains(y, fbH)) {
+    if (app->console.contains(y, fbH) && !app->fullscreen) {
         app->engine->blurInput();
         app->console.onClick(x, y, fbW, fbH, *app->renderer, glfwGetTime());
         return;
@@ -510,6 +550,13 @@ static void onKey(GLFWwindow* window, int key, int scancode, int action, int mod
         return;
     }
 
+    // Esc leaves fullscreen before anything else (the page doesn't see it,
+    // as in browsers).
+    if (key == GLFW_KEY_ESCAPE && engine.fullscreen()) {
+        if (action == GLFW_PRESS) engine.exitFullscreen();
+        return;
+    }
+
     // Alt+Left / Alt+Right: back / forward (works even while typing in a field)
     if ((mods & GLFW_MOD_ALT) && (key == GLFW_KEY_LEFT || key == GLFW_KEY_RIGHT)) {
         app->pendingHistory = key == GLFW_KEY_LEFT ? -1 : 1;
@@ -690,7 +737,7 @@ static void onScroll(GLFWwindow* window, double, double yoffset) {
     glfwGetFramebufferSize(window, &fbW, &fbH);
     bool ctrl = glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
                 glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
-    if (app->console.contains(y, fbH)) app->console.onScroll(yoffset); // wheel over the console scrolls its log
+    if (app->console.contains(y, fbH) && !app->fullscreen) app->console.onScroll(yoffset); // wheel over the console scrolls its log
     else if (ctrl) stepZoom(*app, yoffset > 0 ? 1 : -1);               // Ctrl+wheel zooms, as in browsers
     else app->engine->scroll(static_cast<int>(-yoffset * 40));
 }
@@ -720,27 +767,32 @@ static void drawFrame(App& app) {
     glClear(GL_COLOR_BUFFER_BIT);
 
     engine.onResize(width, height);
-    engine.setBottomInset(app.console.height(height)); // the page scrolls within what the console leaves
+    // The page scrolls within what the console leaves (none in fullscreen).
+    engine.setBottomInset(app.fullscreen ? 0 : app.console.height(height));
     renderer.beginFrame(width, height, 0);
     engine.render(renderer, glfwGetTime());
     updateWindowTitle(app);
-    app.bar.setNavEnabled(app.history.canGoBack(), app.history.canGoForward(), app.history.current() != nullptr,
-                          app.pageLoader.loading());
-    app.bar.setErrorCount(consoleLog().errorCount());
-    app.bar.setZoomPercent((int)std::lround(engine.zoom() * 100));
-    app.bar.draw(renderer, width, glfwGetTime()); // after the page so it covers overscroll
-    app.console.draw(renderer, width, height, glfwGetTime()); // likewise covers the page's bottom
-    app.find.draw(renderer, width, engine.findCurrentIndex(), engine.findMatchCount(), glfwGetTime());
+    if (!app.fullscreen) {
+        app.bar.setNavEnabled(app.history.canGoBack(), app.history.canGoForward(), app.history.current() != nullptr,
+                              app.pageLoader.loading());
+        app.bar.setErrorCount(consoleLog().errorCount());
+        app.bar.setZoomPercent((int)std::lround(engine.zoom() * 100));
+        app.bar.draw(renderer, width, glfwGetTime()); // after the page so it covers overscroll
+        app.console.draw(renderer, width, height, glfwGetTime()); // likewise covers the page's bottom
+        app.find.draw(renderer, width, engine.findCurrentIndex(), engine.findMatchCount(), glfwGetTime());
+    }
 
     // I-beam over the address bar and text fields, hand over links and
     // buttons, arrow elsewhere
     int cx, cy;
     cursorInFramebuffer(window, cx, cy);
     GLFWcursor* wanted = nullptr;
-    bool overConsole = app.console.contains(cy, height);
-    bool overFind = app.find.contains(cx, cy, width);
+    bool overBar = cy < AddressBar::kHeight && !app.fullscreen;
+    bool overConsole = app.console.contains(cy, height) && !app.fullscreen;
+    bool overFind = app.find.contains(cx, cy, width) && !app.fullscreen;
     if (engine.draggingScrollbar()) engine.dragScrollbar(cy); // follows the mouse until the button is released
-    if (cy < AddressBar::kHeight) {
+    if (engine.draggingMedia()) engine.dragMedia(cx);         // likewise a video's progress or volume knob
+    if (overBar) {
         wanted = app.bar.navButtonAt(cx, cy) != AddressBar::NavButton::None ? handCursor : ibeamCursor;
     }
     else if (overFind) {
@@ -760,7 +812,7 @@ static void drawFrame(App& app) {
         }
     }
     // Off the page (over the address bar, the find bar or the console) hovers nothing.
-    if (cy < AddressBar::kHeight || overConsole || overFind) engine.updateHover(-1, -1);
+    if (overBar || overConsole || overFind) engine.updateHover(-1, -1);
     else engine.updateHover(cx, cy);
 
     if (wanted != shownCursor) {
@@ -884,6 +936,9 @@ int wmain(int argc, wchar_t** argv) {
             navigate(app, navUrl, nullptr, navReplace ? NavigationKind::Replace : NavigationKind::Visit, app.currentUrl);
 
         applyFinishedNavigation(app); // shows a navigate()-started fetch's result once it's ready
+
+        bool fullscreenOn;
+        if (engine.takeFullscreenChange(fullscreenOn)) setWindowFullscreen(app, fullscreenOn);
 
         drawFrame(app);
         glfwPollEvents();

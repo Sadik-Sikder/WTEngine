@@ -82,6 +82,14 @@ public:
     virtual void drawGradient(float x, float y, float w, float h, const Gradient& g,
                               const float* radii = nullptr) = 0;
 
+    // Pictures the caller supplies as pixels - a video's frames. uploadPixels
+    // replaces the texture kept under `key` with `bgra` (width x height,
+    // rows top to bottom); drawPixels stretches the last one uploaded over
+    // the box (false if there's none yet); releasePixels frees it.
+    virtual void uploadPixels(const void* key, const unsigned char* bgra, int width, int height) = 0;
+    virtual bool drawPixels(const void* key, float x, float y, float w, float h, const float* radii = nullptr) = 0;
+    virtual void releasePixels(const void* key) = 0;
+
     // A box-shadow's shape: the (rounded) rectangle in `color`, its edge
     // fading out over `blur` pixels - half inside the rectangle, half outside.
     virtual void drawShadow(float x, float y, float w, float h, const float radii[4], float blur,

@@ -232,10 +232,17 @@ static const std::wstring* resolveFontFamily(const std::wstring& list, bool& rec
 // the same line as their surrounding siblings instead of starting a block
 // of its own. Everything else defaults to block, matching the engine's
 // original (pre-inline) universal-block behavior.
+// Replaced elements that are one picture, never recursed into: an <img>,
+// an inline <svg>, a <video> (its frames) and an <audio> (its controls).
+// All are sized and placed by makeImageBox.
+static bool isPictureTag(const std::wstring& tag) {
+    return tag == L"img" || tag == L"svg" || tag == L"video" || tag == L"audio";
+}
+
 static bool isInlineTag(const std::wstring& tag) {
     static const std::wstring kInline[] = {
         L"a", L"span", L"b", L"strong", L"i", L"em", L"u", L"small", L"code",
-        L"sub", L"sup", L"mark", L"label", L"abbr", L"cite", L"q", L"img", L"svg",
+        L"sub", L"sup", L"mark", L"label", L"abbr", L"cite", L"q", L"img", L"svg", L"video", L"audio",
         L"del", L"ins", L"s", L"strike", L"kbd", L"samp", L"var", L"dfn", L"tt", L"time",
         L"bdi", L"bdo", L"big", L"font", L"data", L"output", L"nobr", L"wbr"
     };
@@ -364,7 +371,7 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containin
         // out on lines of its own (InlineItem::blockItem) - the same a
         // control directly in a block gets.
         const bool control = e->tag == L"input" || e->tag == L"button" || e->tag == L"select";
-        const bool image = e->tag == L"img" || e->tag == L"svg";
+        const bool image = isPictureTag(e->tag);
         if (control || (sv.display != Display::Inline && !image)) {
             out.push_back(makeFloatItem(e, sv, true));
             continue;
@@ -373,7 +380,7 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containin
         // An image inside inline content (<a><svg>...</svg> Home</a>) sits
         // in the line like a word - never recursed into, so an <svg>'s
         // <title>/<text> can't leak in as words.
-        if (e->tag == L"img" || e->tag == L"svg") {
+        if (isPictureTag(e->tag)) {
             appendImage(e, containingWidth, sv, out);
             continue;
         }
@@ -1114,6 +1121,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyleUncached(Element* e, int inher
         sv.paddingTop = sv.paddingRight = sv.paddingBottom = sv.paddingLeft = pad;
     }
     else if (tag == L"col" || tag == L"colgroup") sv.display = Display::None; // read by buildTable for widths only
+    else if (tag == L"audio" && !e->attrs.count(L"controls")) sv.display = Display::None; // nothing to show
 
     // The rest of a browser's built-in spacing and sizes. Vertical margins
     // are in em of the element's final font size, so they're resolved once
@@ -2219,12 +2227,16 @@ void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth, c
 // of its intrinsic size), then the image's natural size - a dimension that
 // is set alone keeps the natural aspect ratio. Until a bitmap has loaded,
 // its natural size is unknown and a 200x150 placeholder stands in; an
-// SVG's comes straight from its attributes. The box comes back unplaced
-// (x/y 0): layoutImage stacks it as a block, layoutInlineRun puts it in a line.
+// SVG's comes straight from its attributes; a <video>'s from its player
+// (mediaSize). The box comes back unplaced (x/y 0): layoutImage stacks it
+// as a block, layoutInlineRun puts it in a line.
 LayoutBox LayoutRoot::makeImageBox(Element* e, int containingWidth, const ComputedStyle& style) {
-    const int defaultWidth = 200, defaultHeight = 150;
+    // A <video> with no size yet is 300x150, as in browsers; an <audio>'s
+    // controls are a 300x54 bar.
+    const bool isMedia = e->tag == L"video" || e->tag == L"audio";
+    const int defaultWidth = isMedia ? 300 : 200, defaultHeight = e->tag == L"audio" ? 54 : 150;
     bool isSvg = e->tag == L"svg";
-    std::wstring src = isSvg ? svgDataUri(e, style.paint.color) : getAttr(e, L"src", L"");
+    std::wstring src = isSvg ? svgDataUri(e, style.paint.color) : isMedia ? L"" : getAttr(e, L"src", L"");
 
     int naturalW = 0, naturalH = 0;
     bool haveNatural;
@@ -2234,6 +2246,15 @@ LayoutBox LayoutRoot::makeImageBox(Element* e, int containingWidth, const Comput
         naturalW = (int)std::lround(w);
         naturalH = (int)std::lround(h);
         haveNatural = true;
+    }
+    else if (isMedia) {
+        haveNatural = mediaSize && mediaSize(e, naturalW, naturalH);
+        // Until the video's own size is known, its poster's stands in.
+        std::wstring poster = e->tag == L"video" ? getAttr(e, L"poster", L"") : L"";
+        if (!haveNatural && !poster.empty()) {
+            haveNatural = loadImage && loadImage(poster, naturalW, naturalH);
+            if (!haveNatural) imagesSizedByGuess.insert(poster);
+        }
     }
     else {
         haveNatural = loadImage && !src.empty() && loadImage(src, naturalW, naturalH);
@@ -2273,6 +2294,7 @@ LayoutBox LayoutRoot::makeImageBox(Element* e, int containingWidth, const Comput
     box.fontSize = style.fontSize;
     box.background = style.background;
     box.imageSrc = src;
+    box.media = isMedia;
     std::copy(std::begin(style.radius), std::end(style.radius), std::begin(box.radius)); // rounded avatars etc.
     box.backgrounds = style.backgrounds;
     box.shadows = style.shadows;
@@ -2703,7 +2725,7 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
                 continue;
             }
 
-            if (e->tag == L"img" || e->tag == L"svg") {
+            if (isPictureTag(e->tag)) {
                 // Inline by default, as in CSS: it joins the text around it
                 // ("Click <img> here" stays one line). display:block puts it
                 // on its own.
@@ -3845,7 +3867,7 @@ std::vector<LayoutBox> LayoutRoot::layoutItemDetached(Element* item, int width, 
     int localY = 0;
     if (item->tag == L"input" || item->tag == L"button" || item->tag == L"select")
         layoutControl(item, 0, localY, width, style);
-    else if (item->tag == L"img" || item->tag == L"svg")
+    else if (isPictureTag(item->tag))
         layoutImage(item, 0, localY, width, style);
     else
         layoutBlockChild(item, 0, localY, width, style);
@@ -3977,7 +3999,7 @@ void LayoutRoot::placeFloat(const FloatItem& item, int cbX, int cbW, int y) {
     ComputedStyle s = item.style;
     if (s.display == Display::Inline) s.display = Display::Block; // a float is blockified
     const std::wstring& tag = item.el->tag;
-    const bool replaced = tag == L"img" || tag == L"svg" || tag == L"input" || tag == L"button" || tag == L"select";
+    const bool replaced = isPictureTag(tag) || tag == L"input" || tag == L"button" || tag == L"select";
 
     // Laid out in the context it was met in.
     std::vector<Element*> ancestors = item.ancestors;

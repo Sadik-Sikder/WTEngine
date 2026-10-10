@@ -36,6 +36,7 @@ add_executable(WTEngine
     src/CSS.cpp
     src/Engine.cpp
     src/EngineForms.cpp
+    src/EngineMedia.cpp
     src/TextEditor.cpp
     src/Fetcher.cpp
     src/HTMLParser.cpp
@@ -50,6 +51,7 @@ add_executable(WTEngine
     src/ResourceLoader.cpp
     src/WebStorage.cpp
     src/Svg.cpp
+    src/Media.cpp
     resources/WTEngine.rc # the app icon
 )
 

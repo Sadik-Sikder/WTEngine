@@ -10,6 +10,7 @@
 #include "Fetcher.h"
 #include "WebStorage.h"
 #include "CookieJar.h"
+#include "Media.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -1110,6 +1111,10 @@ static const char* const kHandlerTypes[] = {
     "click", "dblclick", "mousedown", "mouseup", "mousemove", "mouseover", "mouseout",
     "mouseenter", "mouseleave", "keydown", "keyup", "keypress", "input", "change",
     "submit", "reset", "focus", "blur", "load", "error", "scroll", "readystatechange",
+    // media (HTMLMediaElement)
+    "loadstart", "progress", "suspend", "abort", "emptied", "stalled", "play", "pause",
+    "loadedmetadata", "loadeddata", "waiting", "playing", "canplay", "canplaythrough",
+    "seeking", "seeked", "timeupdate", "ended", "ratechange", "durationchange", "volumechange",
 };
 
 static std::shared_ptr<Listener> findHandler(ListenerStorage& ls, Element* target, const std::wstring& type) {
@@ -1627,6 +1632,62 @@ static JSValue js_native_scrollTo(JSContext* ctx, JSValueConst, int argc, JSValu
     if (state && state->geometry.scrollTo && std::isfinite(x) && std::isfinite(y))
         state->geometry.scrollTo((int)std::lround(x), (int)std::lround(y));
     return JS_UNDEFINED;
+}
+
+// --- Media (kBootstrapJS builds HTMLMediaElement and Audio on these) ------
+
+// __wtMedia(el, name) -> the player's property as a number, or undefined
+// if the element has no player yet; __wtMedia(el, name, value) sets one,
+// or runs "play", "pause" or "load".
+static JSValue js_native_media(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    DOMBindingState* state = bindingState(ctx);
+    Element* el = argc >= 2 ? unwrapElement(argv[0]) : nullptr;
+    if (!state || !el) return JS_UNDEFINED;
+    const char* s = JS_ToCString(ctx, argv[1]);
+    if (!s) return JS_EXCEPTION;
+    std::string name = s;
+    JS_FreeCString(ctx, s);
+    if (argc >= 3) {
+        double v = 0;
+        if (JS_ToFloat64(ctx, &v, argv[2])) return JS_EXCEPTION;
+        if (state->media.set) state->media.set(el, name, v);
+        return JS_UNDEFINED;
+    }
+    double out = 0;
+    if (!state->media.get || !state->media.get(el, name, out)) return JS_UNDEFINED;
+    return JS_NewFloat64(ctx, out);
+}
+
+// __wtCanPlayType(type) -> "probably", "maybe" or "".
+static JSValue js_native_canPlayType(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 1) return JS_NewString(ctx, "");
+    const char* s = JS_ToCString(ctx, argv[0]);
+    if (!s) return JS_EXCEPTION;
+    std::wstring type = utf8ToWide(s);
+    JS_FreeCString(ctx, s);
+    return jsStr(ctx, mediaCanPlayType(type));
+}
+
+// __wtSetFullscreen(el): shows `el` fullscreen; null leaves fullscreen.
+static JSValue js_native_setFullscreen(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    DOMBindingState* state = bindingState(ctx);
+    Element* el = argc >= 1 ? unwrapElement(argv[0]) : nullptr;
+    if (state && state->setFullscreen) state->setFullscreen(el);
+    return JS_UNDEFINED;
+}
+
+// __wtFullscreenElement() -> the element shown fullscreen, or null.
+static JSValue js_native_fullscreenElement(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+    DOMBindingState* state = bindingState(ctx);
+    return state && state->fullscreenElement ? wrapNode(ctx, state->fullscreenElement) : JS_NULL;
+}
+
+std::shared_ptr<Node> owningNode(JSContext* ctx, Node* node) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state || !node) return {};
+    if (auto owner = owningPtr(state, node)) return owner;
+    auto it = state->wrappers->byNode.find(node);
+    return it != state->wrappers->byNode.end() ? it->second.keepAlive : std::shared_ptr<Node>();
 }
 
 static double performanceNow(const TimerStorage& ts) {
@@ -4108,6 +4169,244 @@ static const char kBootstrapJS[] = R"JS(
     return proxied(new CSSStyleDeclaration(pairs));
   };
 })();
+
+// <video>/<audio>: HTMLMediaElement's members. They live on the shared node
+// prototype, but only media elements have them: on any other element they
+// read as whatever was there before (usually undefined - so
+// `typeof div.play` is 'undefined'), and assigning one makes an ordinary
+// property. The player is Engine's, behind __wtMedia; an element that has
+// none yet (no source, never laid out) reads the defaults.
+(() => {
+  const g = globalThis;
+  const nodeProto = Object.getPrototypeOf(document);
+  const isMedia = el => el !== nodeProto && el.nodeType === 1 &&
+    (el.localName === 'video' || el.localName === 'audio');
+  const read = (el, name, dflt) => {
+    const v = __wtMedia(el, name);
+    return v === undefined ? dflt : v;
+  };
+
+  const define = (name, get, set) => {
+    const prev = Object.getOwnPropertyDescriptor(nodeProto, name);
+    Object.defineProperty(nodeProto, name, {
+      configurable: true,
+      get() {
+        if (isMedia(this)) return get.call(this);
+        return prev && prev.get ? prev.get.call(this) : undefined;
+      },
+      set(v) {
+        if (isMedia(this)) { if (set) set.call(this, v); return; }
+        if (prev && prev.set) { prev.set.call(this, v); return; }
+        Object.defineProperty(this, name, { value: v, writable: true, enumerable: true, configurable: true });
+      },
+    });
+  };
+  // Methods read off the prototype itself too, so a library can wrap
+  // HTMLMediaElement.prototype.play.
+  const method = (name, fn) => {
+    Object.defineProperty(fn, 'name', { value: name });
+    Object.defineProperty(nodeProto, name, {
+      configurable: true,
+      get() { return this === nodeProto || isMedia(this) ? fn : undefined; },
+      set(v) { Object.defineProperty(this, name, { value: v, writable: true, enumerable: true, configurable: true }); },
+    });
+  };
+  const flag = (name, attr) => define(name,
+    function () { return this.hasAttribute(attr); },
+    function (v) { if (v) this.setAttribute(attr, ''); else this.removeAttribute(attr); });
+  const text = (name, attr) => define(name,
+    function () { return this.getAttribute(attr) || ''; },
+    function (v) { this.setAttribute(attr, String(v)); });
+  const absolute = url => {
+    try { return new URL(url, location.href).href; } catch (e) { return url; }
+  };
+
+  class TimeRanges {
+    constructor(ranges) { this._ranges = ranges; }
+    get length() { return this._ranges.length; }
+    _at(i, k, fn) {
+      if (i >= this._ranges.length)
+        throw new DOMException("Failed to execute '" + fn + "' on 'TimeRanges': The index provided (" + i +
+          ') is greater than or equal to the maximum bound (' + this._ranges.length + ').', 'IndexSizeError');
+      return this._ranges[i][k];
+    }
+    start(i) { return this._at(i >>> 0, 0, 'start'); }
+    end(i) { return this._at(i >>> 0, 1, 'end'); }
+  }
+  class MediaError {
+    constructor(code) {
+      this.code = code;
+      this.message = ['', 'MEDIA_ERR_ABORTED', 'MEDIA_ERR_NETWORK', 'MEDIA_ERR_DECODE', 'MEDIA_ERR_SRC_NOT_SUPPORTED'][code] || '';
+    }
+  }
+  const errorCodes = { MEDIA_ERR_ABORTED: 1, MEDIA_ERR_NETWORK: 2, MEDIA_ERR_DECODE: 3, MEDIA_ERR_SRC_NOT_SUPPORTED: 4 };
+  for (const [k, v] of Object.entries(errorCodes)) {
+    Object.defineProperty(MediaError, k, { value: v, enumerable: true });
+    Object.defineProperty(MediaError.prototype, k, { value: v, enumerable: true });
+  }
+  g.TimeRanges = TimeRanges;
+  g.MediaError = MediaError;
+
+  const states = {
+    NETWORK_EMPTY: 0, NETWORK_IDLE: 1, NETWORK_LOADING: 2, NETWORK_NO_SOURCE: 3,
+    HAVE_NOTHING: 0, HAVE_METADATA: 1, HAVE_CURRENT_DATA: 2, HAVE_FUTURE_DATA: 3, HAVE_ENOUGH_DATA: 4,
+  };
+  for (const [k, v] of Object.entries(states)) Object.defineProperty(g.HTMLMediaElement, k, { value: v, enumerable: true });
+
+  const hasSource = el => el.hasAttribute('src') || !!el.querySelector('source[src]');
+
+  define('src', function () {
+    const a = this.getAttribute('src');
+    return a === null ? '' : absolute(a);
+  }, function (v) {
+    this.setAttribute('src', String(v));
+    __wtMedia(this, 'load', 1);
+  });
+  define('currentSrc', function () {
+    if (__wtMedia(this, 'readyState') === undefined) return '';
+    if (this.hasAttribute('src')) return this.src;
+    const s = this.querySelector('source[src]');
+    return s ? absolute(s.getAttribute('src')) : '';
+  });
+  define('srcObject', function () { return null; }, function () {});
+  flag('autoplay', 'autoplay');
+  flag('controls', 'controls');
+  flag('loop', 'loop');
+  flag('defaultMuted', 'muted');
+  flag('playsInline', 'playsinline');
+  flag('disableRemotePlayback', 'disableremoteplayback');
+  text('poster', 'poster');
+  text('preload', 'preload');
+  define('crossOrigin', function () { return this.getAttribute('crossorigin'); },
+    function (v) { if (v === null) this.removeAttribute('crossorigin'); else this.setAttribute('crossorigin', String(v)); });
+
+  define('currentTime', function () { return read(this, 'currentTime', 0); },
+    function (v) { __wtMedia(this, 'currentTime', Number(v) || 0); });
+  define('duration', function () { return read(this, 'duration', NaN); });
+  define('paused', function () { return !!read(this, 'paused', 1); });
+  define('ended', function () { return !!read(this, 'ended', 0); });
+  define('seeking', function () { return !!read(this, 'seeking', 0); });
+  define('readyState', function () { return read(this, 'readyState', 0); });
+  define('networkState', function () { return read(this, 'networkState', hasSource(this) ? 3 : 0); });
+  define('volume', function () { return read(this, 'volume', 1); }, function (v) {
+    v = Number(v);
+    if (!(v >= 0 && v <= 1))
+      throw new DOMException("Failed to set the 'volume' property on 'HTMLMediaElement': The volume provided (" + v +
+        ') is outside the range [0, 1].', 'IndexSizeError');
+    __wtMedia(this, 'volume', v);
+  });
+  define('muted', function () { return !!read(this, 'muted', this.hasAttribute('muted') ? 1 : 0); },
+    function (v) { __wtMedia(this, 'muted', v ? 1 : 0); });
+  define('playbackRate', function () { return read(this, 'playbackRate', 1); },
+    function (v) { __wtMedia(this, 'playbackRate', Number(v) || 0); });
+  define('defaultPlaybackRate', function () { return this._defaultRate === undefined ? 1 : this._defaultRate; },
+    function (v) { this._defaultRate = Number(v); });
+  define('preservesPitch', function () { return true; }, function () {});
+  define('videoWidth', function () { return this.localName === 'video' ? read(this, 'videoWidth', 0) : undefined; });
+  define('videoHeight', function () { return this.localName === 'video' ? read(this, 'videoHeight', 0) : undefined; });
+  define('error', function () {
+    const code = read(this, 'error', 0);
+    return code ? new MediaError(code) : null;
+  });
+  define('buffered', function () {
+    const end = read(this, 'bufferedEnd', 0);
+    return new TimeRanges(end > 0 ? [[0, end]] : []);
+  });
+  define('seekable', function () {
+    const d = read(this, 'duration', NaN);
+    return new TimeRanges(d > 0 ? [[0, d]] : []);
+  });
+  define('played', function () {
+    const t = read(this, 'currentTime', 0);
+    return new TimeRanges(t > 0 ? [[0, t]] : []);
+  });
+  define('textTracks', function () {
+    if (!this._textTracks) {
+      this._textTracks = [];
+      this._textTracks.addEventListener = this._textTracks.removeEventListener = () => {};
+      this._textTracks.getTrackById = () => null;
+    }
+    return this._textTracks;
+  });
+
+  // play()'s promise settles as Chrome's does: fulfilled once it's playing,
+  // rejected if pause() comes first or the source fails to load.
+  method('play', function () {
+    if (!hasSource(this))
+      return Promise.reject(new DOMException('The element has no supported sources.', 'NotSupportedError'));
+    const el = this;
+    const alreadyPlaying = !el.paused && el.readyState >= 3;
+    __wtMedia(el, 'play', 1);
+    if (alreadyPlaying) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const settle = fn => () => {
+        el.removeEventListener('playing', onPlaying);
+        el.removeEventListener('pause', onPause);
+        el.removeEventListener('error', onError);
+        fn();
+      };
+      const onPlaying = settle(resolve);
+      const onPause = settle(() => reject(new DOMException(
+        'The play() request was interrupted by a call to pause(). https://goo.gl/LdLk22', 'AbortError')));
+      const onError = settle(() => reject(new DOMException(
+        'Failed to load because no supported source was found.', 'NotSupportedError')));
+      el.addEventListener('playing', onPlaying);
+      el.addEventListener('pause', onPause);
+      el.addEventListener('error', onError);
+    });
+  });
+  method('pause', function () { __wtMedia(this, 'pause', 1); });
+  method('load', function () { __wtMedia(this, 'load', 1); });
+  method('canPlayType', function (type) { return __wtCanPlayType(String(type)); });
+  method('fastSeek', function (t) { this.currentTime = t; });
+  method('addTextTrack', function (kind, label, language) {
+    return { kind, label: label || '', language: language || '', mode: 'hidden', cues: [], activeCues: [],
+             addCue() {}, removeCue() {}, addEventListener() {}, removeEventListener() {} };
+  });
+  method('setSinkId', function () { return Promise.resolve(); });
+
+  // new Audio(src): a detached <audio>, loading as soon as it has a source.
+  g.Audio = function Audio(src) {
+    if (!new.target)
+      throw new TypeError("Failed to construct 'Audio': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    const a = document.createElement('audio');
+    a.setAttribute('preload', 'auto');
+    if (src !== undefined) a.src = src;
+    return a;
+  };
+  g.Audio.prototype = nodeProto;
+})();
+
+// Fullscreen: requestFullscreen()/exitFullscreen() and the webkit-prefixed
+// names players still check for. Engine does the switching (a video - or
+// the first video in the element - fills the screen) and fires
+// fullscreenchange; the promises settle at once.
+(() => {
+  const nodeProto = Object.getPrototypeOf(document);
+  const current = () => __wtFullscreenElement();
+  function requestFullscreen() {
+    if (this.nodeType !== 1 || !this.isConnected)
+      return Promise.reject(new TypeError("Failed to execute 'requestFullscreen' on 'Element': The element is not connected."));
+    __wtSetFullscreen(this);
+    return Promise.resolve();
+  }
+  function exitFullscreen() {
+    if (!current())
+      return Promise.reject(new TypeError("Failed to execute 'exitFullscreen' on 'Document': Document not active"));
+    __wtSetFullscreen(null);
+    return Promise.resolve();
+  }
+  for (const name of ['requestFullscreen', 'webkitRequestFullscreen', 'webkitRequestFullScreen'])
+    Object.defineProperty(nodeProto, name, { value: requestFullscreen, writable: true, configurable: true });
+  for (const name of ['exitFullscreen', 'webkitExitFullscreen', 'webkitCancelFullScreen'])
+    Object.defineProperty(document, name, { value: exitFullscreen, writable: true, configurable: true });
+  for (const name of ['fullscreenElement', 'webkitFullscreenElement', 'webkitCurrentFullScreenElement'])
+    Object.defineProperty(document, name, { get: current, configurable: true });
+  for (const name of ['fullscreenEnabled', 'webkitFullscreenEnabled'])
+    Object.defineProperty(document, name, { get: () => true, configurable: true });
+  for (const name of ['fullscreen', 'webkitIsFullScreen'])
+    Object.defineProperty(document, name, { get: () => !!current(), configurable: true });
+})();
 )JS";
 
 // ---------------------------------------------------------------------
@@ -4180,8 +4479,15 @@ static const JSCFunctionListEntry js_node_proto_funcs[] = {
     HANDLER_DEF("onreset", 15), HANDLER_DEF("onfocus", 16), HANDLER_DEF("onblur", 17),
     HANDLER_DEF("onload", 18), HANDLER_DEF("onerror", 19), HANDLER_DEF("onscroll", 20),
     HANDLER_DEF("onreadystatechange", 21),
+    HANDLER_DEF("onloadstart", 22), HANDLER_DEF("onprogress", 23), HANDLER_DEF("onsuspend", 24),
+    HANDLER_DEF("onabort", 25), HANDLER_DEF("onemptied", 26), HANDLER_DEF("onstalled", 27),
+    HANDLER_DEF("onplay", 28), HANDLER_DEF("onpause", 29), HANDLER_DEF("onloadedmetadata", 30),
+    HANDLER_DEF("onloadeddata", 31), HANDLER_DEF("onwaiting", 32), HANDLER_DEF("onplaying", 33),
+    HANDLER_DEF("oncanplay", 34), HANDLER_DEF("oncanplaythrough", 35), HANDLER_DEF("onseeking", 36),
+    HANDLER_DEF("onseeked", 37), HANDLER_DEF("ontimeupdate", 38), HANDLER_DEF("onended", 39),
+    HANDLER_DEF("onratechange", 40), HANDLER_DEF("ondurationchange", 41), HANDLER_DEF("onvolumechange", 42),
 };
-static_assert(countof(kHandlerTypes) == 22, "add an on* property to js_node_proto_funcs for each handler type");
+static_assert(countof(kHandlerTypes) == 43, "add an on* property to js_node_proto_funcs for each handler type");
 
 static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_MAGIC_DEF("setTimeout", 2, js_setTimer, 0),
@@ -4198,6 +4504,10 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("__wtComputedStyle", 1, js_native_computedStyle), // behind getComputedStyle
     JS_CFUNC_DEF("__wtScrollInfo", 0, js_native_scrollInfo),     // behind scrollX/scrollY, scrollHeight
     JS_CFUNC_DEF("__wtScrollTo", 2, js_native_scrollTo),         // behind scrollTo/scrollBy/scrollIntoView
+    JS_CFUNC_DEF("__wtMedia", 3, js_native_media),               // behind HTMLMediaElement
+    JS_CFUNC_DEF("__wtCanPlayType", 1, js_native_canPlayType),
+    JS_CFUNC_DEF("__wtSetFullscreen", 1, js_native_setFullscreen),         // behind requestFullscreen
+    JS_CFUNC_DEF("__wtFullscreenElement", 0, js_native_fullscreenElement), // behind document.fullscreenElement
     JS_CFUNC_DEF("__wtReportError", 2, js_native_reportError),
     JS_CGETSET_DEF("location", js_get_location, js_set_location),
     JS_CFUNC_DEF("addEventListener", 2, js_window_addEventListener),

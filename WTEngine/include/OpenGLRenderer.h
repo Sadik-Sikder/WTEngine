@@ -77,6 +77,9 @@ public:
                       const float* radii = nullptr) override;
     void drawShadow(float x, float y, float w, float h, const float radii[4], float blur,
                     Color color) override;
+    void uploadPixels(const void* key, const unsigned char* bgra, int width, int height) override;
+    bool drawPixels(const void* key, float x, float y, float w, float h, const float* radii = nullptr) override;
+    void releasePixels(const void* key) override;
     bool preloadImage(const std::wstring& url, int& outWidth, int& outHeight) override;
     int imageGeneration() const override { return imageGen; }
     void setPageUrl(const std::wstring& url) override { pageUrl_ = url; }
@@ -142,6 +145,9 @@ private:
     // keyed by everything that shapes it. Emptied when it grows past a few
     // dozen - pages use a handful, and rebuilding one is cheap.
     std::map<std::string, GLuint> gradientCache_;
+    // uploadPixels' textures, by key, with their size.
+    struct PixelTexture { GLuint id = 0; int width = 0, height = 0; };
+    std::map<const void*, PixelTexture> pixelTextures_;
     GLuint gradientTexture(const std::string& key, int width, int height, bool repeat,
                            const std::vector<unsigned char>& rgba);
 

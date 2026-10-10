@@ -53,6 +53,17 @@ struct PageGeometry {
     std::function<void(int x, int y)> scrollTo;
 };
 
+// What scripts can do with a <video>/<audio> (HTMLMediaElement). Engine
+// owns the players, so it fills these in (beginScripts).
+struct MediaHooks {
+    // A property's value ("currentTime", "paused", "videoWidth", ...);
+    // false if the element has no player yet (scripts see the defaults).
+    std::function<bool(Element*, const std::string& name, double& out)> get;
+    // Sets a property ("currentTime", "volume", "muted", "playbackRate"),
+    // or runs "play", "pause" or "load".
+    std::function<void(Element*, const std::string& name, double value)> set;
+};
+
 struct DOMBindingState {
     DOMBindingState();
     ~DOMBindingState();
@@ -69,6 +80,12 @@ struct DOMBindingState {
     // geometry) isn't repeated when nothing changed since.
     unsigned changeCount = 0;
     PageGeometry geometry;
+    MediaHooks media;
+    // Fullscreen: the element shown fullscreen (document.fullscreenElement),
+    // kept current by Engine, which does the switching (setFullscreen;
+    // nullptr leaves fullscreen).
+    Element* fullscreenElement = nullptr;
+    std::function<void(Element*)> setFullscreen;
     int lastScrollY = -1; // as last reported to scripts (setScrollPosition)
     std::unique_ptr<ListenerStorage> listeners;
     std::unique_ptr<TimerStorage> timers; // pending setTimeout/setInterval callbacks
@@ -207,3 +224,7 @@ void evaluateInConsole(JSContext* ctx, const std::wstring& code);
 // `root` (outside any <svg>), with runs of whitespace collapsed to single
 // spaces and trimmed, as browsers do. Empty if there's no <title>.
 std::wstring documentTitle(Element* root);
+
+// The shared_ptr that owns `node` - its parent's child slot, or what keeps
+// a detached node a script holds alive. Empty if neither applies.
+std::shared_ptr<Node> owningNode(JSContext* ctx, Node* node);

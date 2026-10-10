@@ -130,6 +130,9 @@ struct LayoutBox {
     // boxes around it; layout() turns these into LayoutRoot::elementRects
     // and removes them. Never painted.
     bool geometryOnly = false;
+    // A <video> or <audio>: Engine draws its frame (or poster) and its
+    // controls; `el` is the element.
+    bool media = false;
     bool fixed = false;
     int sticky = -1;
     bool clipped = false;
@@ -205,6 +208,10 @@ struct LayoutRoot {
     // and CSS or the attributes didn't fix both sides. Only one of these
     // arriving changes the layout; Engine re-lays-out for those alone.
     std::unordered_set<std::wstring> imagesSizedByGuess;
+    // A <video>'s natural size, the same way: Engine starts loading it on
+    // first ask and returns false until its metadata has arrived (or for
+    // an <audio>). Its arrival fires "loadedmetadata", which relays out.
+    std::function<bool(Element* media, int& outW, int& outH)> mediaSize;
 
     void layout(); // compute boxes from rootNode
 

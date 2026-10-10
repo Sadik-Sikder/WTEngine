@@ -138,6 +138,8 @@
     <ClCompile Include="src\CSS.cpp" />
     <ClCompile Include="src\Engine.cpp" />
     <ClCompile Include="src\EngineForms.cpp" />
+    <ClCompile Include="src\EngineMedia.cpp" />
+    <ClCompile Include="src\Media.cpp" />
     <ClCompile Include="src\TextEditor.cpp" />
     <ClCompile Include="src\Fetcher.cpp">
       <!-- Asio coroutine templates (fetchHttpAsync) exceed the default section limit; mirrored in CMakeLists.txt -->
@@ -200,6 +202,7 @@
     <ClInclude Include="include\ResourceLoader.h" />
     <ClInclude Include="include\WebStorage.h" />
     <ClInclude Include="include\Svg.h" />
+    <ClInclude Include="include\Media.h" />
     <ClInclude Include="include\CookieJar.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

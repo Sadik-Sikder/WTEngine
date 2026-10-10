@@ -107,6 +107,7 @@ OpenGLRenderer::~OpenGLRenderer() {
         if (tex.id) glDeleteTextures(1, &tex.id);
     }
     for (auto& [key, id] : gradientCache_) glDeleteTextures(1, &id);
+    for (auto& [key, tex] : pixelTextures_) if (tex.id) glDeleteTextures(1, &tex.id);
     if (comInitialized) CoUninitialize();
 }
 
@@ -769,6 +770,49 @@ void OpenGLRenderer::drawImage(float x, float y, float w, float h, const std::ws
     TexMap tm = tile ? rectMap(tile[0], tile[1], tile[2], tile[3]) : rectMap(x, y, w, h);
     fillBox(x, y, w, h, radii, { 1, 1, 1, 1 }, tm);
     glDisable(GL_TEXTURE_2D);
+}
+
+void OpenGLRenderer::uploadPixels(const void* key, const unsigned char* bgra, int width, int height) {
+    if (!bgra || width <= 0 || height <= 0) return;
+    PixelTexture& tex = pixelTextures_[key];
+    if (!tex.id) {
+        glGenTextures(1, &tex.id);
+        glBindTexture(GL_TEXTURE_2D, tex.id);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    else {
+        glBindTexture(GL_TEXTURE_2D, tex.id);
+    }
+    // Stored without alpha: a video frame is opaque, whatever its pixels'
+    // fourth byte says. Same size: overwritten in place.
+    if (tex.width != width || tex.height != height) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, bgra);
+        tex.width = width;
+        tex.height = height;
+    }
+    else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, bgra);
+    }
+}
+
+bool OpenGLRenderer::drawPixels(const void* key, float x, float y, float w, float h, const float* radii) {
+    auto it = pixelTextures_.find(key);
+    if (it == pixelTextures_.end() || !it->second.id) return false;
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, it->second.id);
+    fillBox(x, y, w, h, radii, { 1, 1, 1, 1 }, rectMap(x, y, w, h));
+    glDisable(GL_TEXTURE_2D);
+    return true;
+}
+
+void OpenGLRenderer::releasePixels(const void* key) {
+    auto it = pixelTextures_.find(key);
+    if (it == pixelTextures_.end()) return;
+    if (it->second.id) glDeleteTextures(1, &it->second.id);
+    pixelTextures_.erase(it);
 }
 
 bool OpenGLRenderer::preloadImage(const std::wstring& url, int& outWidth, int& outHeight) {

@@ -10,6 +10,7 @@
 #include "Layout.h"
 #include "ResourceLoader.h"
 #include "TextEditor.h"
+#include "Media.h"
 
 // A form the user submitted. The caller resolves `action` against the current
 // page's URL and performs the request.
@@ -76,6 +77,20 @@ public:
     void beginScrollbarDrag(int y);
     void dragScrollbar(int y);
     void endScrollbarDrag() { draggingScrollbar_ = false; }
+
+    // A video's progress or volume knob, grabbed by a click (onClick):
+    // follows the mouse's x until the button is released.
+    bool draggingMedia() const { return mediaDrag_.node != nullptr; }
+    void dragMedia(int x);
+    void endMediaDrag() { mediaDrag_ = {}; }
+
+    // Fullscreen: true once when it began or ended (a script's
+    // requestFullscreen, a video's button, Escape, a new page), for main.cpp
+    // to make the window fill the screen without the browser's bars, or
+    // put it back.
+    bool takeFullscreenChange(bool& on);
+    bool fullscreen() const { return fullscreen_ != nullptr; }
+    void exitFullscreen() { setFullscreen(nullptr); }
     bool draggingScrollbar() const { return draggingScrollbar_; }
     void pageTowards(int y);
     void render(Renderer& renderer, double timeSeconds = 0);
@@ -329,6 +344,78 @@ private:
     unsigned layoutGeneration_ = 0, boxIndexGeneration_ = ~0u;
     // Whether page point (docX, docY) is inside the box and its clip.
     bool boxContains(const LayoutBox& b, int docX, int docY) const;
+
+    // --- <video> and <audio> (EngineMedia.cpp) -------------------------
+    // A player for each media element that has been laid out or scripted,
+    // kept for the page's lifetime. Each holds its element (`node`), so a
+    // script can take it out of the tree, or never put it in (new Audio()),
+    // and still play it.
+    struct MediaElement {
+        std::shared_ptr<Node> node;
+        std::unique_ptr<MediaPlayer> player;
+        std::wstring src;         // the resolved URL it plays
+        bool loaded = false;      // told to load `src` (preload="none" waits for play())
+        bool inPage = false;      // in the document when last checked: leaving it pauses
+        bool everPlayed = false;  // the poster gives way once playing starts
+        bool hasFrame = false;    // a frame is uploaded (Renderer::uploadPixels, keyed by player)
+        int frameW = 0, frameH = 0;
+        std::vector<unsigned char> frame; // readFrame's buffer, reused
+    };
+    std::unordered_map<const Element*, MediaElement> media_;
+    // `el`'s player, created (`create`) if it has none; (re)loads it when
+    // its source changed. nullptr without one.
+    MediaElement* mediaFor(Element* el, bool create);
+    void startMediaLoad(MediaElement& m);
+    bool mediaProperty(Element* el, const std::string& name, double& out);
+    void setMediaProperty(Element* el, const std::string& name, double value);
+    // Each frame: hands what the players did to the page's scripts as
+    // events (and fullscreenchange), relays out when a video's size became
+    // known, and pauses one that was removed from the page.
+    void pollMedia();
+    // Drops every player (and leaves fullscreen) - a new page.
+    void clearMedia();
+    // `el`'s shared_ptr: its parent's slot, or a script's wrapper.
+    std::shared_ptr<Node> ownerOf(Element* el);
+    // A media box: `fullscreen` = the whole view (fullscreenVideoBox),
+    // which always has controls.
+    void drawMedia(Renderer& renderer, const LayoutBox& b, float screenY, bool fullscreen = false);
+    void drawMediaControls(Renderer& renderer, const LayoutBox& b, float top, MediaElement* m, bool fullscreen);
+    // The media element with controls under the page point - in
+    // fullscreen, the video filling the view.
+    bool mediaBoxAt(int docX, int docY, LayoutBox& out) const;
+    bool overMediaControl(int x, int y) const; // a button or slider: the hand cursor
+    // A click on a media element with controls: its listeners, then play/
+    // pause, fullscreen, mute, or grabbing a knob (mediaDrag_). False if the
+    // click wasn't on one.
+    bool mediaClick(int x, int y, double now);
+    // The progress or volume knob being dragged (`node` empty when none):
+    // the slider's extent in page coordinates, and the last value set.
+    struct MediaDrag {
+        std::shared_ptr<Node> node;
+        bool volume = false;
+        float x0 = 0, width = 0;
+        double fraction = -1;
+    };
+    MediaDrag mediaDrag_;
+    // For a double-click on a video (toggles fullscreen).
+    double lastVideoClick_ = -1;
+    const Element* lastVideoClickEl_ = nullptr;
+    // When the mouse last moved: a playing video's controls hide a few
+    // seconds after.
+    int lastMouseX_ = -1, lastMouseY_ = -1;
+    std::chrono::steady_clock::time_point lastMouseMove_;
+
+    // --- Fullscreen (EngineMedia.cpp) ----------------------------------
+    // The element shown fullscreen (requestFullscreen, or a video's
+    // fullscreen button). A video - or the first video inside the element,
+    // as players put their container in fullscreen - fills the view; the
+    // window itself is main.cpp's (takeFullscreenChange).
+    std::shared_ptr<Node> fullscreen_;
+    bool fullscreenChanged_ = false;
+    std::vector<std::shared_ptr<Node>> fullscreenEvents_; // fullscreenchange to fire (pollMedia)
+    void setFullscreen(Element* el); // nullptr leaves fullscreen
+    Element* fullscreenVideo() const;
+    bool fullscreenVideoBox(LayoutBox& out) const;
     // A box's box-shadows (outer ones; inset shadows aren't drawn).
     void paintShadows(Renderer& renderer, const LayoutBox& b, float screenY);
     // A box's background-image/gradient layers over the area (x, y, w, h) -

@@ -225,9 +225,14 @@ Engine::Engine(int w, int h)
         std::wstring resolved = resolveImageSrc(pageBaseUrl, src);
         return !resolved.empty() && measurer->preloadImage(resolved, w, h);
     };
+    layoutRoot.mediaSize = [this](Element* el, int& w, int& h) {
+        MediaElement* m = mediaFor(el, true); // a media element laid out starts loading
+        return m && el->tag == L"video" && m->player->videoSize(w, h);
+    };
 }
 
-Engine::~Engine() {}
+// The renderer may already be gone: the players go, their textures with it.
+Engine::~Engine() { media_.clear(); }
 
 void Engine::setRenderer(Renderer* r) {
     measurer = r;
@@ -292,8 +297,16 @@ void Engine::beginScripts() {
     // domState holds JSValues (event listeners, pending timers) that must be
     // freed against their own runtime, and quickjs asserts if a runtime is
     // destroyed while any value is still alive. So: state, then old realm, then new.
+    clearMedia(); // the last page's players stop
     domState = DOMBindingState{};
     domState.pageUrl = pageBaseUrl; // so location.href/.replace()/.assign() have a base
+    domState.media.get = [this](Element* el, const std::string& name, double& out) {
+        return mediaProperty(el, name, out);
+    };
+    domState.media.set = [this](Element* el, const std::string& name, double value) {
+        setMediaProperty(el, name, value);
+    };
+    domState.setFullscreen = [this](Element* el) { setFullscreen(el); };
     domState.viewportWidth = layoutRoot.viewportWidth; // innerWidth/matchMedia, from the first script on
     domState.viewportHeight = viewHeight();
     domState.pixelRatio = zoom_;
@@ -770,6 +783,9 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
     // the DOM changes they make are laid out and painted this frame.
     if (jsEngine) runAnimationFrames(jsEngine->context());
 
+    // What the <video>/<audio> players did since the last frame, as events.
+    pollMedia();
+
     // A script mutated the DOM (appendChild, textContent=, setAttribute,
     // innerHTML=, ...) since the last layout - re-layout to pick it up.
     if (domState.domDirty) {
@@ -817,7 +833,12 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
         ~ClipScope() { if (on) r.popClip(); }
     };
 
+    // A video in fullscreen is all there is to see (drawn after).
+    LayoutBox fullscreenBox;
+    const bool videoFullscreen = fullscreenVideoBox(fullscreenBox);
+
     for (const auto& b : layoutRoot.boxes) {
+        if (videoFullscreen) break;
 
         const int shift = boxShift(b); // fixed/sticky
         int screenY = b.y + shift - scrollY; // relative to the top of the page area
@@ -879,6 +900,11 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
             }
         }
 
+        if (b.media) {
+            drawMedia(renderer, b, (float)screenY);
+            continue;
+        }
+
         // Draw image
         if (!b.imageSrc.empty()) {
             std::wstring src = resolveImageSrc(pageBaseUrl, b.imageSrc);
@@ -918,6 +944,13 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
                 if (b.lineThrough) renderer.drawRect(b.x + 4, std::round(textTop + fs * 0.72f), w, thickness, ink);
             }
         }
+    }
+
+    if (videoFullscreen) {
+        renderer.drawRect(0, 0, (float)fullscreenBox.width, (float)fullscreenBox.height, { 0, 0, 0, 1 });
+        drawMedia(renderer, fullscreenBox, 0, true);
+        renderer.resetTransform();
+        return;
     }
 
     drawOpenSelect(renderer); // on top of the page, same treatment main.cpp gives AddressBar
@@ -1137,6 +1170,11 @@ std::wstring Engine::title() const {
 static constexpr double kHoverRelayoutBudgetMs = 50;
 
 void Engine::updateHover(int x, int y) {
+    if (x != lastMouseX_ || y != lastMouseY_) { // a playing video's controls show (drawMediaControls)
+        lastMouseX_ = x;
+        lastMouseY_ = y;
+        lastMouseMove_ = std::chrono::steady_clock::now();
+    }
     scrollbarHovered_ = scrollbarAt(x, y) != ScrollbarPart::None;
     if (scrollbarHovered_) { x = -1; y = -1; } // the page under the scrollbar isn't hovered
 

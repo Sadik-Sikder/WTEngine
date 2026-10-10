@@ -186,6 +186,7 @@ const LayoutBox* Engine::controlAt(int x, int y) const {
 Engine::Cursor Engine::cursorAt(int x, int y, Renderer& renderer) const {
     if (const LayoutBox* c = controlAt(x, y))
         return c->control == LayoutBox::TextField ? Cursor::IBeam : Cursor::Hand;
+    if (overMediaControl(x, y)) return Cursor::Hand; // a video's buttons and sliders
     return linkAt(x, y, renderer).empty() ? Cursor::Arrow : Cursor::Hand;
 }
 
@@ -283,6 +284,12 @@ bool Engine::onClick(int x, int y, double now, Renderer& renderer) {
             }
         }
         openSelect = nullptr;
+        return true;
+    }
+
+    // A <video>/<audio>'s controls.
+    if (mediaClick(x, y, now)) {
+        blurInput();
         return true;
     }
 

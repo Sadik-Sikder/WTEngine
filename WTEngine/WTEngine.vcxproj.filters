@@ -30,6 +30,12 @@
     <ClCompile Include="src\EngineForms.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\EngineMedia.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Media.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\TextEditor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -135,6 +141,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\Svg.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\Media.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\CookieJar.h">
