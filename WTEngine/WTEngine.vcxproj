@@ -112,7 +112,8 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(ProjectDir)libs\glfw;$(VCPKG_ROOT)\installed\x64-windows-static-md\debug\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>glfw3.lib;opengl32.lib;wininet.lib;libssl.lib;libcrypto.lib;zsd.lib;ws2_32.lib;mswsock.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>glfw3.lib;opengl32.lib;wininet.lib;libssl.lib;libcrypto.lib;zsd.lib;ws2_32.lib;mswsock.lib;crypt32.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>icu.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -130,7 +131,8 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(ProjectDir)libs\glfw;$(VCPKG_ROOT)\installed\x64-windows-static-md\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>glfw3.lib;opengl32.lib;wininet.lib;libssl.lib;libcrypto.lib;zs.lib;ws2_32.lib;mswsock.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>glfw3.lib;opengl32.lib;wininet.lib;libssl.lib;libcrypto.lib;zs.lib;ws2_32.lib;mswsock.lib;crypt32.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>icu.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -140,6 +142,7 @@
     <ClCompile Include="src\EngineForms.cpp" />
     <ClCompile Include="src\EngineMedia.cpp" />
     <ClCompile Include="src\Media.cpp" />
+    <ClCompile Include="src\Intl.cpp" />
     <ClCompile Include="src\TextEditor.cpp" />
     <ClCompile Include="src\Fetcher.cpp">
       <!-- Asio coroutine templates (fetchHttpAsync) exceed the default section limit; mirrored in CMakeLists.txt -->
@@ -203,6 +206,8 @@
     <ClInclude Include="include\WebStorage.h" />
     <ClInclude Include="include\Svg.h" />
     <ClInclude Include="include\Media.h" />
+    <ClInclude Include="include\Intl.h" />
+    <ClInclude Include="src\IntlJS.inc" />
     <ClInclude Include="include\CookieJar.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

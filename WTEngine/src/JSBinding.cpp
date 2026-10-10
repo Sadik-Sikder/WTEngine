@@ -11,6 +11,7 @@
 #include "WebStorage.h"
 #include "CookieJar.h"
 #include "Media.h"
+#include "Intl.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -4407,6 +4408,41 @@ static const char kBootstrapJS[] = R"JS(
   for (const name of ['fullscreen', 'webkitIsFullScreen'])
     Object.defineProperty(document, name, { get: () => !!current(), configurable: true });
 })();
+
+// Namespaces. An element made by createElementNS is an ordinary element
+// here (tags are lowercase throughout, and an SVG element is one inside an
+// <svg>); namespaceURI reports the namespace it was made in, or else the
+// one its place in the tree implies.
+(() => {
+  const nodeProto = Object.getPrototypeOf(document);
+  const HTML = 'http://www.w3.org/1999/xhtml', SVG = 'http://www.w3.org/2000/svg';
+  const MATHML = 'http://www.w3.org/1998/Math/MathML';
+  const madeIn = new WeakMap();
+  Object.defineProperty(document, 'createElementNS', {
+    configurable: true, writable: true,
+    value: function createElementNS(ns, name) {
+      const qualified = String(name);
+      const el = document.createElement(qualified.slice(qualified.indexOf(':') + 1));
+      if (ns !== null && ns !== undefined && ns !== '') madeIn.set(el, String(ns));
+      return el;
+    },
+  });
+  Object.defineProperty(nodeProto, 'namespaceURI', {
+    configurable: true,
+    get() {
+      if (this.nodeType !== 1 || this === document) return this === document ? HTML : null;
+      const ns = madeIn.get(this);
+      if (ns !== undefined) return ns;
+      for (let n = this; n && n.nodeType === 1; n = n.parentNode) {
+        const t = n.localName;
+        if (t === 'svg') return SVG;
+        if (t === 'math') return MATHML;
+        if (t === 'foreignobject' && n !== this) break;
+      }
+      return HTML;
+    },
+  });
+})();
 )JS";
 
 // ---------------------------------------------------------------------
@@ -4532,6 +4568,8 @@ void installDOMBindings(JSContext* ctx, Element* documentRoot, DOMBindingState* 
     state->fetches->ctx = ctx;   // so ~FetchStorage can free pending promise functions
     state->wrappers->ctx = ctx;  // so ~NodeWrappers can free the wrapper objects
     state->documentEl = documentRoot;
+
+    installIntl(ctx); // Intl, on Windows' ICU (Intl.cpp)
 
     JSRuntime* rt = JS_GetRuntime(ctx);
     JS_NewClassID(rt, &js_node_class_id);

@@ -52,6 +52,7 @@ add_executable(WTEngine
     src/WebStorage.cpp
     src/Svg.cpp
     src/Media.cpp
+    src/Intl.cpp
     resources/WTEngine.rc # the app icon
 )
 
@@ -69,3 +70,9 @@ find_package(ZLIB REQUIRED) # gzip/deflate response decompression - see Fetcher.
 
 target_link_libraries(WTEngine PRIVATE "${GLFW3_LIB}" opengl32 wininet qjs
     Boost::beast OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB ws2_32 mswsock crypt32)
+
+# Intl uses Windows' own ICU (icu.dll, Windows 10 1903 and later), loaded
+# on first use so the browser still starts without it - see Intl.cpp.
+# Mirrored in WTEngine.vcxproj.
+target_link_libraries(WTEngine PRIVATE delayimp)
+target_link_options(WTEngine PRIVATE /DELAYLOAD:icu.dll)
