@@ -86,6 +86,12 @@ struct DOMBindingState {
     // nullptr leaves fullscreen).
     Element* fullscreenElement = nullptr;
     std::function<void(Element*)> setFullscreen;
+    // Set by scripts while a MutationObserver / an IntersectionObserver or
+    // ResizeObserver exists (kBootstrapJS), so pages without one pay
+    // nothing: mutations aren't reported, and Engine skips the per-frame
+    // check (runLayoutObservers).
+    bool observingMutations = false;
+    bool observingLayout = false;
     int lastScrollY = -1; // as last reported to scripts (setScrollPosition)
     std::unique_ptr<ListenerStorage> listeners;
     std::unique_ptr<TimerStorage> timers; // pending setTimeout/setInterval callbacks
@@ -203,6 +209,13 @@ void fireDueTimers(JSContext* ctx);
 // for the next frame. Called once per frame from Engine::render, right
 // before the relayout check, so what they change is painted this frame.
 void runAnimationFrames(JSContext* ctx);
+
+// IntersectionObserver and ResizeObserver: measures what they observe and
+// calls their callbacks for what changed. `layoutChanged` says whether the
+// layout, scroll position or viewport changed since the last call (new
+// targets are checked either way). Called by Engine::render after layout,
+// only while DOMBindingState::observingLayout.
+void runLayoutObservers(JSContext* ctx, bool layoutChanged);
 
 // Runs tasks queued from JS (postMessage deliveries, for window and
 // MessageChannel), each followed by its microtasks. Tasks they queue run

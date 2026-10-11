@@ -821,6 +821,21 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
         resizePainted_ = true; // this frame paints the new size with the old layout
     }
 
+    // IntersectionObserver / ResizeObserver: with the layout now current,
+    // they measure what they watch - all of it again only if the layout,
+    // scroll position or viewport moved since they last looked. What their
+    // callbacks change is laid out next frame.
+    if (jsEngine && domState.observingLayout) {
+        const int vw = layoutRoot.viewportWidth, vh = viewHeight();
+        const bool changed = layoutGeneration_ != observedLayout_ || scrollY != observedScrollY_ ||
+                             vw != observedViewW_ || vh != observedViewH_;
+        observedLayout_ = layoutGeneration_;
+        observedScrollY_ = scrollY;
+        observedViewW_ = vw;
+        observedViewH_ = vh;
+        runLayoutObservers(jsEngine->context(), changed);
+    }
+
     // The page is drawn in page coordinates: the transform moves it below
     // the address bar and applies the zoom (see Renderer::setPageTransform).
     renderer.setPageTransform((float)topInset, zoom_);

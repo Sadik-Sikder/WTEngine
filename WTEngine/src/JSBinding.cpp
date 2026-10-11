@@ -263,6 +263,72 @@ static void markDirty(JSContext* ctx) {
     if (DOMBindingState* s = bindingState(ctx)) { s->domDirty = true; s->changeCount++; }
 }
 
+// --- Mutation records (for MutationObserver, built in kBootstrapJS) ------
+// Each DOM change a script makes is handed to __wtRecordMutation, which
+// gives it to the observers watching that node - but only while one
+// exists (observingMutations), so pages without any pay nothing. Nodes
+// leaving the tree are wrapped before they go, so the records' wrappers
+// keep them alive.
+
+static bool observingMutations(JSContext* ctx) {
+    DOMBindingState* s = bindingState(ctx);
+    return s && s->observingMutations;
+}
+
+static JSValue nodeArray(JSContext* ctx, const std::vector<Node*>& nodes) {
+    JSValue arr = JS_NewArray(ctx);
+    for (size_t i = 0; i < nodes.size(); i++) JS_SetPropertyUint32(ctx, arr, (uint32_t)i, wrapNode(ctx, nodes[i]));
+    return arr;
+}
+
+// Takes ownership of `added`/`removed` (arrays of wrappers, or undefined).
+static void reportMutation(JSContext* ctx, const char* type, Node* target, const std::wstring* name,
+                           const std::wstring* oldValue, JSValue added, JSValue removed, Node* prev, Node* next) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue fn = JS_GetPropertyStr(ctx, global, "__wtRecordMutation");
+    JSValue args[8] = {
+        JS_NewString(ctx, type), wrapNode(ctx, target), name ? jsStr(ctx, *name) : JS_NULL,
+        oldValue ? jsStr(ctx, *oldValue) : JS_NULL, added, removed, wrapNode(ctx, prev), wrapNode(ctx, next),
+    };
+    if (JS_IsFunction(ctx, fn)) {
+        JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 8, args);
+        if (JS_IsException(r)) reportException(ctx, JS_GetException(ctx), L"MutationObserver");
+        JS_FreeValue(ctx, r);
+    }
+    for (JSValue& a : args) JS_FreeValue(ctx, a);
+    JS_FreeValue(ctx, fn);
+    JS_FreeValue(ctx, global);
+}
+
+// An attribute about to change: call before changing it (it reads the old value).
+static void recordAttribute(JSContext* ctx, Element* el, const std::wstring& name) {
+    if (!observingMutations(ctx)) return;
+    auto it = el->attrs.find(name);
+    std::wstring old = it == el->attrs.end() ? L"" : it->second;
+    reportMutation(ctx, "attributes", el, &name, it == el->attrs.end() ? nullptr : &old, JS_UNDEFINED,
+                   JS_UNDEFINED, nullptr, nullptr);
+}
+
+// A text node about to change.
+static void recordText(JSContext* ctx, TextNode* t) {
+    if (!observingMutations(ctx)) return;
+    std::wstring old = t->text;
+    reportMutation(ctx, "characterData", t, nullptr, &old, JS_UNDEFINED, JS_UNDEFINED, nullptr, nullptr);
+}
+
+// The child at `index` of `parent`, or nullptr out of range.
+static Node* childAt(Element* parent, size_t index) {
+    return index < parent->children.size() ? parent->children[index].get() : nullptr;
+}
+
+// Children `parent` had, wrapped before they're replaced (textContent,
+// innerHTML) so the record can still hand them out.
+static JSValue wrapChildren(JSContext* ctx, Element* parent) {
+    std::vector<Node*> nodes;
+    for (auto& c : parent->children) nodes.push_back(c.get());
+    return nodeArray(ctx, nodes);
+}
+
 // Empties `el`. Its old child elements no longer have it as their parent
 // (a script holding one sees parentNode null, as in browsers).
 static void clearChildren(Element* el) {
@@ -295,12 +361,16 @@ static JSValue js_set_textContent(JSContext* ctx, JSValueConst this_val, JSValue
     JS_FreeCString(ctx, s);
 
     if (n->type == Node::TEXT) {
+        recordText(ctx, static_cast<TextNode*>(n));
         static_cast<TextNode*>(n)->text = text;
     }
     else {
         auto* el = static_cast<Element*>(n);
+        const bool observed = observingMutations(ctx) && (!el->children.empty() || !text.empty());
+        JSValue removed = observed ? wrapChildren(ctx, el) : JS_UNDEFINED;
         clearChildren(el);
         if (!text.empty()) el->children.push_back(std::make_shared<TextNode>(text));
+        if (observed) reportMutation(ctx, "childList", el, nullptr, nullptr, wrapChildren(ctx, el), removed, nullptr, nullptr);
     }
     markDirty(ctx);
     return JS_UNDEFINED;
@@ -392,6 +462,8 @@ static JSValue js_set_innerHTML(JSContext* ctx, JSValueConst this_val, JSValueCo
     // fragment's node list, reused as-is with no separate "fragment mode".
     HTMLParser parser;
     auto frag = parser.parse(html);
+    const bool observed = observingMutations(ctx);
+    JSValue removed = observed ? wrapChildren(ctx, el) : JS_UNDEFINED;
     clearChildren(el);
     el->children = frag->body->children;
     // The moved children's `parent` still points at frag->body, which is
@@ -400,6 +472,7 @@ static JSValue js_set_innerHTML(JSContext* ctx, JSValueConst this_val, JSValueCo
     for (auto& child : el->children) {
         if (child->type == Node::ELEMENT) static_cast<Element*>(child.get())->parent = el;
     }
+    if (observed) reportMutation(ctx, "childList", el, nullptr, nullptr, wrapChildren(ctx, el), removed, nullptr, nullptr);
     markDirty(ctx);
     return JS_UNDEFINED;
 }
@@ -429,6 +502,7 @@ static JSValue js_get_attr_magic(JSContext* ctx, JSValueConst this_val, int magi
 static JSValue js_set_attr_magic(JSContext* ctx, JSValueConst this_val, JSValueConst v, int magic) {
     if (Element* el = unwrapElement(this_val)) {
         const char* s = JS_ToCString(ctx, v);
+        recordAttribute(ctx, el, kMagicAttrNames[magic]);
         el->attrs[kMagicAttrNames[magic]] = utf8ToWide(s);
         JS_FreeCString(ctx, s);
         markDirty(ctx);
@@ -447,7 +521,9 @@ static JSValue js_getAttribute(JSContext* ctx, JSValueConst this_val, int argc, 
 
 static JSValue js_setAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     if (Element* el = unwrapElement(this_val); el && argc >= 2) {
-        el->attrs[argStr(ctx, argc, argv, 0)] = argStr(ctx, argc, argv, 1);
+        std::wstring name = argStr(ctx, argc, argv, 0);
+        recordAttribute(ctx, el, name);
+        el->attrs[name] = argStr(ctx, argc, argv, 1);
         markDirty(ctx);
     }
     return JS_UNDEFINED;
@@ -461,8 +537,12 @@ static JSValue js_hasAttribute(JSContext* ctx, JSValueConst this_val, int argc, 
 
 static JSValue js_removeAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     if (Element* el = unwrapElement(this_val); el && argc >= 1) {
-        el->attrs.erase(argStr(ctx, argc, argv, 0));
-        markDirty(ctx);
+        std::wstring name = argStr(ctx, argc, argv, 0);
+        if (el->attrs.count(name)) { // removing one that isn't there changes nothing
+            recordAttribute(ctx, el, name);
+            el->attrs.erase(name);
+            markDirty(ctx);
+        }
     }
     return JS_UNDEFINED;
 }
@@ -578,6 +658,33 @@ static bool checkInsertable(JSContext* ctx, Element* parent, Node* node) {
     return true;
 }
 
+// A node about to leave its parent: its childList record, with its
+// neighbours as they are now.
+static void recordRemoval(JSContext* ctx, DOMBindingState* state, Node* node) {
+    if (!observingMutations(ctx)) return;
+    Element* parent = parentOf(state, node);
+    if (!parent) return;
+    size_t i = 0;
+    while (i < parent->children.size() && parent->children[i].get() != node) i++;
+    reportMutation(ctx, "childList", parent, nullptr, nullptr, JS_NewArray(ctx), nodeArray(ctx, { node }),
+                   i > 0 ? childAt(parent, i - 1) : nullptr, childAt(parent, i + 1));
+}
+
+// Nodes just inserted into `parent`, `count` of them from `first` on.
+static void recordInsertion(JSContext* ctx, Element* parent, Node* first, size_t count) {
+    if (!observingMutations(ctx) || count == 0) return;
+    // From the end: most insertions are appends, and a page appending
+    // thousands of children shouldn't pay for a search each time.
+    size_t i = parent->children.size();
+    while (i > 0 && parent->children[i - 1].get() != first) i--;
+    if (i == 0) return;
+    i--;
+    std::vector<Node*> added;
+    for (size_t k = i; k < i + count && k < parent->children.size(); k++) added.push_back(parent->children[k].get());
+    reportMutation(ctx, "childList", parent, nullptr, nullptr, nodeArray(ctx, added), JS_NewArray(ctx),
+                   i > 0 ? childAt(parent, i - 1) : nullptr, childAt(parent, i + count));
+}
+
 // Inserts `node` into `parent` before `ref` (nullptr = at the end), moving
 // it from wherever it was. `ref` must be a child of `parent`.
 static JSValue insertNode(JSContext* ctx, Element* parent, JSValueConst nodeVal, Node* ref) {
@@ -599,10 +706,12 @@ static JSValue insertNode(JSContext* ctx, Element* parent, JSValueConst nodeVal,
         if (ref) pos = std::find_if(kids.begin(), kids.end(), [&](const auto& c) { return c.get() == ref; });
         for (auto& c : moved) if (c->type == Node::ELEMENT) static_cast<Element*>(c.get())->parent = parent;
         kids.insert(pos, moved.begin(), moved.end());
+        if (!moved.empty()) recordInsertion(ctx, parent, moved.front().get(), moved.size());
         markDirty(ctx);
         return JS_DupValue(ctx, nodeVal);
     }
 
+    recordRemoval(ctx, state, node); // a move takes it from where it was
     std::shared_ptr<Node> owned = takeNode(state, node);
     if (!owned) return throwDOMException(ctx, "HierarchyRequestError", "The node can't be moved.");
     auto& kids = parent->children;
@@ -610,6 +719,7 @@ static JSValue insertNode(JSContext* ctx, Element* parent, JSValueConst nodeVal,
     if (ref) pos = std::find_if(kids.begin(), kids.end(), [&](const auto& c) { return c.get() == ref; });
     kids.insert(pos, owned);
     if (node->type == Node::ELEMENT) static_cast<Element*>(node)->parent = parent;
+    recordInsertion(ctx, parent, node, 1);
     markDirty(ctx);
     return JS_DupValue(ctx, nodeVal);
 }
@@ -639,6 +749,7 @@ static JSValue js_insertBefore(JSContext* ctx, JSValueConst this_val, int argc, 
 // returning the removed node - until the page navigates away, even though
 // nothing in the visible tree references it anymore.
 static void detachNode(JSContext* ctx, DOMBindingState* state, Node* node) {
+    recordRemoval(ctx, state, node);
     if (std::shared_ptr<Node> owned = takeNode(state, node)) {
         state->detachedNodes.push_back(std::move(owned));
         markDirty(ctx);
@@ -989,6 +1100,7 @@ static JSValue js_set_nodeValue(JSContext* ctx, JSValueConst this_val, JSValueCo
     Node* n = unwrapNode(this_val);
     if (!n || n->type != Node::TEXT) return JS_UNDEFINED;
     const char* s = JS_ToCString(ctx, val);
+    recordText(ctx, static_cast<TextNode*>(n));
     static_cast<TextNode*>(n)->text = utf8ToWide(s);
     JS_FreeCString(ctx, s);
     markDirty(ctx);
@@ -1769,6 +1881,31 @@ void runAnimationFrames(JSContext* ctx) {
     ts.runningFrame.clear();
 }
 
+void runLayoutObservers(JSContext* ctx, bool layoutChanged) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state || !state->observingLayout) return;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue fn = JS_GetPropertyStr(ctx, global, "__wtObserverTick"); // kBootstrapJS
+    JSValue arg = JS_NewBool(ctx, layoutChanged);
+    if (JS_IsFunction(ctx, fn)) callCallback(ctx, fn, 1, &arg, L"observer");
+    JS_FreeValue(ctx, fn);
+    JS_FreeValue(ctx, global);
+}
+
+// __wtObserve(kind, on): a script started (or stopped) having observers of
+// that kind - "mutations", or "layout" (intersection and resize).
+static JSValue js_native_observe(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state || argc < 2) return JS_UNDEFINED;
+    const char* kind = JS_ToCString(ctx, argv[0]);
+    if (!kind) return JS_EXCEPTION;
+    bool on = JS_ToBool(ctx, argv[1]);
+    if (strcmp(kind, "mutations") == 0) state->observingMutations = on;
+    else if (strcmp(kind, "layout") == 0) state->observingLayout = on;
+    JS_FreeCString(ctx, kind);
+    return JS_UNDEFINED;
+}
+
 void runQueuedTasks(JSContext* ctx, double budgetSeconds) {
     DOMBindingState* state = bindingState(ctx);
     if (!state) return;
@@ -2024,6 +2161,7 @@ static JSValue js_set_title(JSContext* ctx, JSValueConst this_val, JSValueConst 
 
     DOMBindingState* state = bindingState(ctx);
     if (!state || el != state->documentEl) {
+        recordAttribute(ctx, el, L"title");
         el->attrs[L"title"] = v;
         markDirty(ctx);
         return JS_UNDEFINED;
@@ -4443,6 +4581,342 @@ static const char kBootstrapJS[] = R"JS(
     },
   });
 })();
+
+// MutationObserver, IntersectionObserver and ResizeObserver.
+// - Mutations: the natives report each DOM change a script makes to
+//   __wtRecordMutation (only while an observer exists - __wtObserve), which
+//   files a record with every observer watching the node or, with subtree,
+//   an ancestor; records are delivered in a microtask, as in browsers.
+// - Intersection and resize: Engine calls __wtObserverTick once a frame
+//   after layout (only while one exists), saying whether layout, scroll
+//   or viewport moved. Targets are measured then - all of them if anything
+//   moved, else only ones observed since - and callbacks get what changed.
+(() => {
+  const g = globalThis;
+  const isNode = v => v instanceof g.Node;
+
+  // --- MutationObserver ----------------------------------------------------
+
+  const mutationObservers = new Set();
+  let deliveryQueued = false;
+
+  class MutationRecord {}
+  const deliverMutations = () => {
+    deliveryQueued = false;
+    for (const mo of [...mutationObservers]) {
+      if (!mo._records.length) continue;
+      const records = mo._records;
+      mo._records = [];
+      try { mo._callback.call(mo, records, mo); } catch (e) { __wtReportError(e, 'MutationObserver'); }
+    }
+  };
+
+  class MutationObserver {
+    constructor(callback) {
+      if (arguments.length < 1)
+        throw new TypeError("Failed to construct 'MutationObserver': 1 argument required, but only 0 present.");
+      if (typeof callback !== 'function')
+        throw new TypeError("Failed to construct 'MutationObserver': The callback provided as parameter 1 is not a function.");
+      this._callback = callback;
+      this._targets = new Map();
+      this._records = [];
+    }
+    observe(target, options) {
+      const fail = m => { throw new TypeError("Failed to execute 'observe' on 'MutationObserver': " + m); };
+      if (!isNode(target)) fail("parameter 1 is not of type 'Node'.");
+      const o = Object.assign({}, options);
+      if ((o.attributeOldValue !== undefined || o.attributeFilter !== undefined) && o.attributes === undefined) o.attributes = true;
+      if (o.characterDataOldValue !== undefined && o.characterData === undefined) o.characterData = true;
+      if (o.attributeOldValue && !o.attributes)
+        fail("The options object may only set 'attributeOldValue' to true when 'attributes' is true or not present.");
+      if (o.attributeFilter !== undefined && !o.attributes)
+        fail("The options object may only set 'attributeFilter' when 'attributes' is true or not present.");
+      if (o.characterDataOldValue && !o.characterData)
+        fail("The options object may only set 'characterDataOldValue' to true when 'characterData' is true or not present.");
+      if (!o.childList && !o.attributes && !o.characterData)
+        fail("The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+      this._targets.set(target, {
+        childList: !!o.childList, attributes: !!o.attributes, characterData: !!o.characterData, subtree: !!o.subtree,
+        attributeOldValue: !!o.attributeOldValue, characterDataOldValue: !!o.characterDataOldValue,
+        attributeFilter: o.attributeFilter === undefined ? null : Array.from(o.attributeFilter, String),
+      });
+      mutationObservers.add(this);
+      __wtObserve('mutations', true);
+    }
+    disconnect() {
+      this._targets.clear();
+      this._records = [];
+      mutationObservers.delete(this);
+      if (!mutationObservers.size) __wtObserve('mutations', false);
+    }
+    takeRecords() {
+      const records = this._records;
+      this._records = [];
+      return records;
+    }
+  }
+
+  g.__wtRecordMutation = (type, target, name, oldValue, added, removed, previousSibling, nextSibling) => {
+    for (const mo of mutationObservers) {
+      let wanted = false, withOld = false;
+      for (let n = target; n; n = n.parentNode) {
+        const o = mo._targets.get(n);
+        if (!o || (n !== target && !o.subtree)) continue;
+        if (type === 'attributes' && (!o.attributes || (o.attributeFilter && !o.attributeFilter.includes(name)))) continue;
+        if (type === 'characterData' && !o.characterData) continue;
+        if (type === 'childList' && !o.childList) continue;
+        wanted = true;
+        if ((type === 'attributes' && o.attributeOldValue) || (type === 'characterData' && o.characterDataOldValue)) withOld = true;
+      }
+      if (!wanted) continue;
+      const r = new MutationRecord();
+      Object.assign(r, {
+        type, target,
+        addedNodes: added || [], removedNodes: removed || [],
+        previousSibling: previousSibling || null, nextSibling: nextSibling || null,
+        attributeName: type === 'attributes' ? name : null, attributeNamespace: null,
+        oldValue: withOld ? oldValue : null,
+      });
+      mo._records.push(r);
+      if (!deliveryQueued) {
+        deliveryQueued = true;
+        Promise.resolve().then(deliverMutations);
+      }
+    }
+  };
+  g.MutationObserver = MutationObserver;
+  g.WebKitMutationObserver = MutationObserver;
+  g.MutationRecord = MutationRecord;
+
+  // --- Shared by intersection and resize -------------------------------------
+
+  const intersectionObservers = new Set(), resizeObservers = new Set();
+  const updateLayoutFlag = () => {
+    let any = false;
+    for (const o of intersectionObservers) if (o._targets.size) any = true;
+    for (const o of resizeObservers) if (o._targets.size) any = true;
+    __wtObserve('layout', any);
+  };
+  const rectOf = el => (el && el.isConnected ? __wtRect(el) : null); // [x, y, width, height] in the viewport, or null
+  const checkElement = (target, cls) => {
+    if (!(target instanceof g.Element))
+      throw new TypeError("Failed to execute 'observe' on '" + cls + "': parameter 1 is not of type 'Element'.");
+  };
+
+  // --- IntersectionObserver ----------------------------------------------------
+
+  const getters = (proto, names) => {
+    for (const n of names) Object.defineProperty(proto, n, { get() { return this['_' + n]; }, configurable: true, enumerable: true });
+  };
+  class IntersectionObserverEntry {
+    constructor(init) { for (const k of Object.keys(init)) this['_' + k] = init[k]; }
+  }
+  getters(IntersectionObserverEntry.prototype, ['time', 'rootBounds', 'boundingClientRect', 'intersectionRect',
+    'isIntersecting', 'isVisible', 'intersectionRatio', 'target']);
+
+  // rootMargin: one to four lengths in px or %, as CSS margin shorthand.
+  const parseMargin = value => {
+    const parts = String(value).trim().split(/\s+/).filter(Boolean);
+    if (!parts.length) parts.push('0px');
+    if (parts.length > 4) return null;
+    const out = [];
+    for (const p of parts) {
+      const m = /^(-?(?:\d+\.?\d*|\.\d+))(px|%)$/.exec(p);
+      if (!m) return null;
+      out.push({ value: Number(m[1]), percent: m[2] === '%' });
+    }
+    while (out.length < 4) out.push(out[out.length === 3 ? 1 : out.length === 2 ? 0 : 0]);
+    return out;
+  };
+
+  class IntersectionObserver {
+    constructor(callback, options = {}) {
+      const C = "Failed to construct 'IntersectionObserver': ";
+      if (typeof callback !== 'function') throw new TypeError(C + "The callback provided as parameter 1 is not a function.");
+      const root = options.root === undefined ? null : options.root;
+      if (root !== null && !(root instanceof g.Element) && root !== document)
+        throw new TypeError(C + "Failed to read the 'root' property from 'IntersectionObserverInit': The provided value is not of type '(Document or Element)'.");
+      const margin = parseMargin(options.rootMargin === undefined ? '0px' : options.rootMargin);
+      if (!margin) throw new DOMException(C + 'rootMargin must be specified in absolute length units or percent.', 'SyntaxError');
+      let thresholds = options.threshold === undefined ? [0] : options.threshold;
+      thresholds = (Array.isArray(thresholds) ? thresholds : [thresholds]).map(Number);
+      if (!thresholds.length) thresholds = [0];
+      for (const t of thresholds)
+        if (!(t >= 0 && t <= 1)) throw new RangeError(C + 'Threshold values must be numbers between 0 and 1');
+      thresholds.sort((a, b) => a - b);
+      this._callback = callback;
+      this._root = root;
+      this._margin = margin;
+      this._thresholds = thresholds;
+      this._targets = new Map();
+      this._entries = [];
+    }
+    get root() { return this._root; }
+    get rootMargin() { return this._margin.map(m => m.value + (m.percent ? '%' : 'px')).join(' '); }
+    get thresholds() { return this._thresholds.slice(); }
+    get delay() { return 0; }
+    get trackVisibility() { return false; }
+    observe(target) {
+      checkElement(target, 'IntersectionObserver');
+      if (this._targets.has(target)) return;
+      this._targets.set(target, { index: -1, intersecting: false, checked: false });
+      intersectionObservers.add(this);
+      updateLayoutFlag();
+    }
+    unobserve(target) {
+      this._targets.delete(target);
+      updateLayoutFlag();
+    }
+    disconnect() {
+      this._targets.clear();
+      intersectionObservers.delete(this);
+      updateLayoutFlag();
+    }
+    takeRecords() {
+      const entries = this._entries;
+      this._entries = [];
+      return entries;
+    }
+    // One target, against the root as it is now: an entry if it crossed a
+    // threshold or started or stopped intersecting.
+    _check(target, state, time) {
+      let root;
+      if (this._root === null || this._root === document) root = [0, 0, innerWidth, innerHeight];
+      else root = rectOf(this._root);
+      const t = rectOf(target);
+      let rootBounds = null, intersecting = false, inter = [0, 0, 0, 0], ratio = 0;
+      if (root) {
+        const m = this._margin.map((v, i) => v.percent ? v.value / 100 * (i % 2 ? root[2] : root[3]) : v.value);
+        const top = root[1] - m[0], right = root[0] + root[2] + m[1], bottom = root[1] + root[3] + m[2], left = root[0] - m[3];
+        rootBounds = new DOMRectReadOnly(left, top, right - left, bottom - top);
+        const inside = this._root === null || this._root === document || this._root.contains(target);
+        if (t && inside) {
+          const l = Math.max(t[0], left), tp = Math.max(t[1], top);
+          const r = Math.min(t[0] + t[2], right), b = Math.min(t[1] + t[3], bottom);
+          if (r >= l && b >= tp) {
+            intersecting = true;
+            inter = [l, tp, r - l, b - tp];
+            const area = t[2] * t[3];
+            ratio = area > 0 ? Math.min(1, (inter[2] * inter[3]) / area) : 1;
+          }
+        }
+      }
+      const index = intersecting ? this._thresholds.filter(x => x <= ratio).length : 0;
+      if (index === state.index && intersecting === state.intersecting) return;
+      state.index = index;
+      state.intersecting = intersecting;
+      this._entries.push(new IntersectionObserverEntry({
+        time, rootBounds, target, isIntersecting: intersecting, isVisible: false, intersectionRatio: ratio,
+        boundingClientRect: t ? new DOMRectReadOnly(t[0], t[1], t[2], t[3]) : new DOMRectReadOnly(0, 0, 0, 0),
+        intersectionRect: new DOMRectReadOnly(inter[0], inter[1], inter[2], inter[3]),
+      }));
+    }
+  }
+
+  // --- ResizeObserver ----------------------------------------------------------
+
+  class ResizeObserverSize {
+    constructor(inline, block) { this._inlineSize = inline; this._blockSize = block; }
+  }
+  getters(ResizeObserverSize.prototype, ['inlineSize', 'blockSize']);
+  class ResizeObserverEntry {
+    constructor(init) { for (const k of Object.keys(init)) this['_' + k] = init[k]; }
+  }
+  getters(ResizeObserverEntry.prototype, ['target', 'contentRect', 'borderBoxSize', 'contentBoxSize', 'devicePixelContentBoxSize']);
+
+  const px = v => parseFloat(v) || 0;
+  class ResizeObserver {
+    constructor(callback) {
+      if (typeof callback !== 'function')
+        throw new TypeError("Failed to construct 'ResizeObserver': The callback provided as parameter 1 is not a function.");
+      this._callback = callback;
+      this._targets = new Map();
+    }
+    observe(target, options = {}) {
+      checkElement(target, 'ResizeObserver');
+      const box = options.box === undefined ? 'content-box' : String(options.box);
+      if (!['content-box', 'border-box', 'device-pixel-content-box'].includes(box))
+        throw new TypeError("Failed to execute 'observe' on 'ResizeObserver': Failed to read the 'box' property from 'ResizeObserverOptions': The provided value '" + box + "' is not a valid enum value of type ResizeObserverBoxOptions.");
+      // The last size reported starts at 0 x 0: an element with no size
+      // (display: none) isn't reported until it gets one.
+      this._targets.set(target, { box, width: 0, height: 0, border: null, checked: false });
+      resizeObservers.add(this);
+      updateLayoutFlag();
+    }
+    unobserve(target) {
+      this._targets.delete(target);
+      updateLayoutFlag();
+    }
+    disconnect() {
+      this._targets.clear();
+      resizeObservers.delete(this);
+      updateLayoutFlag();
+    }
+    _check(target, state) {
+      const r = rectOf(target);
+      const bw = r ? r[2] : 0, bh = r ? r[3] : 0;
+      // Padding and border only matter (and are only read) when the
+      // border box changed size.
+      let content = state.content;
+      if (!content || !state.border || state.border[0] !== bw || state.border[1] !== bh) {
+        content = [0, 0, 0, 0];
+        if (r) {
+          const cs = getComputedStyle(target);
+          const pl = px(cs.paddingLeft), pt = px(cs.paddingTop);
+          const w = bw - pl - px(cs.paddingRight) - px(cs.borderLeftWidth) - px(cs.borderRightWidth);
+          const h = bh - pt - px(cs.paddingBottom) - px(cs.borderTopWidth) - px(cs.borderBottomWidth);
+          content = [pl, pt, Math.max(w, 0), Math.max(h, 0)];
+        }
+        state.border = [bw, bh];
+        state.content = content;
+      }
+      const watched = state.box === 'border-box' ? [bw, bh] : [content[2], content[3]];
+      if (watched[0] === state.width && watched[1] === state.height) return null;
+      state.width = watched[0];
+      state.height = watched[1];
+      const dpr = devicePixelRatio;
+      return new ResizeObserverEntry({
+        target,
+        contentRect: new DOMRectReadOnly(content[0], content[1], content[2], content[3]),
+        borderBoxSize: [new ResizeObserverSize(bw, bh)],
+        contentBoxSize: [new ResizeObserverSize(content[2], content[3])],
+        devicePixelContentBoxSize: [new ResizeObserverSize(Math.round(content[2] * dpr), Math.round(content[3] * dpr))],
+      });
+    }
+  }
+
+  // --- Each frame, after layout ---------------------------------------------------
+
+  g.__wtObserverTick = changed => {
+    for (const ro of [...resizeObservers]) {
+      const entries = [];
+      for (const [target, state] of ro._targets) {
+        if (!changed && state.checked) continue;
+        state.checked = true;
+        const e = ro._check(target, state);
+        if (e) entries.push(e);
+      }
+      if (entries.length) {
+        try { ro._callback.call(ro, entries, ro); } catch (e) { __wtReportError(e, 'ResizeObserver'); }
+      }
+    }
+    const time = performance.now();
+    for (const io of [...intersectionObservers]) {
+      for (const [target, state] of io._targets) {
+        if (!changed && state.checked) continue;
+        state.checked = true;
+        io._check(target, state, time);
+      }
+      if (io._entries.length) {
+        const entries = io._entries;
+        io._entries = [];
+        try { io._callback.call(io, entries, io); } catch (e) { __wtReportError(e, 'IntersectionObserver'); }
+      }
+    }
+  };
+
+  Object.assign(g, { IntersectionObserver, IntersectionObserverEntry, ResizeObserver, ResizeObserverEntry, ResizeObserverSize });
+})();
 )JS";
 
 // ---------------------------------------------------------------------
@@ -4542,6 +5016,7 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("__wtScrollTo", 2, js_native_scrollTo),         // behind scrollTo/scrollBy/scrollIntoView
     JS_CFUNC_DEF("__wtMedia", 3, js_native_media),               // behind HTMLMediaElement
     JS_CFUNC_DEF("__wtCanPlayType", 1, js_native_canPlayType),
+    JS_CFUNC_DEF("__wtObserve", 2, js_native_observe),            // behind MutationObserver, IntersectionObserver, ResizeObserver
     JS_CFUNC_DEF("__wtSetFullscreen", 1, js_native_setFullscreen),         // behind requestFullscreen
     JS_CFUNC_DEF("__wtFullscreenElement", 0, js_native_fullscreenElement), // behind document.fullscreenElement
     JS_CFUNC_DEF("__wtReportError", 2, js_native_reportError),

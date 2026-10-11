@@ -342,6 +342,9 @@ private:
     // layoutRoot.boxes by element, rebuilt once per layout when needed.
     std::unordered_map<const Element*, std::vector<size_t>> boxesByElement_;
     unsigned layoutGeneration_ = 0, boxIndexGeneration_ = ~0u;
+    // What runLayoutObservers last saw, to tell it whether anything moved.
+    unsigned observedLayout_ = ~0u;
+    int observedScrollY_ = -1, observedViewW_ = -1, observedViewH_ = -1;
     // Whether page point (docX, docY) is inside the box and its clip.
     bool boxContains(const LayoutBox& b, int docX, int docY) const;
 

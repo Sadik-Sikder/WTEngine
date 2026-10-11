@@ -76,3 +76,8 @@ target_link_libraries(WTEngine PRIVATE "${GLFW3_LIB}" opengl32 wininet qjs
 # Mirrored in WTEngine.vcxproj.
 target_link_libraries(WTEngine PRIVATE delayimp)
 target_link_options(WTEngine PRIVATE /DELAYLOAD:icu.dll)
+
+# A 16 MB main-thread stack, so deep script recursion stops at quickjs's own
+# limit (JSEngine.cpp) with an exception instead of overflowing the thread.
+# Mirrored in WTEngine.vcxproj.
+target_link_options(WTEngine PRIVATE /STACK:16777216)

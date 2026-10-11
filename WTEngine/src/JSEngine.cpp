@@ -95,6 +95,12 @@ static void promiseRejectionTracker(JSContext* ctx, JSValueConst promise, JSValu
 
 JSEngine::JSEngine() {
     rt = JS_NewRuntime();
+    // Deep recursion in page scripts (a framework rendering a big tree) must
+    // hit this limit and throw "Maximum call stack size exceeded" - not run
+    // the thread out of stack, which ends the process. The main thread gets
+    // a 16 MB stack (the /STACK link option); this leaves room in it for
+    // the native code above and below the scripts.
+    JS_SetMaxStackSize(rt, 8 * 1024 * 1024);
     ctx = JS_NewContext(rt);
     state_ = new RuntimeState();
     JS_SetRuntimeOpaque(rt, state_);
