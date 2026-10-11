@@ -6,6 +6,8 @@ WTEngine fetches pages over HTTP(S), parses HTML and CSS, runs the page's JavaSc
 
 It's a learning project, not a replacement for Chrome. Many real sites load and work, though: Wikipedia, BBC News and the DuckDuckGo homepage all render.
 
+![WTEngine showing the Wikipedia article on web browsers](WTEngine/docs/screenshot.png)
+
 ## What it can do
 
 **Loading pages**
@@ -116,6 +118,10 @@ The larger gaps:
 - **Scrolling:** only the page itself scrolls, not elements inside it.
 - **Paint and layout:** layout is a full pass on every change, with no incremental layout. Painting uses fixed-function OpenGL on the main thread.
 - **Platform:** Windows only.
+
+## License
+
+WTEngine is released under the [MIT License](LICENSE). The third-party code below keeps its own licenses.
 
 ## Third-party code
 
