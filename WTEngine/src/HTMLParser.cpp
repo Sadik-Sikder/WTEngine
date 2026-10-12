@@ -147,6 +147,7 @@ std::shared_ptr<Element> HTMLParser::parseElement() {
     auto elem = std::make_shared<Element>(name);
     auto attrs = parseAttributes();
     elem->attrs = attrs;
+    if (name == L"script") elem->parserInserted = elem->scriptStarted = true;
     // consume '>'
     while (pos < s.size() && s[pos] != L'>') pos++;
     if (pos < s.size() && s[pos] == L'>') pos++;
@@ -200,6 +201,19 @@ std::shared_ptr<Element> HTMLParser::parseElement() {
     open_.push_back(name);
     while (true) {
         if (pos >= s.size()) break;
+        if (startsWith(L"<!--")) {
+            // Kept, as scripts see them: frameworks mark where server-
+            // rendered parts begin and end with comments (Vue's <!--[-->).
+            // Layout passes over it - see TextNode::comment.
+            size_t end = s.find(L"-->", pos + 4);
+            if (end == std::wstring::npos) end = s.size();
+            auto comment = std::make_shared<TextNode>(L"");
+            comment->comment = true;
+            comment->data = s.substr(pos + 4, end - pos - 4);
+            elem->children.push_back(comment);
+            pos = std::min(end + 3, s.size());
+            continue;
+        }
         if (skipMarkup()) continue;
         if (startsWith(L"</")) {
             // An end tag: our own closes us. One for an element we're

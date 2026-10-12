@@ -312,7 +312,7 @@ static void recordAttribute(JSContext* ctx, Element* el, const std::wstring& nam
 // A text node about to change.
 static void recordText(JSContext* ctx, TextNode* t) {
     if (!observingMutations(ctx)) return;
-    std::wstring old = t->text;
+    std::wstring old = t->comment ? t->data : t->text;
     reportMutation(ctx, "characterData", t, nullptr, &old, JS_UNDEFINED, JS_UNDEFINED, nullptr, nullptr);
 }
 
@@ -345,9 +345,14 @@ static void gatherText(Node* n, std::wstring& out) {
     for (auto& c : static_cast<Element*>(n)->children) gatherText(c.get(), out);
 }
 
+static bool isComment(const Node* n) {
+    return n && n->type == Node::TEXT && static_cast<const TextNode*>(n)->comment;
+}
+
 static JSValue js_get_textContent(JSContext* ctx, JSValueConst this_val) {
     Node* n = unwrapNode(this_val);
     if (!n) return JS_NULL;
+    if (isComment(n)) return jsStr(ctx, static_cast<TextNode*>(n)->data);
     std::wstring out;
     gatherText(n, out);
     return jsStr(ctx, out);
@@ -362,7 +367,7 @@ static JSValue js_set_textContent(JSContext* ctx, JSValueConst this_val, JSValue
 
     if (n->type == Node::TEXT) {
         recordText(ctx, static_cast<TextNode*>(n));
-        static_cast<TextNode*>(n)->text = text;
+        (isComment(n) ? static_cast<TextNode*>(n)->data : static_cast<TextNode*>(n)->text) = text;
     }
     else {
         auto* el = static_cast<Element*>(n);
@@ -411,7 +416,9 @@ static void serializeChildren(const Element* el, std::wstring& out) {
 
 static void serializeNode(const Node* n, std::wstring& out, bool rawText) {
     if (n->type == Node::TEXT) {
-        const std::wstring& t = static_cast<const TextNode*>(n)->text;
+        const auto* tn = static_cast<const TextNode*>(n);
+        if (tn->comment) { out += L"<!--" + tn->data + L"-->"; return; }
+        const std::wstring& t = tn->text;
         if (rawText) out += t;
         else escapeHTML(t, false, out);
         return;
@@ -519,12 +526,17 @@ static JSValue js_getAttribute(JSContext* ctx, JSValueConst this_val, int argc, 
     return it == el->attrs.end() ? JS_NULL : jsStr(ctx, it->second);
 }
 
+static void runInsertedScripts(DOMBindingState* state, Element* parent, const std::vector<Node*>& nodes);
+
 static JSValue js_setAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     if (Element* el = unwrapElement(this_val); el && argc >= 2) {
         std::wstring name = argStr(ctx, argc, argv, 0);
         recordAttribute(ctx, el, name);
         el->attrs[name] = argStr(ctx, argc, argv, 1);
         markDirty(ctx);
+        // A script already in the page with nothing to run gets its src.
+        if (name == L"src" && el->tag == L"script" && el->parent)
+            if (DOMBindingState* state = bindingState(ctx)) runInsertedScripts(state, el->parent, { el });
     }
     return JS_UNDEFINED;
 }
@@ -572,6 +584,14 @@ static JSValue js_createDocumentFragment(JSContext* ctx, JSValueConst, int, JSVa
 static JSValue js_createTextNode(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
     if (argc < 1) return JS_NULL;
     auto node = std::make_shared<TextNode>(argStr(ctx, argc, argv, 0));
+    if (DOMBindingState* s = bindingState(ctx)) s->detachedNodes.push_back(node);
+    return wrapNode(ctx, node.get());
+}
+
+static JSValue js_createComment(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    auto node = std::make_shared<TextNode>(L"");
+    node->comment = true;
+    node->data = argc > 0 ? argStr(ctx, argc, argv, 0) : L"";
     if (DOMBindingState* s = bindingState(ctx)) s->detachedNodes.push_back(node);
     return wrapNode(ctx, node.get());
 }
@@ -685,6 +705,27 @@ static void recordInsertion(JSContext* ctx, Element* parent, Node* first, size_t
                    i > 0 ? childAt(parent, i - 1) : nullptr, childAt(parent, i + count));
 }
 
+static void collectNewScripts(Node* node, std::vector<Element*>& out) {
+    if (node->type != Node::ELEMENT) return;
+    auto* el = static_cast<Element*>(node);
+    if (el->tag == L"script") {
+        if (!el->scriptStarted && !el->parserInserted) out.push_back(el);
+        return;
+    }
+    for (auto& c : el->children) collectNewScripts(c.get(), out);
+}
+
+// After nodes went into `parent`: any script among them (or `parent`
+// itself, a script given its text) that a page's script made, now in the
+// document and not yet run, runs - see DOMBindingState::runScript.
+static void runInsertedScripts(DOMBindingState* state, Element* parent, const std::vector<Node*>& nodes) {
+    if (!state->runScript || !state->documentEl || topOf(parent) != topOf(state->documentEl)) return;
+    std::vector<Element*> scripts;
+    if (parent->tag == L"script") collectNewScripts(parent, scripts);
+    else for (Node* n : nodes) collectNewScripts(n, scripts);
+    for (Element* s : scripts) state->runScript(s);
+}
+
 // Inserts `node` into `parent` before `ref` (nullptr = at the end), moving
 // it from wherever it was. `ref` must be a child of `parent`.
 static JSValue insertNode(JSContext* ctx, Element* parent, JSValueConst nodeVal, Node* ref) {
@@ -708,6 +749,9 @@ static JSValue insertNode(JSContext* ctx, Element* parent, JSValueConst nodeVal,
         kids.insert(pos, moved.begin(), moved.end());
         if (!moved.empty()) recordInsertion(ctx, parent, moved.front().get(), moved.size());
         markDirty(ctx);
+        std::vector<Node*> inserted;
+        for (auto& c : moved) inserted.push_back(c.get());
+        runInsertedScripts(state, parent, inserted);
         return JS_DupValue(ctx, nodeVal);
     }
 
@@ -721,6 +765,7 @@ static JSValue insertNode(JSContext* ctx, Element* parent, JSValueConst nodeVal,
     if (node->type == Node::ELEMENT) static_cast<Element*>(node)->parent = parent;
     recordInsertion(ctx, parent, node, 1);
     markDirty(ctx);
+    runInsertedScripts(state, parent, { node });
     return JS_DupValue(ctx, nodeVal);
 }
 
@@ -811,32 +856,47 @@ static void findById(Node* n, const std::wstring& id, Element*& out) {
     for (auto& c : el->children) { findById(c.get(), id, out); if (out) return; }
 }
 
+// Where a search called on `this_val` looks. `document` wraps <body> (see
+// installDOMBindings), but searching it means the whole page - <head>
+// and <html> too - so for it this is the top of the tree, which itself
+// counts (`withRoot`). Any other element searches only below itself.
+static Element* searchRoot(JSContext* ctx, JSValueConst this_val, bool& withRoot) {
+    Element* el = unwrapElement(this_val);
+    DOMBindingState* state = bindingState(ctx);
+    withRoot = el && state && el == state->documentEl;
+    return withRoot ? topOf(el) : el;
+}
+
 static JSValue js_getElementById(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    Element* root = unwrapElement(this_val);
+    bool withRoot;
+    Element* root = searchRoot(ctx, this_val, withRoot);
     if (!root || argc < 1) return JS_NULL;
     std::wstring id = argStr(ctx, argc, argv, 0);
 
     Element* found = nullptr;
-    for (auto& c : root->children) { findById(c.get(), id, found); if (found) break; }
+    if (withRoot) findById(root, id, found);
+    else for (auto& c : root->children) { findById(c.get(), id, found); if (found) break; }
     return wrapNode(ctx, found);
 }
 
 static void findByTag(Node* n, const std::wstring& tag, std::vector<Element*>& out) {
     if (!n || n->type != Node::ELEMENT) return;
     auto* el = static_cast<Element*>(n);
-    if (el->tag == tag) out.push_back(el);
+    if (tag == L"*" ? !isFragment(el) : el->tag == tag) out.push_back(el);
     for (auto& c : el->children) findByTag(c.get(), tag, out);
 }
 
 static JSValue js_getElementsByTagName(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    Element* root = unwrapElement(this_val);
+    bool withRoot;
+    Element* root = searchRoot(ctx, this_val, withRoot);
     JSValue arr = JS_NewArray(ctx);
     if (!root || argc < 1) return arr;
     std::wstring tag = argStr(ctx, argc, argv, 0);
     for (auto& c : tag) c = (wchar_t)towlower(c);
 
     std::vector<Element*> found;
-    for (auto& c : root->children) findByTag(c.get(), tag, found);
+    if (withRoot) findByTag(root, tag, found);
+    else for (auto& c : root->children) findByTag(c.get(), tag, found);
     for (size_t i = 0; i < found.size(); i++)
         JS_SetPropertyUint32(ctx, arr, (uint32_t)i, wrapNode(ctx, found[i]));
     return arr;
@@ -847,8 +907,38 @@ static JSValue js_getElementsByTagName(JSContext* ctx, JSValueConst this_val, in
 // and matcher stylesheet rules use against Layout's ancestorStack - rather
 // than duplicating either here.
 
-static bool parseSingleSelector(const std::wstring& sel, CSS::Rule& outRule) {
-    return CSS::parseSelector(sel, outRule.chain);
+// A selector list ("a, .b > c"): one rule per selector, split at the
+// commas that aren't inside (...), [...] or quotes. A selector this engine
+// can't evaluate is left out; false only if none is left.
+using SelectorList = std::vector<CSS::Rule>;
+
+static bool parseSelectorList(const std::wstring& sel, SelectorList& out) {
+    size_t start = 0;
+    int depth = 0;
+    wchar_t quote = 0;
+    for (size_t i = 0; i <= sel.size(); i++) {
+        if (i < sel.size()) {
+            wchar_t c = sel[i];
+            if (c == L'\\') { i++; continue; }
+            if (quote) { if (c == quote) quote = 0; continue; }
+            if (c == L'"' || c == L'\'') { quote = c; continue; }
+            if (c == L'(' || c == L'[') { depth++; continue; }
+            if ((c == L')' || c == L']') && depth > 0) { depth--; continue; }
+            if (c != L',' || depth > 0) continue;
+        }
+        std::wstring part = sel.substr(start, std::min(i, sel.size()) - start);
+        size_t a = part.find_first_not_of(L" \t\r\n"), b = part.find_last_not_of(L" \t\r\n");
+        CSS::Rule rule;
+        if (a != std::wstring::npos && CSS::parseSelector(part.substr(a, b - a + 1), rule.chain))
+            out.push_back(std::move(rule));
+        start = i + 1;
+    }
+    return !out.empty();
+}
+
+static bool matchesAny(const SelectorList& rules, const std::vector<Element*>& ancestors, Element* el) {
+    for (const auto& rule : rules) if (CSS::matches(rule, ancestors, el)) return true;
+    return false;
 }
 
 // `ancestors` starts empty at `root` (the search root, e.g. `document`),
@@ -857,44 +947,60 @@ static bool parseSingleSelector(const std::wstring& sel, CSS::Rule& outRule) {
 // ancestors within the subtree being searched, not root's real ancestors
 // further up the page (which querySelector on a scoped element wouldn't
 // see either, in a real browser, for this simple case).
-static void queryAll(Element* el, const CSS::Rule& rule, std::vector<Element*>& ancestors,
+static void queryAll(Element* el, const SelectorList& rules, std::vector<Element*>& ancestors,
                      std::vector<Element*>& out, bool stopAtFirst) {
     for (auto& child : el->children) {
         if (child->type != Node::ELEMENT) continue;
         auto* ce = static_cast<Element*>(child.get());
-        if (CSS::matches(rule, ancestors, ce)) {
+        if (matchesAny(rules, ancestors, ce)) {
             out.push_back(ce);
             if (stopAtFirst) return;
         }
         ancestors.push_back(ce);
-        queryAll(ce, rule, ancestors, out, stopAtFirst);
+        queryAll(ce, rules, ancestors, out, stopAtFirst);
         ancestors.pop_back();
         if (stopAtFirst && !out.empty()) return;
     }
 }
 
+// queryAll from searchRoot: on `document`, <html> itself is a candidate
+// and the ancestor of everything else.
+static void querySearch(JSContext* ctx, JSValueConst this_val, const SelectorList& rules,
+                        std::vector<Element*>& found, bool stopAtFirst) {
+    bool withRoot;
+    Element* root = searchRoot(ctx, this_val, withRoot);
+    if (!root) return;
+    std::vector<Element*> ancestors;
+    if (withRoot) {
+        if (matchesAny(rules, ancestors, root)) {
+            found.push_back(root);
+            if (stopAtFirst) return;
+        }
+        ancestors.push_back(root);
+    }
+    queryAll(root, rules, ancestors, found, stopAtFirst);
+}
+
 static JSValue js_querySelector(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    Element* root = unwrapElement(this_val);
-    if (!root || argc < 1) return JS_NULL;
+    if (!unwrapElement(this_val) || argc < 1) return JS_NULL;
 
-    CSS::Rule rule;
-    if (!parseSingleSelector(argStr(ctx, argc, argv, 0), rule)) return JS_NULL;
+    SelectorList rules;
+    if (!parseSelectorList(argStr(ctx, argc, argv, 0), rules)) return JS_NULL;
 
-    std::vector<Element*> ancestors, found;
-    queryAll(root, rule, ancestors, found, true);
+    std::vector<Element*> found;
+    querySearch(ctx, this_val, rules, found, true);
     return found.empty() ? JS_NULL : wrapNode(ctx, found[0]);
 }
 
 static JSValue js_querySelectorAll(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    Element* root = unwrapElement(this_val);
     JSValue arr = JS_NewArray(ctx);
-    if (!root || argc < 1) return arr;
+    if (!unwrapElement(this_val) || argc < 1) return arr;
 
-    CSS::Rule rule;
-    if (!parseSingleSelector(argStr(ctx, argc, argv, 0), rule)) return arr;
+    SelectorList rules;
+    if (!parseSelectorList(argStr(ctx, argc, argv, 0), rules)) return arr;
 
-    std::vector<Element*> ancestors, found;
-    queryAll(root, rule, ancestors, found, false);
+    std::vector<Element*> found;
+    querySearch(ctx, this_val, rules, found, false);
     for (size_t i = 0; i < found.size(); i++)
         JS_SetPropertyUint32(ctx, arr, (uint32_t)i, wrapNode(ctx, found[i]));
     return arr;
@@ -930,24 +1036,32 @@ static void findByClasses(Element* el, const std::vector<std::wstring>& want, st
 
 // Every descendant with all the given classes, in document order.
 static JSValue js_getElementsByClassName(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    Element* root = unwrapElement(this_val);
+    bool withRoot;
+    Element* root = searchRoot(ctx, this_val, withRoot);
     JSValue arr = JS_NewArray(ctx);
     if (!root || argc < 1) return arr;
     std::vector<std::wstring> want = splitSpaces(argStr(ctx, argc, argv, 0));
     if (want.empty()) return arr;
     std::vector<Element*> found;
+    if (withRoot) { // <html class="...">
+        auto cls = root->attrs.find(L"class");
+        std::vector<std::wstring> have = cls == root->attrs.end() ? std::vector<std::wstring>{} : splitSpaces(cls->second);
+        if (std::all_of(want.begin(), want.end(), [&](const std::wstring& w) {
+                return std::find(have.begin(), have.end(), w) != have.end(); }))
+            found.push_back(root);
+    }
     findByClasses(root, want, found);
     for (size_t i = 0; i < found.size(); i++)
         JS_SetPropertyUint32(ctx, arr, (uint32_t)i, wrapNode(ctx, found[i]));
     return arr;
 }
 
-// Whether `el` matches `rule`, with its real ancestors (outermost first).
-static bool elementMatches(Element* el, const CSS::Rule& rule) {
+// Whether `el` matches any of `rules`, with its real ancestors (outermost first).
+static bool elementMatches(Element* el, const SelectorList& rules) {
     std::vector<Element*> ancestors;
     for (Element* a = el->parent; a; a = a->parent) ancestors.push_back(a);
     std::reverse(ancestors.begin(), ancestors.end());
-    return CSS::matches(rule, ancestors, el);
+    return matchesAny(rules, ancestors, el);
 }
 
 static JSValue throwSyntaxError(JSContext* ctx, const std::wstring& sel) {
@@ -959,9 +1073,9 @@ static JSValue js_matches(JSContext* ctx, JSValueConst this_val, int argc, JSVal
     Element* el = unwrapElement(this_val);
     if (!el || argc < 1) return JS_FALSE;
     std::wstring sel = argStr(ctx, argc, argv, 0);
-    CSS::Rule rule;
-    if (!parseSingleSelector(sel, rule)) return throwSyntaxError(ctx, sel);
-    return JS_NewBool(ctx, elementMatches(el, rule));
+    SelectorList rules;
+    if (!parseSelectorList(sel, rules)) return throwSyntaxError(ctx, sel);
+    return JS_NewBool(ctx, elementMatches(el, rules));
 }
 
 // The element itself or its nearest ancestor matching the selector.
@@ -969,10 +1083,10 @@ static JSValue js_closest(JSContext* ctx, JSValueConst this_val, int argc, JSVal
     Element* el = unwrapElement(this_val);
     if (!el || argc < 1) return JS_NULL;
     std::wstring sel = argStr(ctx, argc, argv, 0);
-    CSS::Rule rule;
-    if (!parseSingleSelector(sel, rule)) return throwSyntaxError(ctx, sel);
+    SelectorList rules;
+    if (!parseSelectorList(sel, rules)) return throwSyntaxError(ctx, sel);
     for (Element* a = el; a; a = a->parent)
-        if (elementMatches(a, rule)) return wrapNode(ctx, a);
+        if (elementMatches(a, rules)) return wrapNode(ctx, a);
     return JS_NULL;
 }
 
@@ -991,10 +1105,11 @@ static JSValue js_contains(JSContext* ctx, JSValueConst this_val, int argc, JSVa
 // --- cloneNode -----------------------------------------------------------
 
 static std::shared_ptr<Node> cloneTree(const Node* n, bool deep) {
-    if (n->type == Node::TEXT) return std::make_shared<TextNode>(static_cast<const TextNode*>(n)->text);
+    if (n->type == Node::TEXT) return std::make_shared<TextNode>(*static_cast<const TextNode*>(n)); // a comment stays one
     const auto* el = static_cast<const Element*>(n);
     auto copy = std::make_shared<Element>(el->tag);
     copy->attrs = el->attrs;
+    copy->scriptStarted = el->scriptStarted; // a copy of a script that ran won't run either
     if (deep) {
         for (const auto& c : el->children) {
             auto child = cloneTree(c.get(), true);
@@ -1076,13 +1191,13 @@ static JSValue js_get_currentScript(JSContext* ctx, JSValueConst) {
 
 static JSValue js_get_nodeType(JSContext* ctx, JSValueConst this_val) {
     Node* n = unwrapNode(this_val);
-    return JS_NewInt32(ctx, !n ? 0 : n->type == Node::TEXT ? 3 : isFragment(n) ? 11 : 1);
+    return JS_NewInt32(ctx, !n ? 0 : isComment(n) ? 8 : n->type == Node::TEXT ? 3 : isFragment(n) ? 11 : 1);
 }
 
 static JSValue js_get_nodeName(JSContext* ctx, JSValueConst this_val) {
     Node* n = unwrapNode(this_val);
     if (!n) return JS_NULL;
-    if (n->type == Node::TEXT) return jsStr(ctx, L"#text");
+    if (n->type == Node::TEXT) return jsStr(ctx, isComment(n) ? L"#comment" : L"#text");
     if (isFragment(n)) return jsStr(ctx, L"#document-fragment");
     std::wstring upper = static_cast<Element*>(n)->tag;
     for (auto& c : upper) c = (wchar_t)towupper(c);
@@ -1093,7 +1208,8 @@ static JSValue js_get_nodeName(JSContext* ctx, JSValueConst this_val) {
 static JSValue js_get_nodeValue(JSContext* ctx, JSValueConst this_val) {
     Node* n = unwrapNode(this_val);
     if (!n || n->type != Node::TEXT) return JS_NULL;
-    return jsStr(ctx, static_cast<TextNode*>(n)->text);
+    auto* t = static_cast<TextNode*>(n);
+    return jsStr(ctx, t->comment ? t->data : t->text);
 }
 
 static JSValue js_set_nodeValue(JSContext* ctx, JSValueConst this_val, JSValueConst val) {
@@ -1101,7 +1217,8 @@ static JSValue js_set_nodeValue(JSContext* ctx, JSValueConst this_val, JSValueCo
     if (!n || n->type != Node::TEXT) return JS_UNDEFINED;
     const char* s = JS_ToCString(ctx, val);
     recordText(ctx, static_cast<TextNode*>(n));
-    static_cast<TextNode*>(n)->text = utf8ToWide(s);
+    auto* t = static_cast<TextNode*>(n);
+    (t->comment ? t->data : t->text) = utf8ToWide(s);
     JS_FreeCString(ctx, s);
     markDirty(ctx);
     return JS_UNDEFINED;
@@ -1769,6 +1886,13 @@ static JSValue js_native_media(JSContext* ctx, JSValueConst, int argc, JSValueCo
     double out = 0;
     if (!state->media.get || !state->media.get(el, name, out)) return JS_UNDEFINED;
     return JS_NewFloat64(ctx, out);
+}
+
+// __wtParserInserted(script) -> whether the HTML parser made it (behind
+// script.async, which is true for a script's own unless it says otherwise).
+static JSValue js_native_parserInserted(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Element* el = argc > 0 ? unwrapElement(argv[0]) : nullptr;
+    return JS_NewBool(ctx, el && el->parserInserted);
 }
 
 // __wtCanPlayType(type) -> "probably", "maybe" or "".
@@ -3039,10 +3163,61 @@ static const char kBootstrapJS[] = R"JS(
   };
   g.__wtInspect = v => inspect(v, 0, []);
 
-  // console.*: plain strings print as-is, anything else via inspect.
-  const fmt = args => args.map(a => typeof a === 'string' ? a : inspect(a, 0, [])).join(' ');
-  for (const [name, level] of [['log', 0], ['info', 0], ['debug', 0], ['warn', 1], ['error', 2]])
+  // console.*: plain strings print as-is, anything else via inspect. A
+  // first argument with %s/%d/%i/%f/%o/%O/%c takes the arguments after it
+  // in their place (%c's CSS is dropped), as in browsers.
+  let indent = '';
+  const fmt = args => {
+    args = args.slice();
+    let head = '';
+    if (typeof args[0] === 'string' && args[0].includes('%')) {
+      const f = args.shift();
+      head = f.replace(/%([sdifoOc%])/g, (m, k) => {
+        if (k === '%') return '%';
+        if (!args.length) return m;
+        const v = args.shift();
+        if (k === 'c') return '';
+        if (k === 's') return typeof v === 'string' ? v : inspect(v, 1, []);
+        if (k === 'd' || k === 'i') return typeof v === 'symbol' ? 'NaN' : String(parseInt(v, 10));
+        if (k === 'f') return typeof v === 'symbol' ? 'NaN' : String(parseFloat(v));
+        return inspect(v, 0, []);
+      });
+    }
+    const rest = args.map(a => typeof a === 'string' ? a : inspect(a, 0, [])).join(' ');
+    return indent + (head && rest ? head + ' ' + rest : head || rest);
+  };
+  for (const [name, level] of [['log', 0], ['info', 0], ['debug', 0], ['warn', 1], ['error', 2],
+                               ['dir', 0], ['dirxml', 0], ['table', 0]])
     console[name] = (...args) => __wtConsole(level, fmt(args));
+  console.trace = (...args) => {
+    const stack = (new Error().stack || '').split('\n').slice(1).join('\n');
+    __wtConsole(0, fmt(['Trace' + (args.length ? ':' : ''), ...args]) + (stack ? '\n' + stack : ''));
+  };
+  console.assert = (cond, ...args) => {
+    if (!cond) __wtConsole(2, fmt(['Assertion failed' + (args.length ? ':' : ''), ...args]));
+  };
+  const counts = new Map(), timers = new Map();
+  console.count = (label = 'default') => {
+    label = String(label);
+    counts.set(label, (counts.get(label) || 0) + 1);
+    __wtConsole(0, fmt([label + ': ' + counts.get(label)]));
+  };
+  console.countReset = (label = 'default') => { counts.delete(String(label)); };
+  console.time = (label = 'default') => { timers.set(String(label), performance.now()); };
+  const elapsed = (label, args, end) => {
+    label = String(label);
+    if (!timers.has(label)) { __wtConsole(1, fmt(["Timer '" + label + "' does not exist"])); return; }
+    __wtConsole(0, fmt([label + ': ' + (performance.now() - timers.get(label)) + ' ms', ...args]));
+    if (end) timers.delete(label);
+  };
+  console.timeLog = (label = 'default', ...args) => elapsed(label, args, false);
+  console.timeEnd = (label = 'default') => elapsed(label, [], true);
+  console.group = console.groupCollapsed = (...args) => {
+    if (args.length) __wtConsole(0, fmt(args));
+    indent += '  ';
+  };
+  console.groupEnd = () => { indent = indent.slice(2); };
+  console.clear = () => {};
   const kebab = p => p === 'cssFloat' ? 'float' : p.replace(/[A-Z]/g, m => '-' + m.toLowerCase());
   const parse = el => {
     const out = [];
@@ -3805,9 +3980,9 @@ static const char kBootstrapJS[] = R"JS(
     Object.defineProperty(Node, k, { value: v, enumerable: true });
     Object.defineProperty(nodeProto, k, { value: v, configurable: true });
   }
-  const CharacterData = iface('CharacterData', v => isNode(v) && v.nodeType === 3, Node);
+  const CharacterData = iface('CharacterData', v => isNode(v) && (v.nodeType === 3 || v.nodeType === 8), Node);
   iface('Text', v => isNode(v) && v.nodeType === 3, CharacterData);
-  iface('Comment', () => false, CharacterData); // the parser drops comments
+  iface('Comment', v => isNode(v) && v.nodeType === 8, CharacterData);
   iface('DocumentFragment', v => isNode(v) && v.nodeType === 11, Node);
   // `document` wraps <body> here (so it's an Element too).
   const Document = iface('Document', v => v === document, Node);
@@ -3817,6 +3992,10 @@ static const char kBootstrapJS[] = R"JS(
   const SVGElement = iface('SVGElement', v => isElement(v) && inSvg(v), Element);
   iface('SVGSVGElement', v => isElement(v) && tagOf(v) === 'svg', SVGElement);
   iface('SVGGraphicsElement', v => isElement(v) && inSvg(v) && tagOf(v) !== 'svg', SVGElement);
+  // SVG's animated values: an <a> inside <svg> has a plain string href
+  // here, so nothing is one - but pages test for them (instanceof).
+  for (const name of ['SVGAnimatedString', 'SVGAnimatedLength', 'SVGAnimatedNumber', 'SVGAnimatedTransformList'])
+    g[name] = g[name] || { [name]: class { constructor() { throw new TypeError('Illegal constructor'); } } }[name];
 
   const tagClasses = {
     HTMLAnchorElement: 'a', HTMLAreaElement: 'area', HTMLBRElement: 'br', HTMLBaseElement: 'base',
@@ -3844,6 +4023,30 @@ static const char kBootstrapJS[] = R"JS(
   }
   for (const [name, tag] of [['HTMLAudioElement', 'audio'], ['HTMLVideoElement', 'video']])
     iface(name, v => isHTML(v) && tagOf(v) === tag, g.HTMLMediaElement);
+
+  // Object.prototype.toString.call(node): "[object HTMLDivElement]" and so
+  // on. Libraries tell DOM nodes from plain objects by it - Vue's
+  // reactive() would otherwise wrap an element in a Proxy.
+  const classOfTag = { audio: 'HTMLAudioElement', video: 'HTMLVideoElement' };
+  for (const [name, tags] of Object.entries(tagClasses))
+    for (const t of tags.split(' ')) if (!classOfTag[t]) classOfTag[t] = name;
+  Object.defineProperty(nodeProto, Symbol.toStringTag, {
+    configurable: true,
+    get() {
+      if (this === nodeProto) return 'Node';
+      if (this === document) return 'HTMLDocument';
+      switch (this.nodeType) {
+        case 3: return 'Text';
+        case 8: return 'Comment';
+        case 11: return 'DocumentFragment';
+        case 1: break;
+        default: return 'Node';
+      }
+      const tag = tagOf(this);
+      if (inSvg(this)) return tag === 'svg' ? 'SVGSVGElement' : 'SVGElement';
+      return classOfTag[tag] || 'HTMLElement'; // section, nav, b, em, a custom element ...
+    },
+  });
 
   // Query results are plain arrays here.
   iface('NodeList', v => Array.isArray(v));
@@ -4516,6 +4719,360 @@ static const char kBootstrapJS[] = R"JS(
   g.Audio.prototype = nodeProto;
 })();
 
+// <script>: HTMLScriptElement's properties, each reflecting its attribute
+// (setting src on a script a page inserted is what loads it - Engine runs
+// scripts as they're inserted). Like the media ones above, only <script>s
+// have them; other elements see what was there before.
+(() => {
+  const g = globalThis;
+  const nodeProto = Object.getPrototypeOf(document);
+  const isScript = el => el !== nodeProto && el.nodeType === 1 && el.localName === 'script';
+  const define = (name, get, set) => {
+    const prev = Object.getOwnPropertyDescriptor(nodeProto, name);
+    Object.defineProperty(nodeProto, name, {
+      configurable: true,
+      get() {
+        if (isScript(this)) return get.call(this);
+        return prev && prev.get ? prev.get.call(this) : undefined;
+      },
+      set(v) {
+        if (isScript(this)) { set.call(this, v); return; }
+        if (prev && prev.set) { prev.set.call(this, v); return; }
+        Object.defineProperty(this, name, { value: v, writable: true, enumerable: true, configurable: true });
+      },
+    });
+  };
+  const flag = (name, attr) => define(name,
+    function () { return this.hasAttribute(attr); },
+    function (v) { if (v) this.setAttribute(attr, ''); else this.removeAttribute(attr); });
+  const text = (name, attr) => define(name,
+    function () { return this.getAttribute(attr) || ''; },
+    function (v) { this.setAttribute(attr, String(v)); });
+
+  define('src', function () {
+    const a = this.getAttribute('src');
+    if (a === null) return '';
+    try { return new URL(a, location.href).href; } catch (e) { return a; }
+  }, function (v) { this.setAttribute('src', String(v)); });
+  text('type', 'type');
+  text('charset', 'charset');
+  text('integrity', 'integrity');
+  text('nonce', 'nonce');
+  text('event', 'event');
+  text('htmlFor', 'for');
+  text('referrerPolicy', 'referrerpolicy');
+  define('crossOrigin', function () { return this.getAttribute('crossorigin'); },
+    function (v) { if (v === null) this.removeAttribute('crossorigin'); else this.setAttribute('crossorigin', String(v)); });
+  // A script a page creates is async unless it sets async = false.
+  const forcedOff = new WeakSet();
+  define('async', function () {
+    return this.hasAttribute('async') || (!forcedOff.has(this) && !__wtParserInserted(this));
+  }, function (v) {
+    forcedOff.add(this);
+    if (v) this.setAttribute('async', ''); else this.removeAttribute('async');
+  });
+  flag('defer', 'defer');
+  flag('noModule', 'nomodule');
+  define('text', function () { return this.textContent; }, function (v) { this.textContent = String(v); });
+
+  g.HTMLScriptElement.supports = function supports(type) {
+    return ['classic', 'module', 'importmap'].includes(String(type));
+  };
+
+  // document.scripts and the other element lists by tag.
+  const list = (name, tag) => Object.defineProperty(document, name, {
+    configurable: true, enumerable: true,
+    get() { return document.getElementsByTagName(tag); },
+  });
+  list('scripts', 'script');
+  list('images', 'img');
+  list('forms', 'form');
+  list('embeds', 'embed');
+  list('plugins', 'embed');
+  Object.defineProperty(document, 'links', {
+    configurable: true, enumerable: true,
+    get() { return document.querySelectorAll('a[href], area[href]'); },
+  });
+})();
+
+// <template>.content: its contents as a DocumentFragment. The parser and
+// innerHTML put them in the element itself; reading content moves whatever
+// is there now into the template's fragment (in place of what it held -
+// as innerHTML on a template replaces its contents).
+(() => {
+  const nodeProto = Object.getPrototypeOf(document);
+  const fragments = new WeakMap();
+  const prev = Object.getOwnPropertyDescriptor(nodeProto, 'content');
+  Object.defineProperty(nodeProto, 'content', {
+    configurable: true,
+    get() {
+      if (this === nodeProto || this.nodeType !== 1 || this.localName !== 'template')
+        return prev && prev.get ? prev.get.call(this) : undefined;
+      let f = fragments.get(this);
+      if (!f) { f = document.createDocumentFragment(); fragments.set(this, f); }
+      if (this.firstChild) f.replaceChildren(...Array.from(this.childNodes));
+      return f;
+    },
+    set(v) {
+      if (prev && prev.set) { prev.set.call(this, v); return; }
+      Object.defineProperty(this, 'content', { value: v, writable: true, enumerable: true, configurable: true });
+    },
+  });
+})();
+
+// Element properties that mirror an attribute - a.href, img.alt,
+// input.name, el.hidden, td.colSpan ... - by the HTML spec's reflection
+// rules: a string is the attribute or '', a URL the attribute resolved
+// against the page, a boolean whether the attribute is there, a number the
+// attribute parsed (or a default), an enumerated value one of its keywords
+// (or a default). Setting one sets the attribute. Like the media ones,
+// each lives on the shared node prototype for the elements that have it;
+// on any other element it's whatever was there before.
+(() => {
+  const nodeProto = Object.getPrototypeOf(document);
+  const HTML_NS = 'http://www.w3.org/1999/xhtml';
+  const base = () => {
+    const b = document.querySelector('base[href]');
+    try { return b ? new URL(b.getAttribute('href'), location.href).href : location.href; } catch (e) { return location.href; }
+  };
+  const absolute = v => { try { return new URL(v, base()).href; } catch (e) { return v; } };
+  const kinds = {
+    str: attr => [function () { const v = this.getAttribute(attr); return v === null ? '' : v; },
+      function (v) { this.setAttribute(attr, String(v)); }],
+    url: attr => [function () { const v = this.getAttribute(attr); return v === null ? '' : absolute(v.trim()); },
+      function (v) { this.setAttribute(attr, String(v)); }],
+    bool: attr => [function () { return this.hasAttribute(attr); },
+      function (v) { if (v) this.setAttribute(attr, ''); else this.removeAttribute(attr); }],
+    long: (attr, dflt, min) => [function () {
+      const v = this.getAttribute(attr);
+      const n = v === null ? NaN : parseInt(v, 10);
+      return Number.isNaN(n) || (min !== undefined && n < min) ? dflt : n;
+    }, function (v) { this.setAttribute(attr, String(Math.trunc(Number(v)) || 0)); }],
+    enumerated: (attr, values, missing, invalid = missing) => [function () {
+      const v = this.getAttribute(attr);
+      if (v === null) return missing;
+      const lower = v.toLowerCase();
+      return values.includes(lower) ? lower : invalid;
+    }, function (v) { this.setAttribute(attr, String(v)); }],
+    nullable: attr => [function () { return this.getAttribute(attr); },
+      function (v) { if (v === null) this.removeAttribute(attr); else this.setAttribute(attr, String(v)); }],
+    text: () => [function () { return this.textContent; }, function (v) { this.textContent = String(v); }],
+    readonly: value => [function () { return typeof value === 'function' ? value.call(this) : value; }, function () {}],
+    custom: (get, set) => [get, set],
+    // a.protocol, a.host, ...: that part of href.
+    urlPart: part => [function () {
+      const h = this.href;
+      try { return h ? new URL(h)[part] : ''; } catch (e) { return ''; }
+    }, function (v) {
+      try { const u = new URL(this.href); u[part] = v; this.href = u.href; } catch (e) {}
+    }],
+    // img.width: the attribute, else the size it's shown at.
+    dimension: attr => [function () {
+      const n = parseInt(this.getAttribute(attr), 10);
+      if (!Number.isNaN(n)) return n;
+      const r = this.getBoundingClientRect();
+      return Math.round(attr === 'width' ? r.width : r.height);
+    }, function (v) { this.setAttribute(attr, String(Math.trunc(Number(v)) || 0)); }],
+  };
+
+  const table = {}; // property -> [[tags, accessors]], the first whose tags match wins
+  const add = (tags, name, kind, ...args) =>
+    (table[name] = table[name] || []).push([tags === '*' ? null : new Set(tags.split(' ')), kinds[kind](...args)]);
+
+  // Every element.
+  add('*', 'lang', 'str', 'lang');
+  add('*', 'dir', 'enumerated', 'dir', ['ltr', 'rtl', 'auto'], '', '');
+  add('*', 'hidden', 'bool', 'hidden');
+  add('*', 'inert', 'bool', 'inert');
+  add('*', 'autofocus', 'bool', 'autofocus');
+  add('*', 'accessKey', 'str', 'accesskey');
+  add('*', 'slot', 'str', 'slot');
+  add('*', 'inputMode', 'str', 'inputmode');
+  add('*', 'enterKeyHint', 'str', 'enterkeyhint');
+  add('*', 'nonce', 'str', 'nonce');
+  const focusable = el => ['button', 'input', 'select', 'textarea', 'iframe', 'summary'].includes(el.localName) ||
+    ((el.localName === 'a' || el.localName === 'area') && el.hasAttribute('href'));
+  add('*', 'tabIndex', 'custom', function () {
+    const n = parseInt(this.getAttribute('tabindex'), 10);
+    return Number.isNaN(n) ? (focusable(this) ? 0 : -1) : n;
+  }, function (v) { this.setAttribute('tabindex', String(Math.trunc(Number(v)) || 0)); });
+
+  // Links.
+  add('a area link base', 'href', 'url', 'href');
+  add('a area base form', 'target', 'str', 'target');
+  add('a area link form', 'rel', 'str', 'rel');
+  add('a area', 'download', 'str', 'download');
+  add('a area', 'ping', 'str', 'ping');
+  add('a link', 'hreflang', 'str', 'hreflang');
+  add('a link source embed object', 'type', 'str', 'type');
+  add('a area link img iframe', 'referrerPolicy', 'str', 'referrerpolicy');
+  add('a', 'text', 'text');
+  for (const part of ['protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'username', 'password'])
+    add('a area', part, 'urlPart', part);
+  add('a area', 'origin', 'readonly', function () {
+    try { return this.href ? new URL(this.href).origin : ''; } catch (e) { return ''; }
+  });
+  add('area', 'alt', 'str', 'alt');
+  add('area', 'coords', 'str', 'coords');
+  add('area', 'shape', 'str', 'shape');
+  add('link', 'media', 'str', 'media');
+  add('link', 'as', 'str', 'as');
+  add('link', 'integrity', 'str', 'integrity');
+  add('link img', 'crossOrigin', 'nullable', 'crossorigin');
+  add('link', 'disabled', 'bool', 'disabled');
+  add('meta', 'name', 'str', 'name');
+  add('meta', 'content', 'str', 'content');
+  add('meta', 'httpEquiv', 'str', 'http-equiv');
+  add('meta source style', 'media', 'str', 'media');
+
+  // Embedded content.
+  add('img iframe embed source track input', 'src', 'url', 'src');
+  add('img source', 'srcset', 'str', 'srcset');
+  add('img source', 'sizes', 'str', 'sizes');
+  add('img input area', 'alt', 'str', 'alt');
+  add('img', 'useMap', 'str', 'usemap');
+  add('img', 'isMap', 'bool', 'ismap');
+  add('img iframe', 'loading', 'str', 'loading');
+  add('img', 'decoding', 'str', 'decoding');
+  add('img', 'width', 'dimension', 'width');
+  add('img', 'height', 'dimension', 'height');
+  add('video', 'width', 'long', 'width', 0, 0);
+  add('video', 'height', 'long', 'height', 0, 0);
+  add('iframe embed object', 'width', 'str', 'width');
+  add('iframe embed object', 'height', 'str', 'height');
+  add('iframe object', 'name', 'str', 'name');
+  add('iframe', 'srcdoc', 'str', 'srcdoc');
+  add('iframe', 'allow', 'str', 'allow');
+  add('iframe', 'allowFullscreen', 'bool', 'allowfullscreen');
+  add('object', 'data', 'url', 'data');
+  add('track', 'srclang', 'str', 'srclang');
+  add('track', 'label', 'str', 'label');
+  add('track', 'default', 'bool', 'default');
+
+  // Forms.
+  add('form', 'action', 'custom', function () {
+    const a = this.getAttribute('action');
+    return a ? absolute(a) : location.href;
+  }, function (v) { this.setAttribute('action', String(v)); });
+  add('form', 'method', 'enumerated', 'method', ['get', 'post', 'dialog'], 'get');
+  const encodings = ['application/x-www-form-urlencoded', 'multipart/form-data', 'text/plain'];
+  add('form', 'enctype', 'enumerated', 'enctype', encodings, encodings[0]);
+  add('form', 'encoding', 'enumerated', 'enctype', encodings, encodings[0]);
+  add('form', 'acceptCharset', 'str', 'accept-charset');
+  add('form', 'noValidate', 'bool', 'novalidate');
+  add('form input select textarea button fieldset output', 'name', 'str', 'name');
+  add('form', 'autocomplete', 'enumerated', 'autocomplete', ['on', 'off'], 'on');
+  add('input select textarea', 'autocomplete', 'str', 'autocomplete');
+  add('input select textarea button fieldset optgroup option', 'disabled', 'bool', 'disabled');
+  add('input select textarea', 'required', 'bool', 'required');
+  add('input textarea', 'readOnly', 'bool', 'readonly');
+  add('input textarea', 'placeholder', 'str', 'placeholder');
+  add('input textarea', 'maxLength', 'long', 'maxlength', -1, 0);
+  add('input textarea', 'minLength', 'long', 'minlength', -1, 0);
+  add('input textarea', 'dirName', 'str', 'dirname');
+  add('input select', 'multiple', 'bool', 'multiple');
+  const inputTypes = ['hidden', 'text', 'search', 'tel', 'url', 'email', 'password', 'date', 'month', 'week', 'time',
+    'datetime-local', 'number', 'range', 'color', 'checkbox', 'radio', 'file', 'submit', 'image', 'reset', 'button'];
+  add('input', 'type', 'enumerated', 'type', inputTypes, 'text');
+  add('input', 'size', 'long', 'size', 20, 1);
+  for (const a of ['min', 'max', 'step', 'pattern', 'accept'])
+    add('input', a, 'str', a);
+  add('input', 'defaultValue', 'str', 'value');
+  add('input', 'defaultChecked', 'bool', 'checked');
+  add('input button', 'formNoValidate', 'bool', 'formnovalidate');
+  add('textarea', 'rows', 'long', 'rows', 2, 1);
+  add('textarea', 'cols', 'long', 'cols', 20, 1);
+  add('textarea', 'wrap', 'str', 'wrap');
+  add('textarea', 'defaultValue', 'text');
+  add('textarea', 'type', 'readonly', 'textarea');
+  add('select', 'size', 'long', 'size', 0, 0);
+  add('select', 'type', 'readonly', function () { return this.hasAttribute('multiple') ? 'select-multiple' : 'select-one'; });
+  add('button', 'type', 'enumerated', 'type', ['submit', 'reset', 'button'], 'submit');
+  add('option', 'defaultSelected', 'bool', 'selected');
+  add('option', 'label', 'custom', function () {
+    const l = this.getAttribute('label');
+    return l !== null ? l : this.textContent.replace(/\s+/g, ' ').trim();
+  }, function (v) { this.setAttribute('label', String(v)); });
+  add('optgroup', 'label', 'str', 'label');
+  add('option', 'text', 'custom', function () { return this.textContent.replace(/\s+/g, ' ').trim(); },
+    function (v) { this.textContent = String(v); });
+  add('label output', 'htmlFor', 'str', 'for');
+
+  // Tables, lists, quotes, edits, the rest.
+  add('td th', 'colSpan', 'long', 'colspan', 1, 1);
+  add('td th', 'rowSpan', 'long', 'rowspan', 1, 0);
+  add('td th', 'headers', 'str', 'headers');
+  add('th', 'scope', 'str', 'scope');
+  add('th', 'abbr', 'str', 'abbr');
+  add('col colgroup', 'span', 'long', 'span', 1, 1);
+  add('ol', 'start', 'long', 'start', 1);
+  add('ol', 'reversed', 'bool', 'reversed');
+  add('ol', 'type', 'str', 'type');
+  add('li', 'value', 'long', 'value', 0);
+  add('q blockquote del ins', 'cite', 'url', 'cite');
+  add('del ins time', 'dateTime', 'str', 'datetime');
+  add('details dialog', 'open', 'bool', 'open');
+  add('canvas', 'width', 'long', 'width', 300, 0);
+  add('canvas', 'height', 'long', 'height', 150, 0);
+
+  const find = (el, specs) => {
+    if (el === nodeProto || el.nodeType !== 1) return null;
+    const ns = el.namespaceURI;
+    if (ns && ns !== HTML_NS) return null;
+    const tag = el.localName;
+    for (const [tags, acc] of specs) if (!tags || tags.has(tag)) return acc;
+    return null;
+  };
+  for (const [name, specs] of Object.entries(table)) {
+    const prev = Object.getOwnPropertyDescriptor(nodeProto, name);
+    Object.defineProperty(nodeProto, name, {
+      configurable: true,
+      get() {
+        const acc = find(this, specs);
+        if (acc) return acc[0].call(this);
+        return prev && prev.get ? prev.get.call(this) : undefined;
+      },
+      set(v) {
+        const acc = find(this, specs);
+        if (acc) { acc[1].call(this, v); return; }
+        if (prev && prev.set) { prev.set.call(this, v); return; }
+        Object.defineProperty(this, name, { value: v, writable: true, enumerable: true, configurable: true });
+      },
+    });
+  }
+
+  // String(a) is its href.
+  const prevToString = Object.getOwnPropertyDescriptor(nodeProto, 'toString');
+  Object.defineProperty(nodeProto, 'toString', {
+    configurable: true, writable: true,
+    value: function toString() {
+      if (this !== nodeProto && this.nodeType === 1 && (this.localName === 'a' || this.localName === 'area')) return this.href;
+      return prevToString ? prevToString.value.call(this) : Object.prototype.toString.call(this);
+    },
+  });
+
+  // node.baseURI (and document's): what its relative URLs resolve against.
+  Object.defineProperty(nodeProto, 'baseURI', { configurable: true, get: base });
+
+  // <canvas>: there's no drawing here, so no context of any kind - which
+  // getContext reports with null, as a browser does for a context type it
+  // lacks, so a page's feature check falls back instead of throwing.
+  const canvasMethod = (name, fn) => {
+    const prev = Object.getOwnPropertyDescriptor(nodeProto, name);
+    Object.defineProperty(nodeProto, name, {
+      configurable: true,
+      get() {
+        if (this === nodeProto || (this.nodeType === 1 && this.localName === 'canvas')) return fn;
+        return prev ? (prev.get ? prev.get.call(this) : prev.value) : undefined;
+      },
+      set(v) { Object.defineProperty(this, name, { value: v, writable: true, enumerable: true, configurable: true }); },
+    });
+  };
+  canvasMethod('getContext', function getContext() { return null; });
+  canvasMethod('toDataURL', function toDataURL() { return 'data:,'; });
+  canvasMethod('toBlob', function toBlob(callback) { setTimeout(() => callback(null)); });
+})();
+
 // Fullscreen: requestFullscreen()/exitFullscreen() and the webkit-prefixed
 // names players still check for. Engine does the switching (a video - or
 // the first video in the element - fills the screen) and fires
@@ -4976,6 +5533,7 @@ static const JSCFunctionListEntry js_node_proto_funcs[] = {
     JS_CFUNC_DEF("getAttributeNames", 0, js_getAttributeNames),
     JS_CFUNC_DEF("createElement", 1, js_createElement),
     JS_CFUNC_DEF("createTextNode", 1, js_createTextNode),
+    JS_CFUNC_DEF("createComment", 1, js_createComment),
     JS_CFUNC_DEF("createDocumentFragment", 0, js_createDocumentFragment),
     JS_CFUNC_DEF("addEventListener", 2, js_addEventListener),
     JS_CFUNC_DEF("removeEventListener", 2, js_removeEventListener),
@@ -5016,6 +5574,7 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("__wtScrollTo", 2, js_native_scrollTo),         // behind scrollTo/scrollBy/scrollIntoView
     JS_CFUNC_DEF("__wtMedia", 3, js_native_media),               // behind HTMLMediaElement
     JS_CFUNC_DEF("__wtCanPlayType", 1, js_native_canPlayType),
+    JS_CFUNC_DEF("__wtParserInserted", 1, js_native_parserInserted), // behind script.async
     JS_CFUNC_DEF("__wtObserve", 2, js_native_observe),            // behind MutationObserver, IntersectionObserver, ResizeObserver
     JS_CFUNC_DEF("__wtSetFullscreen", 1, js_native_setFullscreen),         // behind requestFullscreen
     JS_CFUNC_DEF("__wtFullscreenElement", 0, js_native_fullscreenElement), // behind document.fullscreenElement

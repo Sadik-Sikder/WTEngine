@@ -9,6 +9,7 @@
 #include "JSBinding.h"
 #include "Layout.h"
 #include "ResourceLoader.h"
+#include "Modules.h"
 #include "TextEditor.h"
 #include "Media.h"
 
@@ -258,17 +259,32 @@ private:
         bool applied = false;
     };
     struct ScriptTask {
-        bool external;
-        size_t fetchIndex;       // valid if external
-        std::wstring inlineCode; // valid if !external
-        std::shared_ptr<Node> el; // the <script> element, for document.currentScript
+        bool module = false;      // type="module"
+        bool external = false;
+        size_t fetchIndex = 0;    // a classic external script's scriptLoader_ fetch
+        std::wstring url;         // an external module's URL (ModuleLoader fetches it)
+        std::wstring inlineCode;  // valid if !external
+        std::vector<std::wstring> imports; // an inline module's: it waits for these
+        std::shared_ptr<Node> el; // the <script> element, for document.currentScript and its load event
     };
     ResourceLoader styleLoader_;
     ResourceLoader scriptLoader_;
+    ModuleLoader modules_;
     std::vector<StyleTask> styleTasks_;
+    // In the order they run: the page's ordinary scripts in document
+    // order, then its deferred ones (defer, and module scripts) - all
+    // before DOMContentLoaded.
     std::vector<ScriptTask> scriptTasks_;
-    size_t scriptCursor_ = 0; // next scriptTasks_ index to run, in document order
-    void advanceScripts();    // runs scriptTasks_[scriptCursor_..] while each is ready, stopping at the first that isn't
+    size_t scriptCursor_ = 0; // next scriptTasks_ index to run
+    // Scripts that run whenever they're ready, in any order: async ones,
+    // and ones a page's script inserted. load waits for them.
+    std::vector<ScriptTask> asyncTasks_;
+    int inlineScripts_ = 0;   // for "<inline script N>" names
+    void advanceScripts();    // runs every task that's ready (scriptTasks_ only in order)
+    bool scriptReady(const ScriptTask& task);
+    // `nested`: from inside another script (inserted inline script).
+    void runScriptTask(const ScriptTask& task, bool nested = false);
+    void scriptInserted(Element* el); // DOMBindingState::runScript
     void pollResources();     // called every frame from render(): applies newly-ready stylesheets, advances scripts
 
     // Form state. The focused field's text lives in `editor` while editing

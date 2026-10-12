@@ -22,6 +22,10 @@ constexpr std::chrono::milliseconds kPageScriptTimeout{ 10000 };
 // page load.
 void ArmScriptWatchdog(struct JSContext* ctx, std::chrono::milliseconds budget = kScriptTimeout);
 
+// Moves the current deadline `extra` later: for time a script spent
+// waiting on something other than itself (a module import() waits for).
+void ExtendScriptWatchdog(struct JSContext* ctx, std::chrono::milliseconds extra);
+
 // Thin wrapper around a quickjs-ng runtime + context: the foundation that
 // per-page script execution, DOM binding, events and timers build on.
 class JSEngine {
@@ -36,8 +40,11 @@ public:
     // 2>", ...). On success, `text` is the result coerced to a string; if
     // it threw, `ok` is false and `text` describes the error (see
     // describeException) - the caller decides whether to log it.
+    // `nested`: run from inside another script (one it inserted) - that
+    // script's watchdog deadline stands, and promise jobs wait until the
+    // outer one is done, as microtasks do.
     struct Result { bool ok; std::wstring text; };
-    Result eval(const std::wstring& code, const char* filename = "<eval>");
+    Result eval(const std::wstring& code, const char* filename = "<eval>", bool nested = false);
 
     // Exposes the underlying context so external code (DOM bindings) can
     // install itself into it. JSEngine itself stays DOM-agnostic - it

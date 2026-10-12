@@ -86,6 +86,10 @@ struct DOMBindingState {
     // nullptr leaves fullscreen).
     Element* fullscreenElement = nullptr;
     std::function<void(Element*)> setFullscreen;
+    // A <script> a page's script put into the document (or gave a src or
+    // text once there) that hasn't run: Engine runs it - an inline one
+    // right away, one with a src once fetched (Engine::scriptInserted).
+    std::function<void(Element*)> runScript;
     // Set by scripts while a MutationObserver / an IntersectionObserver or
     // ResizeObserver exists (kBootstrapJS), so pages without one pay
     // nothing: mutations aren't reported, and Engine skips the per-frame

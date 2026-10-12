@@ -96,6 +96,7 @@ src/                       include/
   Media.cpp                  Media.h         — <video>/<audio> playback (Media Foundation), §14
   EngineMedia.cpp                            — media elements' players, drawing, controls, §14
   Intl.cpp, IntlJS.inc       Intl.h          — Intl on Windows' ICU, §11
+  Modules.cpp                Modules.h       — ES modules: fetching the graph, import maps, §11
                              PageHistory.h   — back/forward stacks (header only)
 third_party/quickjs-ng/    vendored JS engine, built unmodified
 libs/glfw/                 prebuilt glfw3.lib
@@ -209,12 +210,16 @@ The page paints once immediately after `parseAndBuild`/`beginScripts` return - w
 
 ```cpp
 struct Node    { enum Type { ELEMENT, TEXT } type; };
-struct TextNode : Node { std::wstring text; };
+struct TextNode : Node {
+    std::wstring text;
+    bool comment; std::wstring data;        // a comment: empty text, its words in data
+};
 struct Element : Node {
     std::wstring tag;                       // lower-case
     std::map<std::wstring,std::wstring> attrs;
     std::vector<std::shared_ptr<Node>> children;   // owning
     Element* parent;                        // non-owning
+    bool parserInserted, scriptStarted;     // <script> only - see §11, Script execution
 };
 struct Document { shared_ptr<Element> root, body; vector<CSS::Rule> styles; };
 ```
@@ -228,7 +233,8 @@ struct Document { shared_ptr<Element> root, body; vector<CSS::Rule> styles; };
 
 A hand-written, forgiving, single-pass recursive-descent parser. All text is `std::wstring` (UTF-16).
 
-- **Skipped:** `<!DOCTYPE>`, `<!-- comments -->`, `<? … ?>`.
+- **Skipped:** `<!DOCTYPE>`, `<? … ?>`, and comments outside every element.
+- **Comments** inside an element become comment nodes - a `TextNode` with `comment` set, its words in `data` and its `text` empty. Layout, `textContent` and `:empty` pass over one as they would an empty text node, while scripts see a real comment (`nodeType` 8). Frameworks rely on them: Vue marks the edges of server-rendered fragments with `<!--[-->`/`<!--]-->`, and its hydration fails without them.
 - **Void tags** (no children, no end tag): `br hr img input meta link area base col embed source track wbr`. `<x/>` also self-closes.
 - **Raw-text tags** — `script style title textarea`: content is read verbatim up to the matching end tag. `script` and `style` content is kept as one `TextNode` (no entity decoding, so `&&` in JS survives). `title` content is kept too, but entity-decoded like normal text (`Tom &amp; Jerry`); layout skips `<title>` as before, it only feeds the window title and `document.title`. `textarea` content is **dropped**.
 - **Entities:** `&amp; &lt; &gt; &quot; &apos; &nbsp; &copy; &mdash; &ndash; &hellip;` plus numeric `&#N;` / `&#xH;` (BMP only). Decoded in text nodes and attribute values.
@@ -526,7 +532,7 @@ Text is measured through a `std::function` set by `Engine` that calls `Renderer:
 3. `doLayout` — first paint, before any external resource is necessarily ready. `Engine::pollResources` (called every frame from `render`) fills the rest in progressively; see §5's "Progressive resource loading".
 
 ### Linked stylesheets (`parseAndBuild`)
-`<style>` blocks are the only CSS source `HTMLParser` itself understands (§7). Right after parsing, `parseAndBuild` walks the parsed tree (`document->root` if set, else `document->body`) for every `<link rel="stylesheet" href="...">`, in document order, resolves each href with `resolveUrl` (so a relative href only works against an `http(s)` page - same rule `<img src>` and `<script src>` already follow), and hands the resolved URLs to `styleLoader_` (a `ResourceLoader`, §5), which fetches them all concurrently in the background. `pollResources` parses each one's response text with `CSS::parseStylesheet` - straight text parsing, so nothing needs to know or care that this particular response happens to be CSS rather than HTML - and appends the resulting rules to `document->styles`, after whatever `<style>` blocks already produced, as each fetch completes.
+`<style>` blocks are the only CSS source `HTMLParser` itself understands (§7). Right after parsing, `parseAndBuild` walks the parsed tree (`document->root` if set, else `document->body`) for every `<link rel="stylesheet" href="...">` (`rel` as a space-separated list, so VitePress's `rel="preload stylesheet"` counts; an `alternate` stylesheet doesn't), in document order, resolves each href with `resolveUrl` (so a relative href only works against an `http(s)` page - same rule `<img src>` and `<script src>` already follow), and hands the resolved URLs to `styleLoader_` (a `ResourceLoader`, §5), which fetches them all concurrently in the background. `pollResources` parses each one's response text with `CSS::parseStylesheet` - straight text parsing, so nothing needs to know or care that this particular response happens to be CSS rather than HTML - and appends the resulting rules to `document->styles`, after whatever `<style>` blocks already produced, as each fetch completes.
 
 Each stylesheet's own rules come back from `parseStylesheet` numbered from 0 (it has no idea it's one of several sources), so before appending, every rule's `order` is shifted up by a precomputed *band* - `kStyleOrderBand * (this stylesheet's 1-based position among the page's `<link>`s)` - computed from the link's position in the *document*, not from `document->styles.size()` at append time. That distinction matters now that stylesheets apply in whatever order their background fetches happen to complete, rather than always in document order: a size-based offset would only have been correct if appending still happened serially in document order.
 
@@ -576,10 +582,22 @@ Every `loadHTML` creates a **fresh** `JSEngine` (quickjs runtime + context) and 
 quickjs never runs promise jobs on its own; the host must pump them. `runPendingJobs(ctx)` (`JSEngine.cpp`) drains the job queue, like a browser's microtask checkpoint. It runs after every script's `eval`, after each event listener the engine calls, and after each timer callback, so `Promise.then` and `async`/`await` continuations behave in the expected order (`sync code → promise callbacks → timers`). A job that throws is printed as `[promise] Error: …` and the rest still run. **Any new place that calls into JS (`JS_Call`, `JS_Eval`) should call `runPendingJobs` afterwards.** A promise still rejected and unhandled once the queue is empty is reported as `Uncaught (in promise) …`. `queueMicrotask(fn)` (`kBootstrapJS`) queues `fn` as a promise job; an exception it throws is reported as `microtask` rather than becoming a rejection.
 
 ### Script execution (`Engine::beginScripts` / `advanceScripts`)
-- Runs **after the entire DOM is built**, in document order across the whole tree - `<head>` scripts first, then `<body>`'s (`collectScripts` starts at `document->root`). So no `document.write`, and scripts can see the whole page, even one in `<head>`.
-- `beginScripts` handles inline scripts and `src=` scripts, but doesn't fetch or run anything itself beyond building `scriptTasks_` (one per `<script>`, either the inline code or an index into `scriptLoader_`) and starting every external script's fetch concurrently (`ResourceLoader`, §5). `advanceScripts` does the actual running: it walks `scriptTasks_` from a cursor, executing each task the moment it's ready (inline: immediately; external: once its fetch completes) and **stopping at the first one that isn't ready yet**, even if a later task's fetch already finished - preserving document order despite concurrent, out-of-order fetch completion. `beginScripts` calls it once synchronously right after starting the fetches (so a page with only inline scripts runs them all immediately, same as before backgrounding existed), and `pollResources` calls it again every frame to pick up whatever's newly ready.
-- Only "classic" scripts run: no `type`, or `text/javascript`, `application/javascript`, `application/ecmascript`. `type="module"`, JSON-LD, templates etc. are skipped.
+- Runs **after the entire DOM is built**, across the whole tree - `<head>` scripts first, then `<body>`'s (`collectScripts` starts at `document->root`). So no `document.write`, and scripts can see the whole page, even one in `<head>`.
+- **Which run** (`scriptKind`): classic scripts - no `type`, or a JavaScript MIME type (`text/javascript`, `application/javascript`, `application/x-javascript`, ...) - and `type="module"` (ES modules, below). `type="importmap"` is read as the page's import map. Anything else (JSON-LD, templates) isn't run. A classic script with `nomodule` is skipped, as in any browser with modules.
+- **Order**, as in browsers: ordinary scripts in document order; then the deferred ones - `defer` on an external classic script, and every module script without `async` - in document order; then `DOMContentLoaded`. `async` scripts run whenever they arrive, in any order, and `load` waits for them too. (`defer`/`async` on an inline classic script mean nothing, as in browsers.)
+- `beginScripts` doesn't fetch or run anything itself beyond building the tasks - `scriptTasks_` (ordinary, then deferred) and `asyncTasks_`, each either inline code, an index into `scriptLoader_`, or a module URL - and starting every external fetch concurrently (`ResourceLoader`, §5; `ModuleLoader` for modules). `advanceScripts` does the running: every async task that's ready, then `scriptTasks_` from a cursor, executing each the moment it's ready and **stopping at the first one that isn't**, even if a later task's fetch already finished - preserving order despite out-of-order fetch completion. `beginScripts` calls it once synchronously (so a page with only inline scripts runs them all immediately), and `pollResources` again every frame.
+- **Scripts a script inserts** (`createElement('script')` then `appendChild`, the way loaders, analytics and webpack's chunk loading work) run too: `insertNode` (`JSBinding.cpp`) finds any `<script>` among the inserted nodes that is now in the document and hasn't run, and calls `DOMBindingState::runScript` → `Engine::scriptInserted`. An inline one runs right then, inside the inserting call (`JSEngine::eval`'s `nested` mode: no fresh watchdog budget and no microtask checkpoint mid-script). One with a `src` is fetched and joins `asyncTasks_`. A script with neither waits: giving it a `src` (`setAttribute`/`.src`) or text then runs it. `Element::scriptStarted` makes each run at most once, however often it's moved. `parserInserted` scripts never run this way - the page's own are Engine's, and ones `innerHTML` creates never run, as in browsers.
+- An external script gets `load` once it has run, or `error` if it couldn't be fetched (both at the `<script>`, not bubbling).
 - An exception is printed as `[script] Error: …` and execution continues with the next script.
+
+### ES modules (`Modules.cpp`)
+`<script type="module">` (inline or `src`), `import`/`export`, `import()`, `import.meta` (`url`, `resolve()`), import maps (`imports` and `scopes`), and JSON modules (`import data from './x.json' with { type: 'json' }`). A module's top level runs in strict mode with its own scope, and `this` is `undefined`.
+- **The problem:** quickjs asks for an imported module synchronously, while linking the module that imports it (`JS_SetModuleLoaderFunc2`'s loader). Fetching it there would freeze the window for every import.
+- **The fix:** fetch the whole graph first. `ModuleLoader` fetches a module script's URL (`prefetch`); each module that arrives is scanned for what it imports (`scanImports` - a token scan that skips strings, comments, template literals and regular expressions, and picks out `import ... from "x"`, `export ... from "x"`, `import "x"` and `import("x")`), and those are fetched in turn, all concurrently. `Engine::scriptReady` holds a module script back until `graphReady` - its URL and everything it statically imports (as far as the scan could tell) have arrived. When it then runs, quickjs's loader finds every module already fetched.
+- **What the scan misses** - an `import()` with a computed specifier (`import('./locale/' + lang + '.js')`) - quickjs's loader fetches when asked, and waits for it there. The time it waits is added back to the script's watchdog budget (`ExtendScriptWatchdog`). `import("literal")` modules are fetched ahead too (up to 400 modules a page), so a code-split chunk is usually there by the time it's asked for.
+- **Resolution** (`ModuleLoader::resolve`): the import map's `scopes` (longest prefix first), then its `imports` - an exact specifier, or the longest prefix key ending in `/` - then a URL (`./`, `../`, `/` relative to the importing module, or an absolute `http(s)` URL). A bare name nothing maps is a `TypeError` with Chrome's message. A module's relative imports resolve against the URL it came from after redirects (`bases_`); an inline module's against the page, and a classic script's `import()` against the script's URL.
+- **One instance each:** a module is named by its URL, so a module two others import - or one that's also a `<script type=module src>` - runs once (`runUrl` goes through `JS_LoadModule`, which finds an already-loaded module).
+- **Errors:** a module script's evaluation returns a promise; a rejection is reported as the script's error, at `[script]`, not as an unhandled rejection.
 
 ### Script execution watchdog
 JS runs synchronously on the UI thread (there's no worker/off-thread execution model, and quickjs contexts aren't meant to be shared across threads), so a script stuck in an infinite loop used to freeze the whole window indefinitely - the same freeze class as the pre-fix `fetchPage()`/`LayoutRoot::layout()` issues above, just triggered by page JS instead of networking or CSS matching.
@@ -599,7 +617,7 @@ Everything a page's JS says or throws goes into `consoleLog()` - one process-wid
 
 | Source | From |
 |---|---|
-| `console` | `console.log/info/debug/warn/error` - arguments formatted by `__wtInspect` (strings as-is; objects/arrays expanded two levels; elements as `<p#id.class>`; errors with their stack) |
+| `console` | `log`/`info`/`debug`/`warn`/`error`/`dir`/`table` - arguments formatted by `__wtInspect` (strings as-is; objects/arrays expanded two levels; elements as `<p#id.class>`; errors with their stack), with `%s`/`%d`/`%i`/`%f`/`%o`/`%O`/`%c` substitution in a first string argument (`%c`'s CSS is dropped). Also `assert`, `count`/`countReset`, `time`/`timeLog`/`timeEnd`, `group`/`groupCollapsed`/`groupEnd` (indenting what follows), `trace` (with the stack) and `clear` (does nothing) |
 | `script` | An uncaught error in a `<script>`. Scripts are evaluated with a filename - the script's URL, or `<inline script N>` - so the stack names the script and line |
 | `click listener` (`<type> listener`), `inline handler`, `timer` | An exception in an event listener or a `setTimeout`/`setInterval` callback (previously swallowed), or an inline `on*="..."` attribute that doesn't compile |
 | `promise` | A promise rejected with no handler by the end of a microtask checkpoint: `JS_SetHostPromiseRejectionTracker` records each rejection and forgets it if a handler is attached later; `runPendingJobs` reports what's left as `Uncaught (in promise) ...`, as browsers do. This is how a failed `fetch()` without `.catch` shows up |
@@ -700,9 +718,11 @@ A relative URL is resolved against the page's own URL with `resolveUrl` - same r
 |---|---|
 | `textContent` (get/set) | |
 | `innerHTML`, `outerHTML` (get/set) | Getting serializes the subtree back to HTML (`serializeNode`: text and attributes escaped, void elements with no end tag, `<script>`/`<style>` content as is). Setting `innerHTML` parses the fragment with `HTMLParser`; setting `outerHTML` (`kBootstrapJS`) replaces the element with what it parses to. Children replaced this way get a null `parentNode`, and a script still holding one can insert it elsewhere |
-| `childNodes`, `children`, `firstChild`/`lastChild`, `nextSibling`/`previousSibling`, `first`/`lastElementChild`, `next`/`previousElementSibling`, `childElementCount` | Plain arrays (a snapshot, not a live collection) for the lists. Text nodes are included where the DOM has them (no comment nodes - the parser drops comments) |
-| `nodeType`, `nodeName`, `nodeValue`/`data`, `localName`, `ownerDocument`, `isConnected` | `nodeType` 1 or 3; `nodeName` the upper-cased tag or `#text`; `nodeValue`/`data` a text node's text (settable) |
-| `matches`, `closest`, `contains`, `cloneNode` | Selectors as in `querySelector`, matched against the element's real ancestors; an invalid one throws `SyntaxError`. `cloneNode(deep)` copies attributes (and the subtree) but not listeners |
+| `childNodes`, `children`, `firstChild`/`lastChild`, `nextSibling`/`previousSibling`, `first`/`lastElementChild`, `next`/`previousElementSibling`, `childElementCount` | Plain arrays (a snapshot, not a live collection) for the lists. Text and comment nodes are included where the DOM has them |
+| `nodeType`, `nodeName`, `nodeValue`/`data`, `localName`, `ownerDocument`, `isConnected`, `baseURI` | `nodeType` 1, 3 or 8; `nodeName` the upper-cased tag, `#text` or `#comment`; `nodeValue`/`data` a text node's text or a comment's words (settable). `Object.prototype.toString` gives `[object HTMLDivElement]` and so on (`Symbol.toStringTag`) - Vue's `reactive()` tells DOM nodes from plain objects by it |
+| `matches`, `closest`, `contains`, `cloneNode` | Selectors as in `querySelector`, matched against the element's real ancestors; one the engine can't evaluate at all throws `SyntaxError`. `cloneNode(deep)` copies attributes (and the subtree) but not listeners |
+| Attribute properties | `a.href` (and `protocol`, `host`, `pathname`, `search`, `hash`, ... of it, and `String(a)`), `img.src`/`alt`/`width`, `input.name`/`type`/`placeholder`/`maxLength`/`required`/`disabled`/`defaultValue`, `form.action`/`method`, `meta.name`/`content`, `link.rel`/`href`, `td.colSpan`, `el.hidden`/`lang`/`dir`/`tabIndex`, `script.src`/`type`/`async`/`defer`/`noModule`/`text`, and the rest of HTML's reflected attributes for the common elements: a table in `kBootstrapJS`, by the spec's rules (URLs resolved against the page or `<base href>`, numbers parsed with their defaults, enumerated values lowercased). Setting one sets the attribute |
+| `<template>.content`, `<canvas>` | `content` is a `DocumentFragment` holding the template's contents. A `<canvas>` has `width`/`height`, but there's no drawing: `getContext()` returns `null`, as for a context type a browser lacks, so a page's feature check falls back |
 | `classList`, `dataset` | `classList` is a `DOMTokenList` over `className` (`add`, `remove`, `toggle`, `replace`, `contains`, `item`, iteration); `dataset` maps camelCase names to `data-*` attributes |
 | `append`, `prepend`, `before`, `after`, `replaceWith`, `replaceChildren`, `insertAdjacentHTML`/`Element`/`Text`, `hasChildNodes`, `toggleAttribute`, `getAttributeNames`, `innerText` | In `kBootstrapJS`, over the natives; strings become text nodes. `innerText` is `textContent` (no layout-aware version) |
 | `tagName`, `id`, `className` | |
@@ -711,12 +731,13 @@ A relative URL is resolved against the page's own URL with `resolveUrl` - same r
 | `checked` (get/set) | Presence of the `checked` attribute - the same state EngineForms toggles on a click |
 | `style` | A `Proxy` over the `style=""` attribute: `el.style.backgroundColor = 'red'` (camelCase → kebab-case), `cssText`, `getPropertyValue`, `setProperty`, `removeProperty`, `length`. Setting `''`/`null` removes a property. Each write goes through `setAttribute`, so it triggers the usual relayout. Only inline declarations are visible - no computed style |
 | `getAttribute`, `setAttribute`, `hasAttribute`, `removeAttribute` | |
-| `createElement`, `createTextNode` | Available on any node, including `document` |
+| `createElement`, `createTextNode`, `createComment` | Available on any node, including `document` |
 | `appendChild`, `insertBefore`, `replaceChild` | Inserting a node that's already somewhere - in the page or in another detached subtree - **moves** it, as in browsers. Inserting a node into itself or its own descendant throws a `HierarchyRequestError` `DOMException`; a reference/old child that isn't a child throws `NotFoundError` |
 | `removeChild`, `remove()` | Detach (not destroy) the node; see Memory model |
 | `parentNode`, `parentElement` | The parent element, or `null` |
-| `getElementById`, `getElementsByTagName`, `getElementsByClassName` | Search the subtree of the node they're called on |
-| `querySelector`, `querySelectorAll` | Same selector grammar as CSS (§8), including combinators, attribute selectors and structural pseudo-classes; results are plain arrays. Combinators only look at ancestors inside the searched subtree, but sibling combinators and structural pseudo-classes see the element's real siblings |
+| `getElementById`, `getElementsByTagName`, `getElementsByClassName` | Search the subtree of the node they're called on - on `document`, the whole page, `<html>` and `<head>` included (`searchRoot`), though `document` wraps `<body>`. `getElementsByTagName('*')` is every element |
+| `querySelector`, `querySelectorAll` | Same selector grammar as CSS (§8), including combinators, attribute selectors, structural pseudo-classes and selector lists (`'a, .b'`, in document order; a selector in the list the engine can't evaluate is left out); results are plain arrays. On `document` the whole page is searched, as above. Combinators only look at ancestors inside the searched subtree, but sibling combinators and structural pseudo-classes see the element's real siblings |
+| `scripts`, `images`, `forms`, `links`, `embeds` | On `document` only |
 | `addEventListener`, `removeEventListener`, `dispatchEvent` | Any event type; see Events below |
 | `onclick`, `oninput`, `onchange`, `onsubmit`, `onkeydown`, ... | `on*` handler properties for the types in `kHandlerTypes` |
 | `body`, `head`, `documentElement`, `readyState` | On `document` only (it wraps `<body>`, so `document.body` is `document` itself) |
@@ -885,10 +906,11 @@ Only the main thread makes GL calls. A `Failed` image is not retried. While an i
 **JavaScript**
 - `window.onerror`/`unhandledrejection` events don't exist - errors reach the developer console (§11), not page code.
 - No `document.elementFromPoint`. Elements don't scroll on their own (only the page does). (`location`, `fetch()`, `XMLHttpRequest`, events, `localStorage`, `element.style`/`.value`/`.checked` and `document.title` are supported - §11.)
-- Events the engine doesn't fire yet, though listeners and `on*` handlers for them can be registered: `mousedown`/`mouseup`/`mousemove`/`dblclick`/`contextmenu`/`wheel`, `keypress`, `scroll`/`resize`, `<img>`/`<script>` `load`/`error`, and `focus`/`blur` on anything but a text field. `load` doesn't wait for images. `el.click()`, `form.submit()` and `form.requestSubmit()` don't exist.
+- Events the engine doesn't fire yet, though listeners and `on*` handlers for them can be registered: `mousedown`/`mouseup`/`mousemove`/`dblclick`/`contextmenu`/`wheel`, `keypress`, `scroll`/`resize`, `<img>` `load`/`error`, and `focus`/`blur` on anything but a text field. `load` doesn't wait for images. `el.click()`, `form.submit()` and `form.requestSubmit()` don't exist.
 - Mouse events only find elements that have a box: text, controls, images, and blocks with a background or border. Moving or clicking over the empty part of a plain `<div>` reaches its nearest painted ancestor instead (often none).
 - `document` is the `<body>` element's wrapper rather than a separate Document node, so `document.body === document`, and a listener on `document` sits between `<body>` and `<html>` in the event path instead of above `<html>`.
-- ES modules (`type="module"`) are skipped.
+- ES modules (§11): an `import()` whose specifier is computed is fetched when it's called, and the window waits for it. No CSS module scripts (`with { type: 'css' }`), `<link rel="modulepreload">` is ignored (the import scan finds those modules anyway), and module scripts don't check the server's MIME type. No `WebAssembly` (quickjs has none).
+- `<canvas>` has no drawing at all (`getContext()` is `null`).
 - `Intl` (§11) follows Windows' CLDR data, which can differ from Chrome's in a few values. Not supported: `Intl.DurationFormat`, `Temporal`, the `Intl.Locale` info getters (`getWeekInfo`, `getTimeZones`, ...), and a `PluralRules.selectRange` that looks at both ends (it uses the end).
 
 **Engine**

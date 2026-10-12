@@ -77,6 +77,10 @@ void ArmScriptWatchdog(JSContext* ctx, std::chrono::milliseconds budget) {
     state->deadline = std::chrono::steady_clock::now() + budget;
 }
 
+void ExtendScriptWatchdog(JSContext* ctx, std::chrono::milliseconds extra) {
+    runtimeState(ctx)->deadline += extra;
+}
+
 // quickjs calls this when a promise is rejected with no handler attached
 // (isHandled false), and again if a handler is attached later (true).
 static void promiseRejectionTracker(JSContext* ctx, JSValueConst promise, JSValueConst reason,
@@ -202,9 +206,9 @@ void runPendingJobs(JSContext* ctx) {
     }
 }
 
-JSEngine::Result JSEngine::eval(const std::wstring& code, const char* filename) {
+JSEngine::Result JSEngine::eval(const std::wstring& code, const char* filename, bool nested) {
     std::string src = wideToUtf8(code);
-    ArmScriptWatchdog(ctx, kPageScriptTimeout); // a page's own script: the most time (JSEngine.h)
+    if (!nested) ArmScriptWatchdog(ctx, kPageScriptTimeout); // a page's own script: the most time (JSEngine.h)
     JSValue result = JS_Eval(ctx, src.c_str(), src.size(), filename, JS_EVAL_TYPE_GLOBAL);
 
     Result out;
@@ -216,6 +220,6 @@ JSEngine::Result JSEngine::eval(const std::wstring& code, const char* filename) 
         out = { true, toWide(ctx, result) };
     }
     JS_FreeValue(ctx, result);
-    runPendingJobs(ctx); // promise callbacks the script queued run right after it, before the next script
+    if (!nested) runPendingJobs(ctx); // promise callbacks the script queued run right after it, before the next script
     return out;
 }

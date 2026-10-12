@@ -4,6 +4,8 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include "Fetcher.h"
 
 // Fetches a batch of URLs (every external <script src>/<link rel=stylesheet>
@@ -22,12 +24,21 @@ public:
     void start(std::vector<std::wstring> urls, FetchDest dest = FetchDest::Script,
                const std::wstring& referrer = L"");
 
+    // Adds one more fetch to the current batch - a module an import names,
+    // a <script> a page's script inserted - and returns its index.
+    size_t add(std::wstring url, FetchDest dest, const std::wstring& referrer);
+
     size_t count() const { return slots_.size(); }
 
     // True once fetch `index` has finished (successfully or not).
     bool ready(size_t index) const;
 
-    // Only valid once ready(index) is true.
+    // Blocks until fetch `index` has finished or `timeout` passes; returns
+    // ready(index). For the rare fetch that can't wait for a later frame
+    // (a module import() names that wasn't fetched ahead - see Modules.cpp).
+    bool wait(size_t index, std::chrono::milliseconds timeout) const;
+
+    // Only valid once ready(index) (or wait) is true.
     const FetchResult& result(size_t index) const;
 
     // The URL fetch `index` was started with (e.g. for an error message).
@@ -36,6 +47,7 @@ public:
 private:
     struct Slot {
         mutable std::mutex mutex;
+        std::condition_variable arrived; // for wait()
         bool done = false;
         FetchResult result;
     };

@@ -258,18 +258,36 @@ static void collectScripts(Element* el, std::vector<Element*>& out) {
     }
 }
 
-// A <script> with an unrecognized `type` isn't JavaScript at all - commonly
-// JSON-LD structured data (type="application/ld+json") or a template
-// library's inline template (type="text/template") - and must not be
-// evaluated as a script. No `type`, or an empty one, means classic JS.
-// type="module" is also skipped for now: import/export needs
-// JS_EVAL_TYPE_MODULE and module resolution, neither implemented yet.
-static bool isClassicScript(Element* scriptEl) {
+// What a <script> is, by its `type`. No type (or an empty one) and the
+// JavaScript MIME types are classic scripts. Anything else isn't run at all
+// - commonly JSON-LD structured data (type="application/ld+json") or a
+// template library's inline template (type="text/template").
+enum class ScriptKind { None, Classic, Module, ImportMap };
+
+static ScriptKind scriptKind(const Element* scriptEl) {
     auto it = scriptEl->attrs.find(L"type");
-    if (it == scriptEl->attrs.end() || it->second.empty()) return true;
+    if (it == scriptEl->attrs.end()) return ScriptKind::Classic;
     std::wstring t = it->second;
     for (auto& c : t) c = (wchar_t)towlower(c);
-    return t == L"text/javascript" || t == L"application/javascript" || t == L"application/ecmascript";
+    size_t a = t.find_first_not_of(L" \t\r\n"), b = t.find_last_not_of(L" \t\r\n");
+    t = a == std::wstring::npos ? L"" : t.substr(a, b - a + 1);
+    if (t.empty()) return ScriptKind::Classic;
+    if (t == L"module") return ScriptKind::Module;
+    if (t == L"importmap") return ScriptKind::ImportMap;
+    static const wchar_t* js[] = { L"text/javascript", L"application/javascript", L"application/ecmascript",
+                                   L"text/ecmascript", L"application/x-javascript", L"text/x-javascript",
+                                   L"application/x-ecmascript", L"text/jscript" };
+    for (const wchar_t* m : js) if (t == m) return ScriptKind::Classic;
+    return ScriptKind::None;
+}
+
+static bool hasAttr(const Element* el, const wchar_t* name) { return el->attrs.count(name) > 0; }
+
+static std::wstring scriptText(const Element* el) {
+    std::wstring code;
+    for (auto& child : el->children)
+        if (child->type == Node::TEXT) code += static_cast<TextNode*>(child.get())->text;
+    return code;
 }
 
 // The shared_ptr that holds a <script> found in the tree: its parent's slot.
@@ -279,19 +297,22 @@ static std::shared_ptr<Node> owningScript(Element* scriptEl) {
     return {};
 }
 
-// Sets up every <script> on the page to run once, in document order, after
-// the whole DOM is built (see Layout.h's LayoutRoot::loadImage comment for
-// the same "batch, not streaming" simplification applied to images - here
-// it means a script can't document.write() more markup mid-parse, since
-// parsing has already finished by the time any script runs). An inline
-// script's code is available immediately; an external one (<script src>)
-// is fetched concurrently with every other external script/stylesheet on
-// the page (ResourceLoader) instead of blocking here - advanceScripts()
-// (called once synchronously below, then again each frame from
-// pollResources) runs each task the moment it's ready, in order, so a page
-// with no external scripts behaves exactly as it did when this all ran
-// synchronously, and a page with some just fills them in over a few frames
-// instead of freezing the UI thread on each one in turn.
+// Sets up every <script> on the page to run once, after the whole DOM is
+// built (see Layout.h's LayoutRoot::loadImage comment for the same "batch,
+// not streaming" simplification applied to images - here it means a script
+// can't document.write() more markup mid-parse, since parsing has already
+// finished by the time any script runs). The order is a browser's: ordinary
+// scripts in document order, then deferred ones (defer, and module
+// scripts), then DOMContentLoaded; async ones whenever they're ready. An
+// inline script's code is available immediately; an external one is
+// fetched concurrently with every other external script/stylesheet on the
+// page (ResourceLoader, and ModuleLoader for a module and what it imports)
+// instead of blocking here - advanceScripts() (called once synchronously
+// below, then again each frame from pollResources) runs each task the
+// moment it's ready, so a page with no external scripts behaves exactly as
+// it did when this all ran synchronously, and a page with some just fills
+// them in over a few frames instead of freezing the UI thread on each one
+// in turn.
 void Engine::beginScripts() {
     // Drop the previous page's state FIRST, while its JS runtime still exists:
     // domState holds JSValues (event listeners, pending timers) that must be
@@ -307,6 +328,7 @@ void Engine::beginScripts() {
         setMediaProperty(el, name, value);
     };
     domState.setFullscreen = [this](Element* el) { setFullscreen(el); };
+    domState.runScript = [this](Element* el) { scriptInserted(el); };
     domState.viewportWidth = layoutRoot.viewportWidth; // innerWidth/matchMedia, from the first script on
     domState.viewportHeight = viewHeight();
     domState.pixelRatio = zoom_;
@@ -336,13 +358,18 @@ void Engine::beginScripts() {
     consoleLog().clear(); // a new page starts with an empty console, as in browsers
     jsEngine.reset();
     jsEngine = std::make_unique<JSEngine>(); // fresh realm per page
+    modules_.reset(pageBaseUrl);
     scriptTasks_.clear();
+    asyncTasks_.clear();
     scriptCursor_ = 0;
+    inlineScripts_ = 0;
     domContentLoadedFired_ = false;
     loadFired_ = false;
     if (!document || !document->body) { scriptLoader_.start({}); return; }
 
-    installDOMBindings(jsEngine->context(), document->body.get(), &domState);
+    JSContext* ctx = jsEngine->context();
+    installDOMBindings(ctx, document->body.get(), &domState);
+    modules_.install(ctx);
 
     // From the top of the tree, not <body>: real pages put most of their
     // scripts in <head>. Those run first, in document order, as in browsers.
@@ -350,69 +377,162 @@ void Engine::beginScripts() {
     collectScripts(document->root ? document->root.get() : document->body.get(), scripts);
 
     std::vector<std::wstring> urls;
+    std::vector<ScriptTask> deferred;
     for (Element* scriptEl : scripts) {
-        if (!isClassicScript(scriptEl)) continue;
+        ScriptKind kind = scriptKind(scriptEl);
+        if (kind == ScriptKind::None) continue;
+        if (kind == ScriptKind::ImportMap) {
+            if (!hasAttr(scriptEl, L"src")) modules_.addImportMap(ctx, scriptText(scriptEl));
+            continue;
+        }
+        // nomodule: the fallback for browsers without modules - not this one.
+        if (kind == ScriptKind::Classic && hasAttr(scriptEl, L"nomodule")) continue;
 
+        ScriptTask task;
+        task.module = kind == ScriptKind::Module;
+        task.el = owningScript(scriptEl);
+        bool async = hasAttr(scriptEl, L"async");
+        bool defer = task.module || hasAttr(scriptEl, L"defer");
         auto srcAttr = scriptEl->attrs.find(L"src");
-        if (srcAttr != scriptEl->attrs.end() && !srcAttr->second.empty()) {
+        if (srcAttr != scriptEl->attrs.end()) {
             std::wstring resolved = resolveUrl(pageBaseUrl, srcAttr->second);
             if (resolved.empty()) continue;
-            ScriptTask task;
             task.external = true;
-            task.fetchIndex = urls.size();
-            task.el = owningScript(scriptEl);
-            scriptTasks_.push_back(task);
-            urls.push_back(resolved);
-        }
-        else {
-            ScriptTask task;
-            task.external = false;
-            task.el = owningScript(scriptEl);
-            for (auto& child : scriptEl->children) {
-                if (child->type == Node::TEXT) task.inlineCode += static_cast<TextNode*>(child.get())->text;
+            if (task.module) {
+                task.url = resolved;
+                modules_.prefetch(resolved);
+            } else {
+                task.fetchIndex = urls.size();
+                urls.push_back(resolved);
             }
-            scriptTasks_.push_back(std::move(task));
+        } else {
+            task.inlineCode = scriptText(scriptEl);
+            if (task.module) task.imports = modules_.inlineImports(task.inlineCode);
+            else async = defer = false; // only an external classic script can wait
         }
+        if (async) asyncTasks_.push_back(std::move(task));
+        else if (defer) deferred.push_back(std::move(task));
+        else scriptTasks_.push_back(std::move(task));
     }
+    for (auto& task : deferred) scriptTasks_.push_back(std::move(task));
     scriptLoader_.start(std::move(urls), FetchDest::Script, pageBaseUrl);
     advanceScripts();
 }
 
-// Runs scriptTasks_[scriptCursor_..] for as long as each one is ready
-// (inline is always ready; external is ready once its ResourceLoader fetch
-// completes), stopping at the first that isn't - preserving document
-// order even though external scripts can finish fetching in any order.
-void Engine::advanceScripts() {
-    while (scriptCursor_ < scriptTasks_.size()) {
-        ScriptTask& task = scriptTasks_[scriptCursor_];
+// A <script> a page's script inserted (DOMBindingState::runScript): one
+// with a src is fetched and runs when it arrives, as async scripts do; an
+// inline classic one runs right now, inside the inserting call, as in
+// browsers. One with nothing to run yet (no src, no text) waits until it
+// gets some.
+void Engine::scriptInserted(Element* el) {
+    JSContext* ctx = jsContext();
+    if (!ctx || el->scriptStarted || el->parserInserted) return;
+    ScriptKind kind = scriptKind(el);
+    if (kind == ScriptKind::None || kind == ScriptKind::ImportMap) return;
+    if (kind == ScriptKind::Classic && hasAttr(el, L"nomodule")) return;
+
+    ScriptTask task;
+    task.module = kind == ScriptKind::Module;
+    task.el = owningNode(ctx, el);
+    auto srcAttr = el->attrs.find(L"src");
+    if (srcAttr != el->attrs.end()) {
+        el->scriptStarted = true;
+        std::wstring resolved = resolveUrl(pageBaseUrl, srcAttr->second);
+        task.external = true;
+        if (resolved.empty()) {
+            fireEvent(ctx, el, L"error", false, false);
+            return;
+        }
+        if (task.module) {
+            task.url = resolved;
+            modules_.prefetch(resolved);
+        } else {
+            task.fetchIndex = scriptLoader_.add(resolved, FetchDest::Script, pageBaseUrl);
+        }
+        asyncTasks_.push_back(std::move(task));
+        return;
+    }
+    task.inlineCode = scriptText(el);
+    if (task.inlineCode.empty()) return;
+    el->scriptStarted = true;
+    if (task.module) {
+        task.imports = modules_.inlineImports(task.inlineCode);
+        asyncTasks_.push_back(std::move(task));
+    } else {
+        runScriptTask(task, true);
+    }
+}
+
+bool Engine::scriptReady(const ScriptTask& task) {
+    if (task.module) {
+        if (task.external) return modules_.graphReady(task.url);
+        for (auto& url : task.imports) if (!modules_.graphReady(url)) return false;
+        return true;
+    }
+    return !task.external || scriptLoader_.ready(task.fetchIndex);
+}
+
+// Runs one script that's ready (scriptReady). An external one then gets
+// its load event - or error, if it couldn't be fetched.
+void Engine::runScriptTask(const ScriptTask& task, bool nested) {
+    JSContext* ctx = jsContext();
+    bool loaded = true;
+    if (task.module) {
+        std::wstring error;
+        if (task.external && modules_.failed(task.url, &error)) {
+            consoleLog().add(LogLevel::Error, L"network", L"Failed to load module script " + task.url + L": " + error);
+            loaded = false;
+        } else if (task.external) {
+            modules_.runUrl(ctx, task.url);
+        } else {
+            modules_.runInline(ctx, task.inlineCode, L"<inline module " + std::to_wstring(++inlineScripts_) + L">");
+        }
+    } else {
         std::wstring code;
         std::wstring name; // what error stacks call this script, so the console can say which one threw
         if (task.external) {
-            if (!scriptLoader_.ready(task.fetchIndex)) break; // wait here even if a later task is already ready
             const FetchResult& res = scriptLoader_.result(task.fetchIndex);
-            scriptCursor_++;
             if (!res.ok) {
                 consoleLog().add(LogLevel::Error, L"network", L"Failed to load script " +
                                  scriptLoader_.url(task.fetchIndex) + L": " + res.error);
-                continue;
+                loaded = false;
             }
             code = res.html;
-            name = res.finalUrl;
-        }
-        else {
+            name = res.finalUrl.empty() ? scriptLoader_.url(task.fetchIndex) : res.finalUrl;
+        } else {
             code = task.inlineCode;
-            scriptCursor_++;
-            name = L"<inline script " + std::to_wstring(scriptCursor_) + L">";
+            name = L"<inline script " + std::to_wstring(++inlineScripts_) + L">";
         }
-        if (code.empty()) continue;
+        if (loaded && !code.empty()) {
+            std::string filename; // URLs are ASCII; anything else just degrades the label
+            for (wchar_t c : name) filename.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+            std::shared_ptr<Node> outer = domState.currentScript; // an inserting script's, while nested
+            domState.currentScript = task.el; // document.currentScript, while it runs
+            JSEngine::Result result = jsEngine->eval(code, filename.c_str(), nested);
+            domState.currentScript = outer;
+            if (!result.ok) consoleLog().add(LogLevel::Error, L"script", result.text);
+        }
+    }
+    domState.domDirty = true; // conservatively assume the script may have mutated the DOM
+    if (task.external && task.el && task.el->type == Node::ELEMENT)
+        fireEvent(ctx, static_cast<Element*>(task.el.get()), loaded ? L"load" : L"error", false, false);
+}
 
-        std::string filename; // URLs are ASCII; anything else just degrades the label
-        for (wchar_t c : name) filename.push_back(c < 0x80 ? static_cast<char>(c) : '?');
-        domState.currentScript = task.el; // document.currentScript, while it runs
-        JSEngine::Result result = jsEngine->eval(code, filename.c_str());
-        domState.currentScript.reset();
-        if (!result.ok) consoleLog().add(LogLevel::Error, L"script", result.text);
-        domState.domDirty = true; // conservatively assume the script may have mutated the DOM
+// Runs every script that's ready: async ones in any order, and
+// scriptTasks_[scriptCursor_..] in order, stopping at the first that isn't
+// - so an external script that arrives early still waits its turn.
+void Engine::advanceScripts() {
+    // By index, and a copy of each: a script can insert more.
+    for (size_t i = 0; i < asyncTasks_.size(); i++) {
+        if (!scriptReady(asyncTasks_[i])) continue;
+        ScriptTask task = std::move(asyncTasks_[i]);
+        asyncTasks_.erase(asyncTasks_.begin() + i--);
+        runScriptTask(task);
+    }
+    while (scriptCursor_ < scriptTasks_.size()) {
+        if (!scriptReady(scriptTasks_[scriptCursor_])) break; // wait here even if a later task is already ready
+        ScriptTask task = scriptTasks_[scriptCursor_++];
+        runScriptTask(task);
     }
     fireReadyEvents();
 }
@@ -420,8 +540,8 @@ void Engine::advanceScripts() {
 // Fires the page's lifecycle events once each, as soon as they're due:
 // DOMContentLoaded when every script has run (the DOM itself is complete
 // before any script runs - see beginScripts), then load once every
-// stylesheet has also arrived. (Unlike browsers, load doesn't wait for
-// images.) Each is preceded by document.readyState advancing and its
+// stylesheet and async script has also arrived (and run). (Unlike
+// browsers, load doesn't wait for images.) Each is preceded by document.readyState advancing and its
 // readystatechange event. Called from advanceScripts, so both first get a
 // chance during loadHTML and then every frame via pollResources.
 void Engine::fireReadyEvents() {
@@ -435,6 +555,7 @@ void Engine::fireReadyEvents() {
     }
     if (loadFired_) return;
     for (const auto& task : styleTasks_) if (!task.applied) return;
+    if (!asyncTasks_.empty()) return;
     loadFired_ = true;
     advanceReadyState(ctx, L"complete");
     fireEvent(ctx, nullptr, L"load", false, false);
@@ -516,6 +637,7 @@ void Engine::pollResources() {
         domState.domDirty = true;
         domState.changeCount++; // new rules: the layout no longer reflects the page
     }
+    modules_.poll(); // modules that arrived: fetch what they import
     advanceScripts();
 }
 
@@ -530,12 +652,12 @@ static void collectStylesheetLinks(Element* el, std::vector<Element*>& out) {
         auto relIt = el->attrs.find(L"rel");
         auto hrefIt = el->attrs.find(L"href");
         if (relIt == el->attrs.end() || hrefIt == el->attrs.end()) return;
-        std::wstring rel = relIt->second;
-        for (auto& c : rel) c = (wchar_t)towlower(c);
-        // Exact match only - a real UA token-matches a space-separated rel
-        // list (rel="preload stylesheet" and the like), which is rare
-        // enough for a <link> that this doesn't bother.
-        if (rel == L"stylesheet") out.push_back(el);
+        // rel is a space-separated list ("preload stylesheet", which
+        // VitePress sites use); an alternate stylesheet isn't applied.
+        std::wstring rel = L" " + relIt->second + L" ";
+        for (auto& c : rel) c = iswspace(c) ? L' ' : (wchar_t)towlower(c);
+        if (rel.find(L" stylesheet ") != std::wstring::npos && rel.find(L" alternate ") == std::wstring::npos)
+            out.push_back(el);
         return;
     }
     for (auto& child : el->children) {

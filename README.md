@@ -24,7 +24,8 @@ It's a learning project, not a replacement for Chrome. Many real sites load and 
 - Images (PNG, JPEG, GIF, WebP and more through WIC) and SVG.
 
 **JavaScript**
-- quickjs-ng with a DOM API that frameworks like React run on:
+- ES modules: `<script type="module">`, `import()`, import maps and JSON modules, with the whole import graph fetched in parallel before it runs.
+- quickjs-ng with a DOM API that frameworks like React and Vue run on:
   - elements, events, `classList`, `dataset`;
   - `innerHTML`, `querySelector`, `getBoundingClientRect` and `getComputedStyle`;
   - `MutationObserver`, `IntersectionObserver` and `ResizeObserver`.
@@ -114,7 +115,7 @@ If you want to understand or change the code, start with **[docs/HOW_IT_WORKS.md
 The larger gaps:
 
 - **Streaming video:** sites that stream through Media Source Extensions (YouTube, Netflix) don't play, and DRM-protected video isn't supported.
-- **ES modules:** `<script type="module">` is skipped.
+- **Canvas and WebAssembly:** `<canvas>` doesn't draw, and there's no `WebAssembly`.
 - **Scrolling:** only the page itself scrolls, not elements inside it.
 - **Paint and layout:** layout is a full pass on every change, with no incremental layout. Painting uses fixed-function OpenGL on the main thread.
 - **Platform:** Windows only.

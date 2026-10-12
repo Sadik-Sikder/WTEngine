@@ -14,6 +14,11 @@ struct Node {
 
 struct TextNode : Node {
     std::wstring text;
+    // A comment (<!-- ... --> inside an element, or createComment). Its
+    // `text` stays empty, so layout and textContent pass over it like an
+    // empty text node; `data` is what it says.
+    bool comment = false;
+    std::wstring data;
     TextNode(const std::wstring& t) : Node(TEXT), text(t) {}
 };
 
@@ -26,6 +31,12 @@ struct Element : Node {
     // event up through ancestors. nullptr for an unattached element (just
     // created via createElement, or just removed via removeChild).
     Element* parent = nullptr;
+    // <script> only. parserInserted: made by the HTML parser (the page's
+    // own, which Engine runs in order, or innerHTML's, which never run) -
+    // not by a script's createElement. scriptStarted: it ran (or is being
+    // fetched to), so inserting it again doesn't run it again.
+    bool parserInserted = false;
+    bool scriptStarted = false;
     Element(const std::wstring& t) : Node(ELEMENT), tag(t) {}
 };
 
