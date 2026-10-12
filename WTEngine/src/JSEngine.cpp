@@ -37,6 +37,7 @@ static std::wstring toWide(JSContext* ctx, JSValueConst v) {
 // Per-runtime state reachable from any JSContext* (JS_GetRuntimeOpaque).
 struct RuntimeState {
     std::chrono::steady_clock::time_point deadline; // the watchdog's
+    std::chrono::milliseconds budget = kScriptTimeout; // what the run it's timing was given
     // Promises rejected with no handler yet: the tracker below adds one on
     // rejection and removes it again if a handler is attached later, so
     // whatever is left after a microtask checkpoint is truly unhandled.
@@ -70,8 +71,10 @@ static int watchdogInterruptHandler(JSRuntime* /*rt*/, void* opaque) {
     return std::chrono::steady_clock::now() >= state->deadline;
 }
 
-void ArmScriptWatchdog(JSContext* ctx) {
-    runtimeState(ctx)->deadline = std::chrono::steady_clock::now() + kScriptTimeout;
+void ArmScriptWatchdog(JSContext* ctx, std::chrono::milliseconds budget) {
+    RuntimeState* state = runtimeState(ctx);
+    state->budget = budget;
+    state->deadline = std::chrono::steady_clock::now() + budget;
 }
 
 // quickjs calls this when a promise is rejected with no handler attached
@@ -126,9 +129,24 @@ JSEngine::~JSEngine() {
 }
 
 std::wstring describeException(JSContext* ctx, JSValue exc) {
-    if (JS_IsUncatchableError(exc))
-        return L"Script stopped: it ran longer than " + std::to_wstring(kScriptTimeout.count()) +
-               L" ms without finishing (possible infinite loop)";
+    if (JS_IsUncatchableError(exc)) {
+        // Where it was when stopped - the stack names the script and line,
+        // which tells a loop from a script that's just too slow here.
+        std::wstring out = L"Script stopped: it ran longer than " +
+                           std::to_wstring(runtimeState(ctx)->budget.count() / 1000) +
+                           L" s without finishing (an infinite loop, or more work than this engine gets through in time)";
+        JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
+        if (JS_IsString(stack)) {
+            std::wstring s = toWide(ctx, stack);
+            size_t end = 0;
+            for (int lines = 0; lines < 4 && end != std::wstring::npos; lines++) end = s.find(L'\n', end ? end + 1 : 0);
+            s = s.substr(0, end);
+            while (!s.empty() && (s.back() == L'\n' || s.back() == L' ')) s.pop_back();
+            if (!s.empty()) out += L"\n" + s;
+        }
+        JS_FreeValue(ctx, stack);
+        return out;
+    }
 
     // The bootstrap's __wtInspect formats errors (name, message, stack) and
     // anything else that gets thrown the same way console.log would.
@@ -186,7 +204,7 @@ void runPendingJobs(JSContext* ctx) {
 
 JSEngine::Result JSEngine::eval(const std::wstring& code, const char* filename) {
     std::string src = wideToUtf8(code);
-    ArmScriptWatchdog(ctx);
+    ArmScriptWatchdog(ctx, kPageScriptTimeout); // a page's own script: the most time (JSEngine.h)
     JSValue result = JS_Eval(ctx, src.c_str(), src.size(), filename, JS_EVAL_TYPE_GLOBAL);
 
     Result out;

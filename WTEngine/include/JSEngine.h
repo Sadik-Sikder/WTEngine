@@ -3,20 +3,24 @@
 #include <string>
 #include <chrono>
 
-// How long a single script/timer-callback/listener/promise-job run may run
-// before the watchdog (see ArmScriptWatchdog below) kills it. Generous
-// enough for real page scripts, short enough to recover well before
-// Windows would flag the window "Not Responding".
-constexpr std::chrono::milliseconds kScriptTimeout{ 2000 };
+// How long one run of script may take before the watchdog (see
+// ArmScriptWatchdog below) stops it. A page's own <script>s get the most:
+// they build the whole page at load, and an interpreter runs them several
+// times slower than a browser's JIT would. Timers, listeners and promise
+// jobs get kScriptTimeout. Both are short enough that a real infinite loop
+// frees the window soon; meanwhile Windows doesn't gray it out as "Not
+// Responding" (main.cpp turns ghosting off), it just waits.
+constexpr std::chrono::milliseconds kScriptTimeout{ 5000 };
+constexpr std::chrono::milliseconds kPageScriptTimeout{ 10000 };
 
-// Resets the watchdog deadline to now() + kScriptTimeout. Every real entry
-// point into JS (JSEngine::eval, runPendingJobs, and JSBinding.cpp's
+// Resets the watchdog deadline to now() + `budget`. Every real entry point
+// into JS (JSEngine::eval, runPendingJobs, and JSBinding.cpp's
 // fireDueTimers/event dispatch) must call this immediately before its
 // JS_Eval/JS_Call/JS_ExecutePendingJob - the interrupt handler is polled
 // per JSRuntime, not per call, so this is what makes the timeout measure
 // "how long did this one script/callback run" instead of wall clock since
 // page load.
-void ArmScriptWatchdog(struct JSContext* ctx);
+void ArmScriptWatchdog(struct JSContext* ctx, std::chrono::milliseconds budget = kScriptTimeout);
 
 // Thin wrapper around a quickjs-ng runtime + context: the foundation that
 // per-page script execution, DOM binding, events and timers build on.

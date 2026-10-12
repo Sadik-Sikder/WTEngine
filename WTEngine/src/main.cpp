@@ -851,6 +851,12 @@ static LRESULT CALLBACK sizingWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
 constexpr double kTargetFrameSeconds = 1.0 / 60.0;
 
 int wmain(int argc, wchar_t** argv) {
+    // A long page script holds the UI thread for up to its watchdog budget
+    // (JSEngine.h). Windows would gray the window out as "Not Responding"
+    // after 5 s of that; the watchdog ends it soon enough, so the window
+    // just waits instead.
+    DisableProcessWindowsGhosting();
+
     // Windows' default scheduler tick is ~15.6ms, so a short Sleep() below
     // tends to overshoot to the next tick; this asks for 1ms resolution so
     // the frame cap actually lands near its target instead of running slow.
