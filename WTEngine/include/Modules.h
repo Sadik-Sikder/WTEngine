@@ -36,7 +36,9 @@ public:
     std::wstring resolve(const std::wstring& specifier, const std::wstring& base) const;
 
     // Starts fetching `url`, unless it's already fetched or on its way.
-    void prefetch(const std::wstring& url);
+    // `integrity`: a <script type=module src integrity>'s - the import map's
+    // "integrity" entry for the URL otherwise.
+    void prefetch(const std::wstring& url, const std::wstring& integrity = L"");
 
     // Scans modules that arrived since the last call for their imports,
     // and starts fetching those. Called every frame (Engine::pollResources).
@@ -74,7 +76,7 @@ private:
         std::vector<std::wstring> deps; // statically imported URLs
     };
     Module* find(const std::wstring& url);
-    Module& request(const std::wstring& url);
+    Module& request(const std::wstring& url, const std::wstring& integrity = L"");
     void scan(const std::wstring& url, Module& m);
 
     std::wstring pageUrl_;
@@ -89,6 +91,7 @@ private:
     // The import map: specifier (or URL prefix ending in "/") -> URL.
     using SpecifierMap = std::vector<std::pair<std::wstring, std::wstring>>;
     SpecifierMap imports_;
+    std::unordered_map<std::wstring, std::wstring> integrity_; // the import map's: URL -> integrity
     std::vector<std::pair<std::wstring, SpecifierMap>> scopes_; // longest prefix first
     static const std::wstring* lookup(const SpecifierMap& map, const std::wstring& key, std::wstring& out);
 };

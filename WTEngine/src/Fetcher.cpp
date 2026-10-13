@@ -50,6 +50,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
+#include <openssl/evp.h>   // SHA-2 digests for Subresource Integrity
 #include <openssl/x509.h>
 #include <zlib.h>
 
@@ -448,12 +449,13 @@ static bool followRedirect(std::wstring& url, http::verb& method, std::string& b
     return true;
 }
 
-static FetchResult readLocalFile(const std::wstring& path) {
+static FetchResult readLocalFile(const std::wstring& path, std::string* raw = nullptr) {
     FetchResult res;
     std::ifstream in(path, std::ios::binary);
     if (!in) { res.error = L"Could not open file: " + path; return res; }
     std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     res.html = utf8ToWide(body);
+    if (raw) *raw = std::move(body);
     res.ok = true;
     return res;
 }
@@ -813,11 +815,74 @@ private:
 
 // --- The per-API coroutines: run a request, convert its result, call onDone.
 
+// --- Subresource Integrity ---------------------------------------------
+// <script src integrity="sha384-..."> and <link rel=stylesheet integrity>:
+// the response must hash to one of the listed digests, or it's blocked -
+// so a compromised CDN can't swap in different code. Each token is
+// "<algorithm>-<base64 digest>[?options]"; only the strongest algorithm
+// listed counts (sha512 over sha384 over sha256), and any one of its
+// digests matching is enough. Tokens with an unknown algorithm are ignored;
+// a value with none known checks nothing, as the spec says.
+
+static std::string normalizedDigest(std::string b64) {
+    // base64url ('-', '_') counts the same as base64, and padding is optional.
+    for (char& c : b64) c = c == '-' ? '+' : c == '_' ? '/' : c;
+    while (!b64.empty() && b64.back() == '=') b64.pop_back();
+    return b64;
+}
+
+static bool checkIntegrity(const std::wstring& integrity, const std::string& body, const std::wstring& url,
+                           std::wstring& error) {
+    static const struct { const char* name; const EVP_MD* (*md)(); const wchar_t* label; } algorithms[] = {
+        { "sha256", EVP_sha256, L"SHA-256" }, { "sha384", EVP_sha384, L"SHA-384" }, { "sha512", EVP_sha512, L"SHA-512" },
+    };
+    std::vector<std::pair<int, std::string>> digests; // algorithm index, digest
+    int strongest = -1;
+    std::string value; // the meaningful part is ASCII
+    for (wchar_t c : integrity) value.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+    size_t i = 0;
+    while (i < value.size()) {
+        while (i < value.size() && isspace((unsigned char)value[i])) i++;
+        size_t end = i;
+        while (end < value.size() && !isspace((unsigned char)value[end])) end++;
+        std::string token = value.substr(i, end - i);
+        i = end;
+        size_t dash = token.find('-');
+        if (dash == std::string::npos) continue;
+        std::string alg = token.substr(0, dash);
+        for (auto& c : alg) c = (char)tolower((unsigned char)c);
+        std::string digest = token.substr(dash + 1);
+        digest = digest.substr(0, digest.find('?'));
+        for (int a = 0; a < 3; a++) {
+            if (alg != algorithms[a].name) continue;
+            digests.emplace_back(a, normalizedDigest(digest));
+            strongest = std::max(strongest, a);
+        }
+    }
+    if (strongest < 0) return true;
+
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    EVP_Digest(body.data(), body.size(), hash, &len, algorithms[strongest].md(), nullptr);
+    std::string b64(4 * ((len + 2) / 3), '\0');
+    b64.resize(EVP_EncodeBlock(reinterpret_cast<unsigned char*>(b64.data()), hash, (int)len));
+    std::string computed = normalizedDigest(b64);
+    for (auto& [a, d] : digests)
+        if (a == strongest && d == computed) return true;
+
+    // Chrome's message.
+    error = L"Failed to find a valid digest in the 'integrity' attribute for resource '" + url +
+            L"' with computed " + algorithms[strongest].label + L" integrity '" +
+            std::wstring(b64.begin(), b64.end()) + L"'. The resource has been blocked.";
+    return false;
+}
+
 net::awaitable<void> runPage(std::wstring url, std::string body, bool isPost, FetchOptions options,
                              std::function<void(FetchResult)> onDone) {
     FetchResult res;
+    std::string bytes; // the body as it came, for an integrity check
     if (!isHttpUrl(url)) {
-        res = readLocalFile(url); // a POST body makes no sense for a file
+        res = readLocalFile(url, &bytes); // a POST body makes no sense for a file
     } else {
         RequestSpec spec;
         spec.method = isPost ? http::verb::post : http::verb::get;
@@ -831,6 +896,11 @@ net::awaitable<void> runPage(std::wstring url, std::string body, bool isPost, Fe
         res.error = raw.error;
         res.finalUrl = raw.finalUrl;
         if (raw.ok) res.html = utf8ToWide(raw.body);
+        if (raw.ok && !options.integrity.empty()) bytes = std::move(raw.body);
+    }
+    if (res.ok && !options.integrity.empty() && !checkIntegrity(options.integrity, bytes, url, res.error)) {
+        res.ok = false;
+        res.html.clear();
     }
     onDone(std::move(res));
 }

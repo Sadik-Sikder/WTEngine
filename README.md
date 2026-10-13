@@ -13,6 +13,7 @@ It's a learning project, not a replacement for Chrome. Many real sites load and 
 **Loading pages**
 - HTTP/HTTPS through its own async network stack (Boost.Beast + OpenSSL), with cookies, redirects, gzip and the request headers browsers send.
 - Pages, stylesheets, scripts and images all load in the background, so the window never freezes waiting on the network.
+- Subresource Integrity: a CDN script or stylesheet whose `integrity` hash doesn't match is blocked, as in Chrome.
 - Local files open too.
 
 **HTML and CSS**

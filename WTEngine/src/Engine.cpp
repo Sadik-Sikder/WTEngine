@@ -283,6 +283,11 @@ static ScriptKind scriptKind(const Element* scriptEl) {
 
 static bool hasAttr(const Element* el, const wchar_t* name) { return el->attrs.count(name) > 0; }
 
+static std::wstring attrOf(const Element* el, const wchar_t* name) {
+    auto it = el->attrs.find(name);
+    return it == el->attrs.end() ? L"" : it->second;
+}
+
 static std::wstring scriptText(const Element* el) {
     std::wstring code;
     for (auto& child : el->children)
@@ -376,7 +381,7 @@ void Engine::beginScripts() {
     std::vector<Element*> scripts;
     collectScripts(document->root ? document->root.get() : document->body.get(), scripts);
 
-    std::vector<std::wstring> urls;
+    scriptLoader_.start({}); // this page's batch: each external script adds itself below
     std::vector<ScriptTask> deferred;
     for (Element* scriptEl : scripts) {
         ScriptKind kind = scriptKind(scriptEl);
@@ -400,10 +405,9 @@ void Engine::beginScripts() {
             task.external = true;
             if (task.module) {
                 task.url = resolved;
-                modules_.prefetch(resolved);
+                modules_.prefetch(resolved, attrOf(scriptEl, L"integrity"));
             } else {
-                task.fetchIndex = urls.size();
-                urls.push_back(resolved);
+                task.fetchIndex = scriptLoader_.add(resolved, FetchDest::Script, pageBaseUrl, attrOf(scriptEl, L"integrity"));
             }
         } else {
             task.inlineCode = scriptText(scriptEl);
@@ -415,7 +419,6 @@ void Engine::beginScripts() {
         else scriptTasks_.push_back(std::move(task));
     }
     for (auto& task : deferred) scriptTasks_.push_back(std::move(task));
-    scriptLoader_.start(std::move(urls), FetchDest::Script, pageBaseUrl);
     advanceScripts();
 }
 
@@ -445,9 +448,9 @@ void Engine::scriptInserted(Element* el) {
         }
         if (task.module) {
             task.url = resolved;
-            modules_.prefetch(resolved);
+            modules_.prefetch(resolved, attrOf(el, L"integrity"));
         } else {
-            task.fetchIndex = scriptLoader_.add(resolved, FetchDest::Script, pageBaseUrl);
+            task.fetchIndex = scriptLoader_.add(resolved, FetchDest::Script, pageBaseUrl, attrOf(el, L"integrity"));
         }
         asyncTasks_.push_back(std::move(task));
         return;
@@ -719,18 +722,16 @@ void Engine::parseAndBuild(const std::wstring& html) {
         std::vector<Element*> links;
         collectStylesheetLinks(searchRoot, links);
 
-        std::vector<std::wstring> urls;
+        styleLoader_.start({}); // this page's batch: each stylesheet adds itself below
         for (Element* link : links) {
             std::wstring resolved = resolveUrl(pageBaseUrl, link->attrs[L"href"]);
             if (resolved.empty()) continue; // e.g. a relative href on a local-file page
 
             StyleTask task;
-            task.fetchIndex = urls.size();
+            task.fetchIndex = styleLoader_.add(resolved, FetchDest::Style, pageBaseUrl, attrOf(link, L"integrity"));
             task.orderBase = kStyleOrderBand * (int)(styleTasks_.size() + 1);
             styleTasks_.push_back(task);
-            urls.push_back(resolved);
         }
-        styleLoader_.start(std::move(urls), FetchDest::Style, pageBaseUrl);
     }
     else {
         styleLoader_.start({});

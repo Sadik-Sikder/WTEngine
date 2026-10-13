@@ -9,7 +9,8 @@ void ResourceLoader::start(std::vector<std::wstring> urls, FetchDest dest, const
     for (auto& url : urls) add(std::move(url), dest, referrer);
 }
 
-size_t ResourceLoader::add(std::wstring url, FetchDest dest, const std::wstring& referrer) {
+size_t ResourceLoader::add(std::wstring url, FetchDest dest, const std::wstring& referrer,
+                           const std::wstring& integrity) {
     auto slot = std::make_shared<Slot>();
     slots_.push_back(slot);
     urls_.push_back(url);
@@ -19,6 +20,7 @@ size_t ResourceLoader::add(std::wstring url, FetchDest dest, const std::wstring&
     options.priority = FetchPriority::Blocking;
     options.dest = dest;
     options.referrer = referrer;
+    options.integrity = integrity;
     options.stillWanted = [weak] { return !weak.expired(); };
     fetchPageAsync(std::move(url), nullptr, std::move(options), [weak](FetchResult res) {
         std::shared_ptr<Slot> s = weak.lock();

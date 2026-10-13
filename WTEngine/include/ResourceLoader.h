@@ -26,7 +26,10 @@ public:
 
     // Adds one more fetch to the current batch - a module an import names,
     // a <script> a page's script inserted - and returns its index.
-    size_t add(std::wstring url, FetchDest dest, const std::wstring& referrer);
+    // `integrity`: the tag's integrity attribute, checked against the body
+    // (FetchOptions::integrity).
+    size_t add(std::wstring url, FetchDest dest, const std::wstring& referrer,
+               const std::wstring& integrity = L"");
 
     size_t count() const { return slots_.size(); }
 

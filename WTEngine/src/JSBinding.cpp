@@ -2748,6 +2748,128 @@ static const char kBootstrapJS[] = R"JS(
     toJSON() { return { timeOrigin }; },
   };
 
+  // User Timing: performance.mark()/measure() and the entries they record
+  // (GitHub's scripts each start with a mark). Only marks and measures are
+  // kept - no resource or navigation timing - and PerformanceObserver sees
+  // just those two types.
+  class PerformanceEntry {
+    constructor(name, entryType, startTime, duration) {
+      Object.defineProperties(this, {
+        name: { value: name, enumerable: true }, entryType: { value: entryType, enumerable: true },
+        startTime: { value: startTime, enumerable: true }, duration: { value: duration, enumerable: true },
+      });
+    }
+    toJSON() { return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration }; }
+  }
+  const timeArg = (v, what) => {
+    const n = Number(v);
+    if (!(n >= 0)) throw new TypeError("Failed to execute '" + what + "' on 'Performance': '" + v + "' cannot have a negative time stamp.");
+    return n;
+  };
+  class PerformanceMark extends PerformanceEntry {
+    constructor(name, options = {}) {
+      if (arguments.length < 1) throw new TypeError("Failed to construct 'PerformanceMark': 1 argument required, but only 0 present.");
+      const start = options && options.startTime !== undefined ? timeArg(options.startTime, 'mark') : __wtNow();
+      super(String(name), 'mark', start, 0);
+      Object.defineProperty(this, 'detail', { value: options && options.detail !== undefined ? structuredCloneish(options.detail) : null, enumerable: true });
+    }
+  }
+  class PerformanceMeasure extends PerformanceEntry {}
+  const structuredCloneish = v => { try { return g.structuredClone ? g.structuredClone(v) : v; } catch (e) { return v; } };
+  const entries = [];
+  const observers = new Set();
+  const record = entry => {
+    entries.push(entry);
+    for (const o of observers) o._offer(entry);
+    return entry;
+  };
+  const markTime = (name, what) => {
+    if (typeof name === 'number') return timeArg(name, what);
+    for (let i = entries.length - 1; i >= 0; i--)
+      if (entries[i].entryType === 'mark' && entries[i].name === name) return entries[i].startTime;
+    throw new DOMException("Failed to execute '" + what + "' on 'Performance': The mark '" + name + "' does not exist.", 'SyntaxError');
+  };
+  const byTime = list => list.slice().sort((a, b) => a.startTime - b.startTime);
+  Object.assign(g.performance, {
+    mark(name, options) { return record(new PerformanceMark(name, options)); },
+    measure(name, startOrOptions, endMark) {
+      let start = 0, end, detail = null;
+      if (startOrOptions && typeof startOrOptions === 'object') {
+        const o = startOrOptions;
+        if (o.start !== undefined) start = markTime(o.start, 'measure');
+        if (o.end !== undefined) end = markTime(o.end, 'measure');
+        if (o.duration !== undefined) {
+          if (o.start !== undefined) end = start + Number(o.duration);
+          else if (end !== undefined) start = end - Number(o.duration);
+        }
+        if (o.detail !== undefined) detail = structuredCloneish(o.detail);
+      } else if (startOrOptions !== undefined) {
+        start = markTime(String(startOrOptions), 'measure');
+      }
+      if (endMark !== undefined) end = markTime(String(endMark), 'measure');
+      if (end === undefined) end = __wtNow();
+      const m = new PerformanceMeasure(String(name), 'measure', start, end - start);
+      Object.defineProperty(m, 'detail', { value: detail, enumerable: true });
+      return record(m);
+    },
+    getEntries() { return byTime(entries); },
+    getEntriesByType(type) { return byTime(entries.filter(e => e.entryType === String(type))); },
+    getEntriesByName(name, type) {
+      return byTime(entries.filter(e => e.name === String(name) && (type === undefined || e.entryType === String(type))));
+    },
+    clearMarks(name) { clear('mark', name); },
+    clearMeasures(name) { clear('measure', name); },
+    clearResourceTimings() {},
+    setResourceTimingBufferSize() {},
+  });
+  const clear = (type, name) => {
+    for (let i = entries.length - 1; i >= 0; i--)
+      if (entries[i].entryType === type && (name === undefined || entries[i].name === String(name))) entries.splice(i, 1);
+  };
+
+  class PerformanceObserverEntryList {
+    constructor(list) { this._list = list; }
+    getEntries() { return byTime(this._list); }
+    getEntriesByType(type) { return byTime(this._list.filter(e => e.entryType === String(type))); }
+    getEntriesByName(name, type) {
+      return byTime(this._list.filter(e => e.name === String(name) && (type === undefined || e.entryType === String(type))));
+    }
+  }
+  class PerformanceObserver {
+    constructor(callback) {
+      if (typeof callback !== 'function')
+        throw new TypeError("Failed to construct 'PerformanceObserver': The callback provided as parameter 1 is not a function.");
+      this._callback = callback;
+      this._types = new Set();
+      this._queue = [];
+      this._scheduled = false;
+    }
+    observe(options = {}) {
+      const types = options.entryTypes ? Array.from(options.entryTypes, String) : options.type ? [String(options.type)] : [];
+      for (const t of types) this._types.add(t);
+      observers.add(this);
+      if (options.buffered && options.type)
+        for (const e of entries) if (e.entryType === options.type) this._offer(e);
+    }
+    disconnect() { observers.delete(this); this._queue = []; }
+    takeRecords() { const q = this._queue; this._queue = []; return q; }
+    _offer(entry) {
+      if (!this._types.has(entry.entryType)) return;
+      this._queue.push(entry);
+      if (this._scheduled) return;
+      this._scheduled = true;
+      setTimeout(() => {
+        this._scheduled = false;
+        const list = this.takeRecords();
+        if (!list.length) return;
+        try { this._callback.call(this, new PerformanceObserverEntryList(list), this); }
+        catch (e) { __wtReportError(e, 'PerformanceObserver'); }
+      }, 0);
+    }
+    static get supportedEntryTypes() { return ['mark', 'measure']; }
+  }
+  Object.assign(g, { PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList });
+
   g.queueMicrotask = cb => {
     if (typeof cb !== 'function')
       throw new TypeError("Failed to execute 'queueMicrotask' on 'Window': The callback provided as parameter 1 is not a function.");

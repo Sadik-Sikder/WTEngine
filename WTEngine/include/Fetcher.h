@@ -46,6 +46,10 @@ struct FetchOptions {
     // superseded page load or script batch cost nothing if it hadn't
     // started yet.
     std::function<bool()> stillWanted;
+    // Subresource Integrity: a <script>/<link>'s integrity attribute
+    // ("sha384-<base64> ..."). If set, a body that doesn't match is a
+    // failure, as in browsers - see checkIntegrity in Fetcher.cpp.
+    std::wstring integrity;
 };
 
 struct FetchResult {

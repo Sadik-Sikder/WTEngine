@@ -270,6 +270,7 @@ void ModuleLoader::reset(const std::wstring& pageUrl) {
     unscanned_.clear();
     bases_.clear();
     imports_.clear();
+    integrity_.clear();
     scopes_.clear();
 }
 
@@ -331,6 +332,25 @@ void ModuleLoader::addImportMap(JSContext* ctx, const std::wstring& json) {
     readMap(imports, imports_);
     JS_FreeValue(ctx, imports);
 
+    // "integrity": { "<url>": "sha384-..." } - what a module fetched from
+    // that URL must hash to (an earlier map's entry wins).
+    JSValue integrity = JS_GetPropertyStr(ctx, map, "integrity");
+    JSPropertyEnum* entries = nullptr;
+    uint32_t entryCount = 0;
+    if (JS_IsObject(integrity) &&
+        JS_GetOwnPropertyNames(ctx, &entries, &entryCount, integrity, JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) >= 0) {
+        for (uint32_t k = 0; k < entryCount; k++) {
+            const char* keyC = JS_AtomToCString(ctx, entries[k].atom);
+            std::wstring url = asUrl(wide(keyC), pageUrl_);
+            JS_FreeCString(ctx, keyC);
+            JSValue v = JS_GetProperty(ctx, integrity, entries[k].atom);
+            if (!url.empty() && JS_IsString(v)) integrity_.emplace(url, wide(ctx, v));
+            JS_FreeValue(ctx, v);
+        }
+        JS_FreePropertyEnum(ctx, entries, entryCount);
+    }
+    JS_FreeValue(ctx, integrity);
+
     JSValue scopes = JS_GetPropertyStr(ctx, map, "scopes");
     JSPropertyEnum* props = nullptr;
     uint32_t count = 0;
@@ -391,16 +411,18 @@ ModuleLoader::Module* ModuleLoader::find(const std::wstring& url) {
     return it == modules_.end() ? nullptr : &it->second;
 }
 
-ModuleLoader::Module& ModuleLoader::request(const std::wstring& url) {
+ModuleLoader::Module& ModuleLoader::request(const std::wstring& url, const std::wstring& integrity) {
     if (Module* m = find(url)) return *m;
     Module& m = modules_[url];
-    m.fetch = fetches_.add(url, FetchDest::Script, pageUrl_);
+    auto mapped = integrity_.find(url);
+    m.fetch = fetches_.add(url, FetchDest::Script, pageUrl_,
+                           !integrity.empty() || mapped == integrity_.end() ? integrity : mapped->second);
     unscanned_.push_back(url);
     return m;
 }
 
-void ModuleLoader::prefetch(const std::wstring& url) {
-    if (!find(url) && modules_.size() < kMaxPrefetch) request(url);
+void ModuleLoader::prefetch(const std::wstring& url, const std::wstring& integrity) {
+    if (!find(url) && modules_.size() < kMaxPrefetch) request(url, integrity);
 }
 
 void ModuleLoader::scan(const std::wstring& url, Module& m) {
