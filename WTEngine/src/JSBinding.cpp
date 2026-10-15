@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <map>
+#include <unordered_map>
 #include <set>
 #include <mutex>
 #include <deque>
@@ -101,10 +102,18 @@ struct ListenerStorage {
 struct NodeWrappers {
     struct Entry { JSValue obj; std::shared_ptr<Node> keepAlive; };
     std::map<Node*, Entry> byNode;
+    // The prototype a new wrapper gets: HTMLDivElement.prototype for a
+    // <div>, Text.prototype for text, and so on - keyed by tag, or by
+    // "#text", "#comment", "#document-fragment", "#document", "svg",
+    // "*svg" (any other SVG element) and "*" (any other HTML element).
+    // Set once by kBootstrapJS (__wtSetPrototypes); until then every
+    // wrapper has the shared node prototype they all inherit from.
+    std::unordered_map<std::wstring, JSValue> protos;
     JSContext* ctx = nullptr;
     ~NodeWrappers() {
         if (!ctx) return;
         for (auto& [node, e] : byNode) JS_FreeValue(ctx, e.obj);
+        for (auto& [key, proto] : protos) JS_FreeValue(ctx, proto);
     }
 };
 
@@ -224,6 +233,31 @@ static std::shared_ptr<Node> owningPtr(DOMBindingState* state, Node* node) {
 // wrapper keeps its node alive (NodeWrappers), so a node a script holds
 // survives being dropped from the tree; `owner`, when the caller has it,
 // saves looking it up.
+static bool isFragment(const Node* n);
+
+// The prototype `node`'s wrapper should have (NodeWrappers::protos), or
+// JS_UNDEFINED before kBootstrapJS has set them up. Borrowed, not dup'd.
+static JSValue prototypeFor(DOMBindingState* state, Node* node) {
+    auto& protos = state->wrappers->protos;
+    if (protos.empty()) return JS_UNDEFINED;
+    auto find = [&](const wchar_t* key) {
+        auto it = protos.find(key);
+        return it == protos.end() ? JS_UNDEFINED : it->second;
+    };
+    if (node->type == Node::TEXT) return find(static_cast<TextNode*>(node)->comment ? L"#comment" : L"#text");
+    if (isFragment(node)) return find(L"#document-fragment");
+    if (node == state->documentEl) return find(L"#document");
+    auto* el = static_cast<Element*>(node);
+    // Inside an <svg> (and not back in HTML through a <foreignObject>),
+    // a tag means its SVG element, not the HTML one of the same name.
+    for (Element* a = el; a; a = a->parent) {
+        if (a->tag == L"svg") return find(el == a ? L"svg" : L"*svg");
+        if (a->tag == L"foreignobject" && a != el) break;
+    }
+    auto it = protos.find(el->tag);
+    return it != protos.end() ? it->second : find(L"*");
+}
+
 static JSValue wrapNode(JSContext* ctx, Node* node, const std::shared_ptr<Node>* owner = nullptr) {
     if (!node) return JS_NULL;
     DOMBindingState* state = bindingState(ctx);
@@ -234,6 +268,10 @@ static JSValue wrapNode(JSContext* ctx, Node* node, const std::shared_ptr<Node>*
     JSValue obj = JS_NewObjectClass(ctx, js_node_class_id);
     if (JS_IsException(obj)) return obj;
     JS_SetOpaque(obj, node);
+    if (state) {
+        JSValue proto = prototypeFor(state, node);
+        if (JS_IsObject(proto)) JS_SetPrototype(ctx, obj, proto);
+    }
     if (state) state->wrappers->byNode[node] = { JS_DupValue(ctx, obj), owner ? *owner : owningPtr(state, node) };
     return obj;
 }
@@ -1864,6 +1902,68 @@ static JSValue js_native_scrollTo(JSContext* ctx, JSValueConst, int argc, JSValu
     return JS_UNDEFINED;
 }
 
+// __wtElementFromPoint(x, y) -> the element there, or null.
+static JSValue js_native_elementFromPoint(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    DOMBindingState* state = bindingState(ctx);
+    double x = NAN, y = NAN;
+    if (argc >= 1) JS_ToFloat64(ctx, &x, argv[0]);
+    if (argc >= 2) JS_ToFloat64(ctx, &y, argv[1]);
+    if (!state || !state->geometry.elementFromPoint || !std::isfinite(x) || !std::isfinite(y)) return JS_NULL;
+    return wrapNode(ctx, state->geometry.elementFromPoint(x, y));
+}
+
+// __wtIsNode(v) -> whether v is a DOM node's wrapper (whatever its
+// prototype - a custom element's is the page's own class).
+static JSValue js_native_isNode(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    return JS_NewBool(ctx, argc > 0 && unwrapNode(argv[0]) != nullptr);
+}
+
+// __wtSetPrototypes({ div: HTMLDivElement.prototype, '#text': ..., ... }):
+// the prototype each kind of node's wrapper gets (NodeWrappers::protos).
+// The wrappers made before this - kBootstrapJS's own - get theirs now.
+static JSValue js_native_setPrototypes(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state || argc < 1 || !JS_IsObject(argv[0])) return JS_UNDEFINED;
+    JSPropertyEnum* props = nullptr;
+    uint32_t count = 0;
+    if (JS_GetOwnPropertyNames(ctx, &props, &count, argv[0], JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0)
+        return JS_EXCEPTION;
+    auto& protos = state->wrappers->protos;
+    for (auto& [key, proto] : protos) JS_FreeValue(ctx, proto);
+    protos.clear();
+    for (uint32_t i = 0; i < count; i++) {
+        const char* key = JS_AtomToCString(ctx, props[i].atom);
+        JSValue proto = JS_GetProperty(ctx, argv[0], props[i].atom);
+        if (key && JS_IsObject(proto)) protos[utf8ToWide(key)] = proto;
+        else JS_FreeValue(ctx, proto);
+        JS_FreeCString(ctx, key);
+    }
+    JS_FreePropertyEnum(ctx, props, count);
+    for (auto& [node, entry] : state->wrappers->byNode) {
+        JSValue proto = prototypeFor(state, node);
+        if (JS_IsObject(proto)) JS_SetPrototype(ctx, entry.obj, proto);
+    }
+    return JS_UNDEFINED;
+}
+
+// __wtMakeAllCollection() -> a new object with [[IsHTMLDDA]], what
+// document.all is in browsers: typeof "undefined", falsy, == null, yet not
+// undefined. Scripts test `x === document.all` to mean "really undefined
+// or document.all" - polymer-resin (YouTube) does, and with document.all
+// undefined it took every undefined binding value for one to sanitize.
+static JSValue js_native_makeAllCollection(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetIsHTMLDDA(ctx, obj);
+    return obj;
+}
+
+// __wtActiveElement() -> the focused field, or null.
+static JSValue js_native_activeElement(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+    DOMBindingState* state = bindingState(ctx);
+    if (!state || !state->geometry.activeElement) return JS_NULL;
+    return wrapNode(ctx, state->geometry.activeElement());
+}
+
 // --- Media (kBootstrapJS builds HTMLMediaElement and Audio on these) ------
 
 // __wtMedia(el, name) -> the player's property as a number, or undefined
@@ -2603,6 +2703,25 @@ void evaluateInConsole(JSContext* ctx, const std::wstring& code) {
 // the style="" attribute - so every write goes through setAttribute, which
 // already marks the DOM dirty for a relayout).
 static const char kBootstrapJS[] = R"JS(
+// Members only some kinds of node have (media's play, a script's src, an
+// input's value, ...) are first defined on the one shared node prototype,
+// each checking what node it's on - the interfaces' own prototypes don't
+// exist until the last IIFE here, which moves each one there. Until then
+// this records, per name, the interfaces (or tags) it belongs to and what
+// the shared prototype had before (`base`, put back once it moves). It
+// matters beyond tidiness: `'data' in element` must be false for an element
+// that has no data - polymer-resin (YouTube) treats any name an element
+// has as a built-in, possibly dangerous one, and sanitizes it away.
+Object.defineProperty(globalThis, '__wtScope', {
+  configurable: true,
+  value: (proto, name, target) => {
+    const m = globalThis.__wtScopedProps || Object.defineProperty(globalThis, '__wtScopedProps', { value: new Map(), configurable: true }).__wtScopedProps;
+    let r = m.get(name);
+    if (!r) m.set(name, r = { targets: new Set(), base: Object.getOwnPropertyDescriptor(proto, name) });
+    r.targets.add(target);
+  },
+});
+
 (function () {
   const g = globalThis;
 
@@ -2729,8 +2848,112 @@ static const char kBootstrapJS[] = R"JS(
   class SubmitEvent extends Event {
     constructor(type, init) { super(type, init); this.submitter = (init && init.submitter) || null; }
   }
-  const eventClasses = { Event, UIEvent, MouseEvent, KeyboardEvent, InputEvent, FocusEvent, CustomEvent, SubmitEvent };
+  // The rest of the standard event classes. The engine doesn't fire these
+  // yet (no wheel, pointer or touch events), but pages construct them,
+  // dispatch their own, and name them in instanceof checks. Each takes its
+  // init dictionary's members with the spec's defaults.
+  const eventClass = (name, Base, defaults) => {
+    const C = { [name]: class extends Base {
+      constructor(type, init) {
+        super(type, init);
+        init = init || {};
+        for (const [k, d] of Object.entries(defaults)) {
+          const v = init[k];
+          this[k] = v === undefined ? (typeof d === 'function' ? d() : d) : typeof d === 'number' ? Number(v) : v;
+        }
+      }
+    } }[name];
+    return C;
+  };
+  const pointerDefaults = { pointerId: 0, width: 1, height: 1, pressure: 0, tangentialPressure: 0, tiltX: 0, tiltY: 0,
+    twist: 0, altitudeAngle: Math.PI / 2, azimuthAngle: 0, pointerType: '', isPrimary: false };
+  const WheelEvent = eventClass('WheelEvent', MouseEvent, { deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0 });
+  Object.assign(WheelEvent, { DOM_DELTA_PIXEL: 0, DOM_DELTA_LINE: 1, DOM_DELTA_PAGE: 2 });
+  const PointerEvent = eventClass('PointerEvent', MouseEvent, pointerDefaults);
+  PointerEvent.prototype.getCoalescedEvents = function () { return []; };
+  PointerEvent.prototype.getPredictedEvents = function () { return []; };
+  const TouchEvent = eventClass('TouchEvent', UIEvent, { touches: () => [], targetTouches: () => [], changedTouches: () => [],
+    altKey: false, metaKey: false, ctrlKey: false, shiftKey: false });
+  class Touch {
+    constructor(init) {
+      init = init || {};
+      for (const k of ['identifier', 'screenX', 'screenY', 'clientX', 'clientY', 'pageX', 'pageY', 'radiusX', 'radiusY', 'rotationAngle', 'force'])
+        this[k] = Number(init[k]) || 0;
+      this.target = init.target || null;
+    }
+  }
+  const more = {
+    WheelEvent, PointerEvent, TouchEvent,
+    DragEvent: eventClass('DragEvent', MouseEvent, { dataTransfer: null }),
+    CompositionEvent: eventClass('CompositionEvent', UIEvent, { data: '' }),
+    ClipboardEvent: eventClass('ClipboardEvent', Event, { clipboardData: null }),
+    AnimationEvent: eventClass('AnimationEvent', Event, { animationName: '', elapsedTime: 0, pseudoElement: '' }),
+    TransitionEvent: eventClass('TransitionEvent', Event, { propertyName: '', elapsedTime: 0, pseudoElement: '' }),
+    ErrorEvent: eventClass('ErrorEvent', Event, { message: '', filename: '', lineno: 0, colno: 0, error: null }),
+    PromiseRejectionEvent: eventClass('PromiseRejectionEvent', Event, { promise: null, reason: undefined }),
+    PopStateEvent: eventClass('PopStateEvent', Event, { state: null }),
+    HashChangeEvent: eventClass('HashChangeEvent', Event, { oldURL: '', newURL: '' }),
+    PageTransitionEvent: eventClass('PageTransitionEvent', Event, { persisted: false }),
+    BeforeUnloadEvent: eventClass('BeforeUnloadEvent', Event, {}),
+    StorageEvent: eventClass('StorageEvent', Event, { key: null, oldValue: null, newValue: null, url: '', storageArea: null }),
+    ToggleEvent: eventClass('ToggleEvent', Event, { oldState: '', newState: '' }),
+    SecurityPolicyViolationEvent: eventClass('SecurityPolicyViolationEvent', Event, { violatedDirective: '', blockedURI: '' }),
+  };
+  Object.assign(g, more, { Touch });
+  const eventClasses = { Event, UIEvent, MouseEvent, KeyboardEvent, InputEvent, FocusEvent, CustomEvent, SubmitEvent, ...more };
   Object.assign(g, eventClasses);
+
+  // The old way to make an event: document.createEvent('Event') and then
+  // initEvent(type, bubbles, cancelable). Polyfills - YouTube's web
+  // components one first of all - still use it.
+  Event.prototype.initEvent = function initEvent(type, bubbles, cancelable) {
+    if (this.eventPhase !== 0) return; // being dispatched: ignored, as in browsers
+    this.type = String(type);
+    this.bubbles = !!bubbles;
+    this.cancelable = !!cancelable;
+    this.defaultPrevented = false;
+    this.__wtStop = this.__wtStopImmediate = false;
+  };
+  CustomEvent.prototype.initCustomEvent = function initCustomEvent(type, bubbles, cancelable, detail) {
+    this.initEvent(type, bubbles, cancelable);
+    this.detail = detail === undefined ? null : detail;
+  };
+  UIEvent.prototype.initUIEvent = function initUIEvent(type, bubbles, cancelable, view, detail) {
+    this.initEvent(type, bubbles, cancelable);
+    this.view = view === undefined ? null : view;
+    this.detail = detail | 0;
+  };
+  MouseEvent.prototype.initMouseEvent = function initMouseEvent(type, bubbles, cancelable, view, detail, screenX, screenY,
+                                                                clientX, clientY, ctrlKey, altKey, shiftKey, metaKey,
+                                                                button, relatedTarget) {
+    this.initUIEvent(type, bubbles, cancelable, view, detail);
+    this.screenX = +screenX || 0; this.screenY = +screenY || 0;
+    this.clientX = this.pageX = +clientX || 0; this.clientY = this.pageY = +clientY || 0;
+    modifiers(this, { ctrlKey, altKey, shiftKey, metaKey });
+    this.button = button | 0;
+    this.relatedTarget = relatedTarget || null;
+  };
+  KeyboardEvent.prototype.initKeyboardEvent = function initKeyboardEvent(type, bubbles, cancelable, view, key, location,
+                                                                         ctrlKey, altKey, shiftKey, metaKey) {
+    this.initUIEvent(type, bubbles, cancelable, view, 0);
+    this.key = key === undefined ? '' : String(key);
+    this.location = location | 0;
+    modifiers(this, { ctrlKey, altKey, shiftKey, metaKey });
+  };
+  const legacyEventNames = {
+    event: Event, events: Event, htmlevents: Event, svgevents: Event, customevent: CustomEvent,
+    uievent: UIEvent, uievents: UIEvent, mouseevent: MouseEvent, mouseevents: MouseEvent,
+    keyboardevent: KeyboardEvent, keyboardevents: KeyboardEvent, focusevent: FocusEvent,
+    inputevent: InputEvent, submitevent: SubmitEvent,
+  };
+  Object.defineProperty(document, 'createEvent', {
+    configurable: true, writable: true,
+    value: function createEvent(name) {
+      const C = legacyEventNames[String(name).toLowerCase()];
+      if (!C) throw new DOMException("Failed to execute 'createEvent' on 'Document': The provided event type ('" + name + "') is invalid.", 'NotSupportedError');
+      return new C('');
+    },
+  });
   g.__wtMakeEvent = (ctor, type, init) => {
     const e = new eventClasses[ctor](type, init);
     e.isTrusted = true;
@@ -2787,6 +3010,13 @@ static const char kBootstrapJS[] = R"JS(
     if (typeof name === 'number') return timeArg(name, what);
     for (let i = entries.length - 1; i >= 0; i--)
       if (entries[i].entryType === 'mark' && entries[i].name === name) return entries[i].startTime;
+    // A PerformanceTiming field names that moment ('navigationStart' -
+    // Next.js measures its hydration from it).
+    if (Object.prototype.hasOwnProperty.call(g.performance.timing || {}, name) && name !== 'toJSON') {
+      const t = g.performance.timing[name];
+      if (!t) throw new DOMException("Failed to execute '" + what + "' on 'Performance': '" + name + "' is empty: either the event hasn't happened yet, or it would provide cross-origin timing information.", 'InvalidAccessError');
+      return t - timeOrigin;
+    }
     throw new DOMException("Failed to execute '" + what + "' on 'Performance': The mark '" + name + "' does not exist.", 'SyntaxError');
   };
   const byTime = list => list.slice().sort((a, b) => a.startTime - b.startTime);
@@ -2869,6 +3099,27 @@ static const char kBootstrapJS[] = R"JS(
     static get supportedEntryTypes() { return ['mark', 'measure']; }
   }
   Object.assign(g, { PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList });
+
+  // Navigation timing, for pages that read it: performance.timing (the old
+  // API, epoch milliseconds) and a "navigation" entry (milliseconds since
+  // timeOrigin). This engine doesn't keep the network times, so each phase
+  // reads as if it took no time, at the page's start.
+  const navFields = ['navigationStart', 'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd',
+    'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd', 'secureConnectionStart',
+    'requestStart', 'responseStart', 'responseEnd', 'domLoading', 'domInteractive', 'domContentLoadedEventStart',
+    'domContentLoadedEventEnd', 'domComplete', 'loadEventStart', 'loadEventEnd'];
+  const timing = {};
+  for (const f of navFields) timing[f] = /^(unload|redirect)|secureConnectionStart/.test(f) ? 0 : timeOrigin;
+  timing.toJSON = function () { const o = {}; for (const f of navFields) o[f] = this[f]; return o; };
+  g.performance.timing = timing;
+  g.performance.navigation = { type: 0, redirectCount: 0, TYPE_NAVIGATE: 0, TYPE_RELOAD: 1, TYPE_BACK_FORWARD: 2 };
+  class PerformanceNavigationTiming extends PerformanceEntry {}
+  const navEntry = new PerformanceNavigationTiming(location.href, 'navigation', 0, 0);
+  for (const f of navFields) if (f !== 'navigationStart' && f !== 'domLoading') navEntry[f] = 0;
+  Object.assign(navEntry, { type: 'navigate', redirectCount: 0, transferSize: 0, encodedBodySize: 0, decodedBodySize: 0,
+    initiatorType: 'navigation', nextHopProtocol: 'http/1.1', workerStart: 0 });
+  entries.push(navEntry);
+  g.PerformanceNavigationTiming = PerformanceNavigationTiming;
 
   g.queueMicrotask = cb => {
     if (typeof cb !== 'function')
@@ -3257,7 +3508,7 @@ static const char kBootstrapJS[] = R"JS(
       const stack = typeof v.stack === 'string' ? v.stack.replace(/\s+$/, '') : '';
       return stack ? head + '\n' + stack : head;
     }
-    if (Object.getPrototypeOf(v) === nodeProto) {
+    if (__wtIsNode(v)) {
       const tag = v.tagName;
       if (!tag) return '#text ' + JSON.stringify(v.textContent);
       const id = v.id ? '#' + v.id : '';
@@ -3381,6 +3632,8 @@ static const char kBootstrapJS[] = R"JS(
         },
       });
     },
+    // el.style = "color: red" sets the whole declaration list, as cssText.
+    set(v) { this.setAttribute('style', v === null || v === undefined ? '' : String(v)); },
   });
 })();
 
@@ -4060,32 +4313,33 @@ static const char kBootstrapJS[] = R"JS(
 })();
 
 // DOM interface classes: Node, Element, HTMLElement, Text, the per-tag
-// HTML*Element classes, Document, Window, ... Every node shares one native
-// prototype here, so each class answers instanceof by looking at the node
-// (element or text, its tag, inside an <svg> or not), and every class's
-// .prototype is that shared prototype - so a polyfill that patches
-// Element.prototype or HTMLElement.prototype reaches every node. None can
-// be constructed (new HTMLElement() throws, as without custom elements).
+// HTML*Element classes, Document, Window, ... Each class answers
+// instanceof by looking at the node (element or text, its tag, its
+// namespace); a page's subclass of one uses the ordinary prototype check.
+// Their .prototype objects - a real chain under the shared node prototype
+// - are made at the end of kBootstrapJS, once everything is defined on
+// the shared one. None can be constructed (new HTMLElement() throws, as
+// without custom elements).
 (() => {
   const g = globalThis;
   const nodeProto = Object.getPrototypeOf(document);
-  const isNode = v => v !== null && typeof v === 'object' && Object.getPrototypeOf(v) === nodeProto;
+  const isNode = v => __wtIsNode(v);
   const tagOf = v => (v.tagName || '').toLowerCase();
   const isElement = v => isNode(v) && v.nodeType === 1;
-  const inSvg = v => {
-    for (let n = v; n; n = n.parentNode) {
-      const t = tagOf(n);
-      if (t === 'svg') return true;
-      if (t === 'foreignobject' && n !== v) return false;
-    }
-    return false;
-  };
+  // In an <svg>, or made by createElementNS in SVG's namespace
+  // (namespaceURI - defined further down - knows both).
+  const inSvg = v => v.namespaceURI === 'http://www.w3.org/2000/svg';
   const isHTML = v => isElement(v) && !inSvg(v);
 
   const iface = (name, test, parent) => {
     const C = { [name]: function () { throw new TypeError('Illegal constructor'); } }[name];
     C.prototype = nodeProto;
-    Object.defineProperty(C, Symbol.hasInstance, { value: v => !!test(v), configurable: true });
+    // The interface itself answers by what the node is; a page's subclass
+    // of it (a custom element's class) by the ordinary prototype check.
+    Object.defineProperty(C, Symbol.hasInstance, {
+      configurable: true,
+      value(v) { return this === C ? !!test(v) : Function.prototype[Symbol.hasInstance].call(this, v); },
+    });
     if (parent) Object.setPrototypeOf(C, parent);
     Object.defineProperty(g, name, { value: C, writable: true, configurable: true });
     return C;
@@ -4105,6 +4359,10 @@ static const char kBootstrapJS[] = R"JS(
   const CharacterData = iface('CharacterData', v => isNode(v) && (v.nodeType === 3 || v.nodeType === 8), Node);
   iface('Text', v => isNode(v) && v.nodeType === 3, CharacterData);
   iface('Comment', v => isNode(v) && v.nodeType === 8, CharacterData);
+  // Kinds of node this DOM never has, but polyfills patch them by name.
+  iface('CDATASection', () => false, g.Text);
+  iface('ProcessingInstruction', () => false, CharacterData);
+  iface('DocumentType', () => false, Node);
   iface('DocumentFragment', v => isNode(v) && v.nodeType === 11, Node);
   // `document` wraps <body> here (so it's an Element too).
   const Document = iface('Document', v => v === document, Node);
@@ -4139,6 +4397,8 @@ static const char kBootstrapJS[] = R"JS(
     HTMLTextAreaElement: 'textarea', HTMLTimeElement: 'time', HTMLTitleElement: 'title',
     HTMLTrackElement: 'track', HTMLUListElement: 'ul', HTMLMediaElement: 'audio video',
   };
+  // For the prototype chain set up at the end (the last IIFE here).
+  Object.defineProperty(g, '__wtTagClasses', { value: tagClasses, configurable: true });
   for (const [name, tags] of Object.entries(tagClasses)) {
     const list = tags.split(' ');
     iface(name, v => isHTML(v) && list.includes(tagOf(v)), HTMLElement);
@@ -4651,6 +4911,7 @@ static const char kBootstrapJS[] = R"JS(
   };
 
   const define = (name, get, set) => {
+    __wtScope(nodeProto, name, 'HTMLMediaElement');
     const prev = Object.getOwnPropertyDescriptor(nodeProto, name);
     Object.defineProperty(nodeProto, name, {
       configurable: true,
@@ -4668,10 +4929,11 @@ static const char kBootstrapJS[] = R"JS(
   // Methods read off the prototype itself too, so a library can wrap
   // HTMLMediaElement.prototype.play.
   const method = (name, fn) => {
+    __wtScope(nodeProto, name, 'HTMLMediaElement');
     Object.defineProperty(fn, 'name', { value: name });
     Object.defineProperty(nodeProto, name, {
       configurable: true,
-      get() { return this === nodeProto || isMedia(this) ? fn : undefined; },
+      get() { return !__wtIsNode(this) || isMedia(this) ? fn : undefined; },
       set(v) { Object.defineProperty(this, name, { value: v, writable: true, enumerable: true, configurable: true }); },
     });
   };
@@ -4839,6 +5101,17 @@ static const char kBootstrapJS[] = R"JS(
     return a;
   };
   g.Audio.prototype = nodeProto;
+
+  // new Image(width, height): a detached <img> - pages use it to preload.
+  g.Image = function Image(width, height) {
+    if (!new.target)
+      throw new TypeError("Failed to construct 'Image': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    const img = document.createElement('img');
+    if (width !== undefined) img.setAttribute('width', String(width >>> 0));
+    if (height !== undefined) img.setAttribute('height', String(height >>> 0));
+    return img;
+  };
+  g.Image.prototype = nodeProto;
 })();
 
 // <script>: HTMLScriptElement's properties, each reflecting its attribute
@@ -4850,6 +5123,7 @@ static const char kBootstrapJS[] = R"JS(
   const nodeProto = Object.getPrototypeOf(document);
   const isScript = el => el !== nodeProto && el.nodeType === 1 && el.localName === 'script';
   const define = (name, get, set) => {
+    __wtScope(nodeProto, name, 'HTMLScriptElement');
     const prev = Object.getOwnPropertyDescriptor(nodeProto, name);
     Object.defineProperty(nodeProto, name, {
       configurable: true,
@@ -4924,6 +5198,7 @@ static const char kBootstrapJS[] = R"JS(
 (() => {
   const nodeProto = Object.getPrototypeOf(document);
   const fragments = new WeakMap();
+  __wtScope(nodeProto, 'content', 'HTMLTemplateElement');
   const prev = Object.getOwnPropertyDescriptor(nodeProto, 'content');
   Object.defineProperty(nodeProto, 'content', {
     configurable: true,
@@ -5146,6 +5421,7 @@ static const char kBootstrapJS[] = R"JS(
     return null;
   };
   for (const [name, specs] of Object.entries(table)) {
+    for (const [tags] of specs) for (const t of tags || ['*']) __wtScope(nodeProto, name, t);
     const prev = Object.getOwnPropertyDescriptor(nodeProto, name);
     Object.defineProperty(nodeProto, name, {
       configurable: true,
@@ -5180,11 +5456,12 @@ static const char kBootstrapJS[] = R"JS(
   // getContext reports with null, as a browser does for a context type it
   // lacks, so a page's feature check falls back instead of throwing.
   const canvasMethod = (name, fn) => {
+    __wtScope(nodeProto, name, 'HTMLCanvasElement');
     const prev = Object.getOwnPropertyDescriptor(nodeProto, name);
     Object.defineProperty(nodeProto, name, {
       configurable: true,
       get() {
-        if (this === nodeProto || (this.nodeType === 1 && this.localName === 'canvas')) return fn;
+        if (!__wtIsNode(this) || (this.nodeType === 1 && this.localName === 'canvas')) return fn;
         return prev ? (prev.get ? prev.get.call(this) : prev.value) : undefined;
       },
       set(v) { Object.defineProperty(this, name, { value: v, writable: true, enumerable: true, configurable: true }); },
@@ -5596,6 +5873,1076 @@ static const char kBootstrapJS[] = R"JS(
 
   Object.assign(g, { IntersectionObserver, IntersectionObserverEntry, ResizeObserver, ResizeObserverEntry, ResizeObserverSize });
 })();
+
+// Traversal and the rest of the document API: NodeFilter, TreeWalker,
+// NodeIterator, document.implementation, DOMParser, XMLSerializer,
+// importNode/adoptNode, getRootNode, compareDocumentPosition, attributes,
+// the *NS attribute methods, activeElement, elementFromPoint, and node
+// comparison. The web components polyfill YouTube ships starts with these.
+(() => {
+  const g = globalThis;
+  const nodeProto = Object.getPrototypeOf(document);
+  const HTML_NS = 'http://www.w3.org/1999/xhtml', XLINK_NS = 'http://www.w3.org/1999/xlink';
+
+  // The native accessors, captured now: polyfills replace the public ones,
+  // and a TreeWalker is how they reach the real tree afterwards.
+  const native = name => { const get = Object.getOwnPropertyDescriptor(nodeProto, name).get; return n => get.call(n); };
+  const nParent = native('parentNode'), nFirst = native('firstChild'), nLast = native('lastChild');
+  const nNext = native('nextSibling'), nPrev = native('previousSibling'), nType = native('nodeType');
+
+  // `document` is <body>'s wrapper, so a walk that starts at the document
+  // uses this stand-in for it: its one child is <html>, and <body> is just
+  // an element further down.
+  const DOC = {};
+  const html = () => document.documentElement;
+  const tree = {
+    parent: (n, root) => n === DOC ? null : (nParent(n) || (root === DOC && n === html() ? DOC : null)),
+    first: n => n === DOC ? html() : nFirst(n),
+    last: n => n === DOC ? html() : nLast(n),
+    next: n => n === DOC ? null : nNext(n),
+    prev: n => n === DOC ? null : nPrev(n),
+    type: n => n === DOC ? 9 : nType(n),
+  };
+  const outward = n => n === DOC ? document : n;
+  const inward = n => n === document ? DOC : n;
+
+  const NodeFilter = {
+    FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
+    SHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 0x1, SHOW_ATTRIBUTE: 0x2, SHOW_TEXT: 0x4, SHOW_CDATA_SECTION: 0x8,
+    SHOW_ENTITY_REFERENCE: 0x10, SHOW_ENTITY: 0x20, SHOW_PROCESSING_INSTRUCTION: 0x40, SHOW_COMMENT: 0x80,
+    SHOW_DOCUMENT: 0x100, SHOW_DOCUMENT_TYPE: 0x200, SHOW_DOCUMENT_FRAGMENT: 0x400, SHOW_NOTATION: 0x800,
+  };
+  const ACCEPT = 1, REJECT = 2, SKIP = 3;
+
+  // whatToShow, then the page's filter (a function or { acceptNode }).
+  const filterNode = (t, node) => {
+    if (!(((t._whatToShow >>> 0) >>> (tree.type(node) - 1)) & 1)) return SKIP;
+    const f = t._filter;
+    if (f === null) return ACCEPT;
+    if (t._active) throw new DOMException('Filter function can\'t be recursive', 'InvalidStateError');
+    t._active = true;
+    try {
+      const r = typeof f === 'function' ? f(outward(node)) : f.acceptNode(outward(node));
+      return Number(r) | 0;
+    } finally { t._active = false; }
+  };
+
+  const checkRoot = (root, what) => {
+    if (root === null || typeof root !== 'object' || !('nodeType' in root))
+      throw new TypeError("Failed to execute '" + what + "' on 'Document': parameter 1 is not of type 'Node'.");
+  };
+
+  class TreeWalker {
+    constructor(root, whatToShow, filter) {
+      this._root = inward(root);
+      this._whatToShow = whatToShow === undefined ? 0xFFFFFFFF : whatToShow >>> 0;
+      this._filter = filter == null ? null : filter;
+      this._cur = this._root;
+      this._active = false;
+    }
+    get root() { return outward(this._root); }
+    get whatToShow() { return this._whatToShow; }
+    get filter() { return this._filter; }
+    get currentNode() { return outward(this._cur); }
+    set currentNode(n) { checkRoot(n, 'currentNode'); this._cur = inward(n); }
+    parentNode() {
+      let node = this._cur;
+      while (node !== null && node !== this._root) {
+        node = tree.parent(node, this._root);
+        if (node !== null && filterNode(this, node) === ACCEPT) { this._cur = node; return outward(node); }
+      }
+      return null;
+    }
+    _children(first) {
+      let node = first ? tree.first(this._cur) : tree.last(this._cur);
+      while (node !== null) {
+        const r = filterNode(this, node);
+        if (r === ACCEPT) { this._cur = node; return outward(node); }
+        if (r === SKIP) {
+          const child = first ? tree.first(node) : tree.last(node);
+          if (child !== null) { node = child; continue; }
+        }
+        while (node !== null) {
+          const sibling = first ? tree.next(node) : tree.prev(node);
+          if (sibling !== null) { node = sibling; break; }
+          const parent = tree.parent(node, this._root);
+          if (parent === null || parent === this._root || parent === this._cur) return null;
+          node = parent;
+        }
+      }
+      return null;
+    }
+    firstChild() { return this._children(true); }
+    lastChild() { return this._children(false); }
+    _siblings(next) {
+      let node = this._cur;
+      if (node === this._root) return null;
+      for (;;) {
+        let sibling = next ? tree.next(node) : tree.prev(node);
+        while (sibling !== null) {
+          node = sibling;
+          const r = filterNode(this, node);
+          if (r === ACCEPT) { this._cur = node; return outward(node); }
+          sibling = next ? tree.first(node) : tree.last(node);
+          if (r === REJECT || sibling === null) sibling = next ? tree.next(node) : tree.prev(node);
+        }
+        node = tree.parent(node, this._root);
+        if (node === null || node === this._root) return null;
+        if (filterNode(this, node) === ACCEPT) return null;
+      }
+    }
+    nextSibling() { return this._siblings(true); }
+    previousSibling() { return this._siblings(false); }
+    previousNode() {
+      let node = this._cur;
+      while (node !== this._root) {
+        let sibling = tree.prev(node);
+        while (sibling !== null) {
+          node = sibling;
+          let r = filterNode(this, node);
+          while (r !== REJECT && tree.last(node) !== null) {
+            node = tree.last(node);
+            r = filterNode(this, node);
+          }
+          if (r === ACCEPT) { this._cur = node; return outward(node); }
+          sibling = tree.prev(node);
+        }
+        const parent = tree.parent(node, this._root);
+        if (node === this._root || parent === null) return null;
+        node = parent;
+        if (filterNode(this, node) === ACCEPT) { this._cur = node; return outward(node); }
+      }
+      return null;
+    }
+    nextNode() {
+      let node = this._cur, r = ACCEPT;
+      for (;;) {
+        while (r !== REJECT && tree.first(node) !== null) {
+          node = tree.first(node);
+          r = filterNode(this, node);
+          if (r === ACCEPT) { this._cur = node; return outward(node); }
+        }
+        let sibling = null;
+        for (let temp = node; temp !== null; temp = tree.parent(temp, this._root)) {
+          if (temp === this._root) return null;
+          sibling = tree.next(temp);
+          if (sibling !== null) break;
+        }
+        if (sibling === null) return null;
+        node = sibling;
+        r = filterNode(this, node);
+        if (r === ACCEPT) { this._cur = node; return outward(node); }
+      }
+    }
+  }
+
+  // NodeIterator: the same filtering over a flat, document-order walk. (Not
+  // adjusted when the node it's on is removed.)
+  class NodeIterator {
+    constructor(root, whatToShow, filter) {
+      this._root = inward(root);
+      this._whatToShow = whatToShow === undefined ? 0xFFFFFFFF : whatToShow >>> 0;
+      this._filter = filter == null ? null : filter;
+      this._ref = this._root;
+      this._before = true;
+      this._active = false;
+    }
+    get root() { return outward(this._root); }
+    get whatToShow() { return this._whatToShow; }
+    get filter() { return this._filter; }
+    get referenceNode() { return outward(this._ref); }
+    get pointerBeforeReferenceNode() { return this._before; }
+    _following(n) {
+      const child = tree.first(n);
+      if (child !== null) return child;
+      for (; n !== null && n !== this._root; n = tree.parent(n, this._root)) {
+        const sibling = tree.next(n);
+        if (sibling !== null) return sibling;
+      }
+      return null;
+    }
+    _preceding(n) {
+      if (n === this._root) return null;
+      let p = tree.prev(n);
+      if (p === null) return tree.parent(n, this._root);
+      while (tree.last(p) !== null) p = tree.last(p);
+      return p;
+    }
+    _traverse(next) {
+      let node = this._ref, before = this._before;
+      for (;;) {
+        if (next) {
+          if (!before) { node = this._following(node); if (node === null) return null; } else before = false;
+        } else {
+          if (before) { node = this._preceding(node); if (node === null) return null; } else before = true;
+        }
+        if (filterNode(this, node) === ACCEPT) break;
+      }
+      this._ref = node;
+      this._before = before;
+      return outward(node);
+    }
+    nextNode() { return this._traverse(true); }
+    previousNode() { return this._traverse(false); }
+    detach() {}
+  }
+
+  // --- Other documents: document.implementation, DOMParser ------------
+  // A document made by a script, for building or parsing HTML away from
+  // the page. Its <html>, <head> and <body> are ordinary detached elements;
+  // nodes made through it belong to the page's document as far as
+  // ownerDocument is concerned.
+  class InertDocument {
+    constructor(title) {
+      const root = document.createElement('html');
+      const head = document.createElement('head');
+      const body = document.createElement('body');
+      root.appendChild(head);
+      root.appendChild(body);
+      if (title !== undefined) {
+        const t = document.createElement('title');
+        t.textContent = String(title);
+        head.appendChild(t);
+      }
+      Object.defineProperties(this, {
+        documentElement: { value: root, enumerable: true },
+        implementation: { value: implementation },
+      });
+    }
+    get nodeType() { return 9; }
+    get nodeName() { return '#document'; }
+    get head() { return this.documentElement.querySelector('head'); }
+    get body() { return this.documentElement.querySelector('body'); }
+    get title() { const t = this.documentElement.querySelector('title'); return t ? t.textContent.replace(/\s+/g, ' ').trim() : ''; }
+    set title(v) {
+      let t = this.documentElement.querySelector('title');
+      if (!t) { t = document.createElement('title'); this.head.appendChild(t); }
+      t.textContent = String(v);
+    }
+    get childNodes() { return [this.documentElement]; }
+    get children() { return [this.documentElement]; }
+    get firstChild() { return this.documentElement; }
+    get lastChild() { return this.documentElement; }
+    get firstElementChild() { return this.documentElement; }
+    get parentNode() { return null; }
+    get ownerDocument() { return null; }
+    get defaultView() { return null; }
+    get URL() { return 'about:blank'; }
+    get documentURI() { return 'about:blank'; }
+    get readyState() { return 'complete'; }
+    get contentType() { return 'text/html'; }
+    get characterSet() { return 'UTF-8'; }
+    get compatMode() { return 'CSS1Compat'; }
+    get activeElement() { return null; }
+    querySelector(s) { const r = this.documentElement; return r.matches(s) ? r : r.querySelector(s); }
+    querySelectorAll(s) { const r = this.documentElement; return (r.matches(s) ? [r] : []).concat(r.querySelectorAll(s)); }
+    getElementById(id) { id = String(id); return this.querySelectorAll('[id]').find(e => e.id === id) || null; }
+    getElementsByTagName(t) {
+      const r = this.documentElement;
+      return (t === '*' || r.localName === String(t).toLowerCase() ? [r] : []).concat(r.getElementsByTagName(t));
+    }
+    getElementsByClassName(c) { return this.documentElement.getElementsByClassName(c); }
+    contains(n) { return n === this || this.documentElement.contains(n); }
+    hasChildNodes() { return true; }
+    addEventListener() {}
+    removeEventListener() {}
+    dispatchEvent() { return true; }
+  }
+  for (const name of ['createElement', 'createElementNS', 'createTextNode', 'createComment', 'createDocumentFragment',
+                      'createEvent', 'createTreeWalker', 'createNodeIterator', 'createAttribute', 'importNode', 'adoptNode'])
+    InertDocument.prototype[name] = function (...args) { return document[name](...args); };
+
+  const implementation = {
+    createHTMLDocument(title) { return new InertDocument(title); },
+    createDocument(namespace, qualifiedName) {
+      const d = new InertDocument();
+      d.documentElement.replaceChildren();
+      return d;
+    },
+    createDocumentType(name, publicId, systemId) {
+      return { nodeType: 10, nodeName: String(name), name: String(name), publicId: String(publicId || ''), systemId: String(systemId || '') };
+    },
+    hasFeature() { return true; },
+  };
+
+  class DOMParser {
+    parseFromString(text, type) {
+      text = String(text);
+      const d = new InertDocument();
+      const m = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(text);
+      if (m) d.title = m[1];
+      const holder = document.createElement('div');
+      holder.innerHTML = text;
+      d.body.replaceChildren(...Array.from(holder.childNodes));
+      return d;
+    }
+  }
+  class XMLSerializer {
+    serializeToString(node) {
+      if (node instanceof InertDocument) return node.documentElement.outerHTML;
+      if (node === document) return document.documentElement.outerHTML;
+      if (node.nodeType === 3) return node.textContent.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      if (node.nodeType === 8) return '<!--' + node.data + '-->';
+      if (node.nodeType === 11) return Array.from(node.childNodes, c => this.serializeToString(c)).join('');
+      // As XML: the outermost element names its namespace.
+      const ns = node.namespaceURI || HTML_NS;
+      return node.outerHTML.replace(/^<([^\s>\/]+)/, (m, tag) => '<' + tag + ' xmlns="' + ns + '"');
+    }
+  }
+
+  // --- Attributes as nodes: element.attributes, Attr ------------------
+  class Attr {
+    constructor(owner, name, value) {
+      Object.defineProperties(this, {
+        ownerElement: { value: owner, enumerable: true }, name: { value: name, enumerable: true },
+        _value: { value, writable: true },
+      });
+    }
+    get value() { return this.ownerElement ? (this.ownerElement.getAttribute(this.name) ?? '') : this._value; }
+    set value(v) { this._value = String(v); if (this.ownerElement) this.ownerElement.setAttribute(this.name, this._value); }
+    get localName() { const i = this.name.indexOf(':'); return i < 0 ? this.name : this.name.slice(i + 1); }
+    get prefix() { const i = this.name.indexOf(':'); return i < 0 ? null : this.name.slice(0, i); }
+    get namespaceURI() { return this.prefix === 'xlink' ? XLINK_NS : null; }
+    get nodeName() { return this.name; }
+    get nodeValue() { return this.value; }
+    set nodeValue(v) { this.value = v; }
+    get textContent() { return this.value; }
+    set textContent(v) { this.value = v; }
+    get specified() { return true; }
+    get nodeType() { return 2; }
+    get parentNode() { return null; }
+    get ownerDocument() { return document; }
+  }
+  // A snapshot each time it's read (the list itself isn't live, the
+  // values in it are).
+  class NamedNodeMap {
+    constructor(el) {
+      const names = el.getAttributeNames();
+      names.forEach((n, i) => { this[i] = new Attr(el, n, el.getAttribute(n)); });
+      Object.defineProperties(this, { _el: { value: el }, length: { value: names.length } });
+    }
+    item(i) { return this[i >>> 0] || null; }
+    getNamedItem(name) {
+      name = String(name).toLowerCase();
+      for (let i = 0; i < this.length; i++) if (this[i].name === name) return this[i];
+      return null;
+    }
+    getNamedItemNS(ns, local) { return this.getNamedItem(ns === XLINK_NS ? 'xlink:' + local : local); }
+    setNamedItem(attr) { const old = this.getNamedItem(attr.name); this._el.setAttribute(attr.name, attr.value); return old; }
+    setNamedItemNS(attr) { return this.setNamedItem(attr); }
+    removeNamedItem(name) {
+      const old = this.getNamedItem(name);
+      if (!old) throw new DOMException("Failed to execute 'removeNamedItem' on 'NamedNodeMap': No item with name '" + name + "' was found.", 'NotFoundError');
+      this._el.removeAttribute(old.name);
+      return old;
+    }
+    removeNamedItemNS(ns, local) { return this.removeNamedItem(ns === XLINK_NS ? 'xlink:' + local : local); }
+    *[Symbol.iterator]() { for (let i = 0; i < this.length; i++) yield this[i]; }
+  }
+
+  const def = (name, desc) => {
+    const prev = Object.getOwnPropertyDescriptor(nodeProto, name);
+    if (prev && !prev.configurable) return;
+    Object.defineProperty(nodeProto, name, Object.assign({ configurable: true }, desc));
+  };
+  const method = (name, fn) => def(name, { writable: true, value: fn });
+  const isElement = n => n !== nodeProto && nType(n) === 1;
+
+  def('attributes', { get() { return isElement(this) ? new NamedNodeMap(this) : null; } });
+  method('hasAttributes', function hasAttributes() { return isElement(this) && this.getAttributeNames().length > 0; });
+  method('getAttributeNode', function getAttributeNode(name) {
+    name = String(name).toLowerCase();
+    return this.hasAttribute(name) ? new Attr(this, name, this.getAttribute(name)) : null;
+  });
+  method('setAttributeNode', function setAttributeNode(attr) {
+    const old = this.getAttributeNode(attr.name);
+    this.setAttribute(attr.name, attr.value);
+    return old;
+  });
+  method('removeAttributeNode', function removeAttributeNode(attr) { this.removeAttribute(attr.name); return attr; });
+
+  // The *NS attribute methods: the namespace only matters for xlink:href
+  // and its kin, which HTML parsing keeps under their prefixed name.
+  const nsName = (ns, local) => ns === XLINK_NS && !String(local).includes(':') ? 'xlink:' + local : String(local);
+  const qualified = q => { q = String(q); const i = q.indexOf(':'); return i < 0 ? q : q.slice(i + 1); };
+  method('getAttributeNS', function getAttributeNS(ns, local) {
+    const v = this.getAttribute(nsName(ns, local));
+    return v !== null || ns !== XLINK_NS ? v : this.getAttribute(String(local));
+  });
+  method('setAttributeNS', function setAttributeNS(ns, name, value) {
+    this.setAttribute(ns === XLINK_NS && !String(name).includes(':') ? 'xlink:' + name : String(name), value);
+  });
+  method('hasAttributeNS', function hasAttributeNS(ns, local) { return this.getAttributeNS(ns, local) !== null; });
+  method('removeAttributeNS', function removeAttributeNS(ns, local) { this.removeAttribute(nsName(ns, qualified(local))); });
+  method('getAttributeNodeNS', function getAttributeNodeNS(ns, local) { return this.getAttributeNode(nsName(ns, local)); });
+  method('setAttributeNodeNS', function setAttributeNodeNS(attr) { return this.setAttributeNode(attr); });
+
+  // --- Tree relationships ---------------------------------------------
+  method('getRootNode', function getRootNode() {
+    let n = this;
+    for (let p = n.parentNode; p; p = p.parentNode) n = p;
+    return n === html() ? document : n;
+  });
+
+  // DOCUMENT_POSITION_* bits: 1 disconnected, 2 preceding, 4 following,
+  // 8 contains, 16 contained by, 32 implementation-specific.
+  method('compareDocumentPosition', function compareDocumentPosition(other) {
+    if (other === null || typeof other !== 'object' || !('nodeType' in other))
+      throw new TypeError("Failed to execute 'compareDocumentPosition' on 'Node': parameter 1 is not of type 'Node'.");
+    if (this === other) return 0;
+    const chain = n => { const a = []; for (let x = n; x; x = x.parentNode) a.unshift(x); return a; };
+    const a = chain(this), b = chain(other);
+    // `document` (as the document, not <body>) holds the whole tree.
+    if (this === document && b[0] === html()) return 16 | 4;
+    if (other === document && a[0] === html()) return 8 | 2;
+    if (a[0] !== b[0]) return 1 | 32 | 4;
+    let i = 0;
+    while (i < a.length && i < b.length && a[i] === b[i]) i++;
+    if (i === a.length) return 16 | 4; // other is inside this
+    if (i === b.length) return 8 | 2;  // this is inside other
+    const siblings = Array.from(a[i - 1].childNodes);
+    return siblings.indexOf(b[i]) > siblings.indexOf(a[i]) ? 4 : 2;
+  });
+  method('isSameNode', function isSameNode(other) { return this === other; });
+  method('isEqualNode', function isEqualNode(other) {
+    if (!other || other.nodeType !== this.nodeType || other.nodeName !== this.nodeName) return false;
+    if (this.nodeType === 3 || this.nodeType === 8) return this.data === other.data;
+    if (this.nodeType === 1) {
+      const names = this.getAttributeNames();
+      if (names.length !== other.getAttributeNames().length) return false;
+      if (names.some(n => other.getAttribute(n) !== this.getAttribute(n))) return false;
+    }
+    const mine = this.childNodes, theirs = other.childNodes;
+    if (mine.length !== theirs.length) return false;
+    for (let i = 0; i < mine.length; i++) if (!mine[i].isEqualNode(theirs[i])) return false;
+    return true;
+  });
+  // Merges adjacent text nodes and drops empty ones.
+  method('normalize', function normalize() {
+    for (let c = this.firstChild; c;) {
+      const next = c.nextSibling;
+      if (c.nodeType === 3) {
+        if (c.data === '') { c.remove(); c = next; continue; }
+        let n = next;
+        while (n && n.nodeType === 3) { c.data += n.data; const after = n.nextSibling; n.remove(); n = after; }
+        c = n;
+        continue;
+      }
+      if (c.nodeType === 1) c.normalize();
+      c = next;
+    }
+  });
+  method('lookupNamespaceURI', function lookupNamespaceURI(prefix) {
+    return prefix === null || prefix === undefined || prefix === '' ? (this.namespaceURI || HTML_NS) : prefix === 'xlink' ? XLINK_NS : null;
+  });
+  method('lookupPrefix', function lookupPrefix(ns) { return ns === XLINK_NS ? 'xlink' : null; });
+  method('isDefaultNamespace', function isDefaultNamespace(ns) { return ns === (this.namespaceURI || HTML_NS); });
+
+  // --- On the document --------------------------------------------------
+  const onDocument = (name, value) =>
+    Object.defineProperty(document, name, { configurable: true, writable: true, value });
+  onDocument('createTreeWalker', function createTreeWalker(root, whatToShow, filter) {
+    checkRoot(root, 'createTreeWalker');
+    return new TreeWalker(root, whatToShow, filter);
+  });
+  onDocument('createNodeIterator', function createNodeIterator(root, whatToShow, filter) {
+    checkRoot(root, 'createNodeIterator');
+    return new NodeIterator(root, whatToShow, filter);
+  });
+  onDocument('importNode', function importNode(node, deep) {
+    if (node === document || node instanceof InertDocument)
+      throw new DOMException("Failed to execute 'importNode' on 'Document': The node provided is a document, which may not be imported.", 'NotSupportedError');
+    return node.cloneNode(!!deep);
+  });
+  onDocument('adoptNode', function adoptNode(node) {
+    if (node.parentNode) node.parentNode.removeChild(node);
+    return node;
+  });
+  onDocument('createAttribute', function createAttribute(name) { return new Attr(null, String(name).toLowerCase(), ''); });
+  onDocument('createAttributeNS', function createAttributeNS(ns, name) { return new Attr(null, String(name), ''); });
+  onDocument('elementFromPoint', function elementFromPoint(x, y) { return __wtElementFromPoint(x, y); });
+  onDocument('elementsFromPoint', function elementsFromPoint(x, y) {
+    const out = [];
+    for (let el = __wtElementFromPoint(x, y); el; el = el.parentElement) out.push(el);
+    return out;
+  });
+  onDocument('hasFocus', function hasFocus() { return true; });
+  Object.defineProperty(document, 'activeElement', {
+    configurable: true, enumerable: true,
+    get() { return __wtActiveElement() || document.body; },
+  });
+  Object.defineProperty(document, 'implementation', { configurable: true, enumerable: true, value: implementation });
+  Object.defineProperty(document, 'defaultView', { configurable: true, enumerable: true, get() { return g; } });
+
+  // document.all: every element, as the old HTMLAllCollection - and, like
+  // a browser's, falsy with typeof "undefined" (see __wtMakeAllCollection).
+  const all = __wtMakeAllCollection();
+  const allElements = () => document.getElementsByTagName('*');
+  Object.defineProperties(all, {
+    length: { get() { return allElements().length; } },
+    item: { value: function item(i) {
+      if (typeof i === 'string' && !/^\d+$/.test(i)) return all.namedItem(i);
+      return allElements()[Number(i) >>> 0] || null;
+    } },
+    namedItem: { value: function namedItem(name) {
+      name = String(name);
+      return allElements().find(e => e.id === name || e.getAttribute('name') === name) || null;
+    } },
+    [Symbol.iterator]: { value: function* () { yield* allElements(); } },
+  });
+  Object.defineProperty(document, 'all', { configurable: true, enumerable: true, get() { return all; } });
+
+  // A script-made document is a Document too.
+  const isDocument = g.Document[Symbol.hasInstance];
+  Object.defineProperty(g.Document, Symbol.hasInstance, {
+    configurable: true, value: v => v instanceof InertDocument || isDocument.call(g.Document, v),
+  });
+
+  Object.assign(g, { NodeFilter, TreeWalker, NodeIterator, DOMParser, XMLSerializer, Attr, NamedNodeMap });
+})();
+
+// AbortController and AbortSignal, and the two places that take a signal:
+// fetch() (rejects with the signal's reason - the request itself finishes
+// unseen) and addEventListener's { signal } (removes the listener).
+(() => {
+  const g = globalThis;
+  const nodeProto = Object.getPrototypeOf(document);
+  const abortError = () => new DOMException('signal is aborted without reason', 'AbortError');
+
+  class AbortSignal extends g.EventTarget {
+    constructor() {
+      super();
+      Object.defineProperties(this, { _aborted: { value: false, writable: true }, _reason: { value: undefined, writable: true } });
+    }
+    get aborted() { return this._aborted; }
+    get reason() { return this._reason; }
+    throwIfAborted() { if (this._aborted) throw this._reason; }
+    _abort(reason) {
+      if (this._aborted) return;
+      this._aborted = true;
+      this._reason = reason === undefined ? abortError() : reason;
+      this.dispatchEvent(new Event('abort'));
+    }
+    static abort(reason) { const s = new AbortSignal(); s._abort(reason); return s; }
+    static timeout(ms) {
+      const s = new AbortSignal();
+      setTimeout(() => s._abort(new DOMException('signal timed out', 'TimeoutError')), Number(ms) || 0);
+      return s;
+    }
+    static any(signals) {
+      const s = new AbortSignal();
+      for (const each of signals) {
+        if (each.aborted) { s._abort(each.reason); break; }
+        each.addEventListener('abort', () => s._abort(each.reason), { once: true });
+      }
+      return s;
+    }
+  }
+  class AbortController {
+    constructor() { Object.defineProperty(this, 'signal', { value: new AbortSignal(), enumerable: true }); }
+    abort(reason) { this.signal._abort(reason); }
+  }
+  Object.assign(g, { AbortSignal, AbortController });
+
+  const nativeFetch = g.fetch;
+  g.fetch = function fetch(input, init) {
+    const signal = init && init.signal;
+    if (!signal) return nativeFetch(input, init);
+    if (signal.aborted) return Promise.reject(signal.reason);
+    return new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      nativeFetch(input, init).then(resolve, reject);
+    });
+  };
+
+  // { signal } on addEventListener, wherever it lives.
+  const withSignal = add => function addEventListener(type, listener, options) {
+    const signal = options && typeof options === 'object' ? options.signal : undefined;
+    if (signal && signal.aborted) return;
+    add.call(this, type, listener, options);
+    if (signal) {
+      const capture = typeof options === 'object' ? !!options.capture : !!options;
+      signal.addEventListener('abort', () => this.removeEventListener(type, listener, capture), { once: true });
+    }
+  };
+  for (const target of [nodeProto, g.EventTarget.prototype]) {
+    const d = Object.getOwnPropertyDescriptor(target, 'addEventListener');
+    Object.defineProperty(target, 'addEventListener', { configurable: true, writable: true, value: withSignal(d.value) });
+  }
+  g.addEventListener = withSignal(g.addEventListener);
+})();
+
+// Range and Selection: boundary points (node, offset) in the tree, with
+// comparison, text, extracting/cloning/deleting contents, insertNode and
+// createContextualFragment. Simplified where the DOM spec splits elements
+// that are only partly inside: those stay where they are (their inside
+// text is still trimmed). The selection is the page's own - the user
+// can't select text yet - so it's whatever scripts put in it.
+(() => {
+  const g = globalThis;
+  const indexOf = n => { const p = n.parentNode; return p ? Array.prototype.indexOf.call(p.childNodes, n) : 0; };
+  const lengthOf = n => n.nodeType === 3 || n.nodeType === 8 ? n.data.length : n.childNodes.length;
+  const isText = n => n.nodeType === 3;
+  const checkNode = (n, what) => {
+    if (!__wtIsNode(n) && n !== document)
+      throw new TypeError("Failed to execute '" + what + "' on 'Range': parameter 1 is not of type 'Node'.");
+  };
+  const checkOffset = (n, o, what) => {
+    if (o > lengthOf(n))
+      throw new DOMException("Failed to execute '" + what + "' on 'Range': The offset " + o + ' is larger than the node\'s length (' + lengthOf(n) + ').', 'IndexSizeError');
+  };
+
+  // Where (a, ao) is relative to (b, bo): -1 before, 0 equal, 1 after.
+  const compare = (a, ao, b, bo) => {
+    if (a === b) return ao === bo ? 0 : ao < bo ? -1 : 1;
+    const pos = a.compareDocumentPosition(b);
+    if (pos & 2) return -compare(b, bo, a, ao); // b precedes a: compare the other way
+    if (pos & 16) {                               // b is inside a
+      let child = b;
+      while (child.parentNode !== a) child = child.parentNode;
+      return indexOf(child) < ao ? 1 : -1;
+    }
+    return -1;
+  };
+
+  // Every node from `from` on, in document order, until `to` (exclusive).
+  function* between(from, to) {
+    for (let n = from; n && n !== to;) {
+      yield n;
+      if (n.firstChild) { n = n.firstChild; continue; }
+      while (n && !n.nextSibling) n = n.parentNode;
+      n = n && n.nextSibling;
+    }
+  }
+
+  class AbstractRange {
+    get startContainer() { return this._sc; }
+    get startOffset() { return this._so; }
+    get endContainer() { return this._ec; }
+    get endOffset() { return this._eo; }
+    get collapsed() { return this._sc === this._ec && this._so === this._eo; }
+  }
+  class StaticRange extends AbstractRange {
+    constructor(init) {
+      super();
+      Object.assign(this, { _sc: init.startContainer, _so: init.startOffset >>> 0, _ec: init.endContainer, _eo: init.endOffset >>> 0 });
+    }
+  }
+
+  class Range extends AbstractRange {
+    constructor() { super(); this._sc = this._ec = document; this._so = this._eo = 0; }
+    get commonAncestorContainer() {
+      for (let a = this._sc; a; a = a.parentNode) if (a === this._ec || a.contains(this._ec)) return a;
+      return document;
+    }
+    setStart(node, offset) {
+      checkNode(node, 'setStart'); offset >>>= 0; checkOffset(node, offset, 'setStart');
+      this._sc = node; this._so = offset;
+      if (compare(this._sc, this._so, this._ec, this._eo) > 0) { this._ec = node; this._eo = offset; }
+    }
+    setEnd(node, offset) {
+      checkNode(node, 'setEnd'); offset >>>= 0; checkOffset(node, offset, 'setEnd');
+      this._ec = node; this._eo = offset;
+      if (compare(this._sc, this._so, this._ec, this._eo) > 0) { this._sc = node; this._so = offset; }
+    }
+    setStartBefore(n) { this.setStart(n.parentNode, indexOf(n)); }
+    setStartAfter(n) { this.setStart(n.parentNode, indexOf(n) + 1); }
+    setEndBefore(n) { this.setEnd(n.parentNode, indexOf(n)); }
+    setEndAfter(n) { this.setEnd(n.parentNode, indexOf(n) + 1); }
+    selectNode(n) {
+      const p = n.parentNode;
+      if (!p) throw new DOMException("Failed to execute 'selectNode' on 'Range': the given Node has no parent.", 'InvalidNodeTypeError');
+      const i = indexOf(n);
+      this._sc = this._ec = p; this._so = i; this._eo = i + 1;
+    }
+    selectNodeContents(n) { this._sc = this._ec = n; this._so = 0; this._eo = lengthOf(n); }
+    collapse(toStart) {
+      if (toStart) { this._ec = this._sc; this._eo = this._so; } else { this._sc = this._ec; this._so = this._eo; }
+    }
+    cloneRange() { const r = new Range(); Object.assign(r, { _sc: this._sc, _so: this._so, _ec: this._ec, _eo: this._eo }); return r; }
+    detach() {}
+    compareBoundaryPoints(how, other) {
+      const [a, ao] = how === 0 || how === 3 ? [this._sc, this._so] : [this._ec, this._eo];
+      const [b, bo] = how === 0 || how === 1 ? [other._sc, other._so] : [other._ec, other._eo];
+      return compare(a, ao, b, bo);
+    }
+    comparePoint(node, offset) {
+      if (compare(node, offset, this._sc, this._so) < 0) return -1;
+      if (compare(node, offset, this._ec, this._eo) > 0) return 1;
+      return 0;
+    }
+    isPointInRange(node, offset) { try { return this.comparePoint(node, offset) === 0; } catch (e) { return false; } }
+    intersectsNode(node) {
+      const p = node.parentNode;
+      if (!p) return true;
+      const i = indexOf(node);
+      return compare(p, i, this._ec, this._eo) < 0 && compare(p, i + 1, this._sc, this._so) > 0;
+    }
+    // The first node at or after the start, and the first one after the end.
+    _first() { return isText(this._sc) || !this._sc.childNodes[this._so] ? this._sc : this._sc.childNodes[this._so]; }
+    _stop() {
+      const n = isText(this._ec) || this._ec.nodeType === 8 ? null : this._ec.childNodes[this._eo];
+      if (n) return n;
+      let e = this._ec; // past its end: the next node after it
+      while (e && !e.nextSibling) e = e.parentNode;
+      return e && e.nextSibling;
+    }
+    toString() {
+      if (this._sc === this._ec && isText(this._sc)) return this._sc.data.slice(this._so, this._eo);
+      let s = '';
+      for (const n of between(this._first(), this._stop())) {
+        if (!isText(n)) continue;
+        let t = n.data;
+        if (n === this._ec) t = t.slice(0, this._eo);
+        if (n === this._sc) t = t.slice(this._so);
+        s += t;
+      }
+      return s;
+    }
+    // The nodes wholly inside, outermost only, in order.
+    _contained() {
+      const out = [];
+      for (const n of between(this._first(), this._stop())) {
+        if (n === this._sc || n === this._ec || out.some(o => o.contains(n))) continue;
+        const p = n.parentNode;
+        if (!p) continue;
+        const i = indexOf(n);
+        if (compare(p, i, this._sc, this._so) >= 0 && compare(p, i + 1, this._ec, this._eo) <= 0) out.push(n);
+      }
+      return out;
+    }
+    _contents(mode) { // 'clone', 'extract' or 'delete'
+      const frag = document.createDocumentFragment();
+      if (this._sc === this._ec && (isText(this._sc) || this._sc.nodeType === 8)) {
+        const n = this._sc, t = n.data.slice(this._so, this._eo);
+        if (mode !== 'delete') frag.appendChild(document.createTextNode(t));
+        if (mode !== 'clone') n.data = n.data.slice(0, this._so) + n.data.slice(this._eo);
+        this.collapse(true);
+        return frag;
+      }
+      if (isText(this._sc)) {
+        const t = this._sc.data.slice(this._so);
+        if (mode !== 'delete') frag.appendChild(document.createTextNode(t));
+        if (mode !== 'clone') this._sc.data = this._sc.data.slice(0, this._so);
+      }
+      for (const n of this._contained()) {
+        if (mode === 'clone') frag.appendChild(n.cloneNode(true));
+        else if (mode === 'extract') frag.appendChild(n);
+        else n.remove();
+      }
+      if (isText(this._ec)) {
+        const t = this._ec.data.slice(0, this._eo);
+        if (mode !== 'delete') frag.appendChild(document.createTextNode(t));
+        if (mode !== 'clone') { this._ec.data = this._ec.data.slice(this._eo); this._eo = 0; }
+      }
+      if (mode !== 'clone') this.collapse(true);
+      return frag;
+    }
+    cloneContents() { return this._contents('clone'); }
+    extractContents() { return this._contents('extract'); }
+    deleteContents() { this._contents('delete'); }
+    insertNode(node) {
+      let parent, before;
+      if (isText(this._sc)) {
+        const n = this._sc;
+        parent = n.parentNode;
+        const rest = document.createTextNode(n.data.slice(this._so));
+        n.data = n.data.slice(0, this._so);
+        parent.insertBefore(rest, n.nextSibling);
+        before = rest;
+      } else {
+        parent = this._sc;
+        before = parent.childNodes[this._so] || null;
+      }
+      parent.insertBefore(node, before);
+      if (this.collapsed) this.setEndAfter(node);
+    }
+    surroundContents(newParent) {
+      const contents = this.extractContents();
+      newParent.replaceChildren();
+      this.insertNode(newParent);
+      newParent.appendChild(contents);
+      this.selectNode(newParent);
+    }
+    createContextualFragment(html) {
+      const t = document.createElement('template');
+      t.innerHTML = String(html);
+      return t.content;
+    }
+    _box() { const n = isText(this._sc) || this._sc.nodeType === 8 ? this._sc.parentNode : this._sc.childNodes[this._so] || this._sc; return n && n.nodeType === 1 ? n : null; }
+    getBoundingClientRect() { const el = this._box(); return el ? el.getBoundingClientRect() : new DOMRect(0, 0, 0, 0); }
+    getClientRects() { const el = this._box(); return el ? el.getClientRects() : []; }
+  }
+  Object.assign(Range, { START_TO_START: 0, START_TO_END: 1, END_TO_END: 2, END_TO_START: 3 });
+  Object.assign(Range.prototype, { START_TO_START: 0, START_TO_END: 1, END_TO_END: 2, END_TO_START: 3 });
+
+  class Selection {
+    constructor() { this._range = null; }
+    get rangeCount() { return this._range ? 1 : 0; }
+    get anchorNode() { return this._range ? this._range.startContainer : null; }
+    get anchorOffset() { return this._range ? this._range.startOffset : 0; }
+    get focusNode() { return this._range ? this._range.endContainer : null; }
+    get focusOffset() { return this._range ? this._range.endOffset : 0; }
+    get isCollapsed() { return !this._range || this._range.collapsed; }
+    get type() { return !this._range ? 'None' : this._range.collapsed ? 'Caret' : 'Range'; }
+    get direction() { return 'none'; }
+    getRangeAt(i) {
+      if (!this._range || i !== 0)
+        throw new DOMException("Failed to execute 'getRangeAt' on 'Selection': " + i + ' is not a valid index.', 'IndexSizeError');
+      return this._range;
+    }
+    addRange(r) { if (!this._range) this._range = r; }
+    removeRange(r) { if (r === this._range) this._range = null; }
+    removeAllRanges() { this._range = null; }
+    empty() { this._range = null; }
+    collapse(node, offset = 0) {
+      if (node === null) { this._range = null; return; }
+      const r = new Range(); r.setStart(node, offset); this._range = r;
+    }
+    setPosition(node, offset) { this.collapse(node, offset); }
+    collapseToStart() { if (this._range) this._range.collapse(true); }
+    collapseToEnd() { if (this._range) this._range.collapse(false); }
+    extend(node, offset = 0) { if (this._range) this._range.setEnd(node, offset); }
+    setBaseAndExtent(a, ao, f, fo) { const r = new Range(); r.setStart(a, ao); r.setEnd(f, fo); this._range = r; }
+    selectAllChildren(node) { const r = new Range(); r.selectNodeContents(node); this._range = r; }
+    deleteFromDocument() { if (this._range) this._range.deleteContents(); }
+    containsNode(node, partly) {
+      if (!this._range) return false;
+      return partly ? this._range.intersectsNode(node) : this._range._contained().some(n => n === node || n.contains(node));
+    }
+    modify() {}
+    toString() { return this._range ? this._range.toString() : ''; }
+  }
+  const selection = new Selection();
+  g.getSelection = function getSelection() { return selection; };
+  Object.defineProperty(document, 'getSelection', { configurable: true, writable: true, value: function getSelection() { return selection; } });
+  Object.defineProperty(document, 'createRange', { configurable: true, writable: true, value: function createRange() { return new Range(); } });
+  Object.assign(g, { AbstractRange, StaticRange, Range, Selection });
+})();
+
+// Page visibility and scheduling: the page is always visible (it's the
+// only one, in the one window), requestIdleCallback runs at the next
+// timer turn with up to 50 ms to spare, and scheduler.postTask/yield run
+// on timers too. Schedulers - YouTube's renders its feed through one -
+// hold their work while visibilityState isn't 'visible'.
+(() => {
+  const g = globalThis;
+  const getter = (name, get) => Object.defineProperty(document, name, { configurable: true, enumerable: true, get });
+  getter('visibilityState', () => 'visible');
+  getter('hidden', () => false);
+  getter('webkitVisibilityState', () => 'visible');
+  getter('webkitHidden', () => false);
+  getter('prerendering', () => false);
+
+  let nextIdle = 1;
+  const idle = new Map();
+  g.requestIdleCallback = function requestIdleCallback(cb, options) {
+    if (typeof cb !== 'function')
+      throw new TypeError("Failed to execute 'requestIdleCallback' on 'Window': The callback provided as parameter 1 is not a function.");
+    const id = nextIdle++;
+    const start = performance.now();
+    idle.set(id, setTimeout(() => {
+      idle.delete(id);
+      const deadline = { didTimeout: false, timeRemaining: () => Math.max(0, 50 - (performance.now() - start)) };
+      try { cb(deadline); } catch (e) { __wtReportError(e, 'idle callback'); }
+    }, 1));
+    return id;
+  };
+  g.cancelIdleCallback = function cancelIdleCallback(id) {
+    if (idle.has(id)) { clearTimeout(idle.get(id)); idle.delete(id); }
+  };
+
+  // scheduler.postTask(callback, { priority, delay, signal }) and yield().
+  class TaskSignal extends g.AbortSignal {
+    constructor(priority) { super(); Object.defineProperty(this, '_priority', { value: priority || 'user-visible', writable: true }); }
+    get priority() { return this._priority; }
+  }
+  class TaskController extends g.AbortController {
+    constructor(init) {
+      super();
+      Object.defineProperty(this, 'signal', { value: new TaskSignal(init && init.priority), enumerable: true });
+    }
+    setPriority(p) { this.signal._priority = String(p); this.signal.dispatchEvent(new Event('prioritychange')); }
+  }
+  const scheduler = {
+    postTask(callback, options = {}) {
+      return new Promise((resolve, reject) => {
+        const signal = options.signal;
+        if (signal && signal.aborted) { reject(signal.reason); return; }
+        const t = setTimeout(() => {
+          try { resolve(callback()); } catch (e) { reject(e); }
+        }, Math.max(0, Number(options.delay) || 0));
+        if (signal) signal.addEventListener('abort', () => { clearTimeout(t); reject(signal.reason); }, { once: true });
+      });
+    },
+    yield() { return new Promise(resolve => setTimeout(resolve, 0)); },
+  };
+  g.scheduler = scheduler;
+  Object.assign(g, { TaskController, TaskSignal });
+  if (g.navigator && !g.navigator.scheduling)
+    Object.defineProperty(g.navigator, 'scheduling', { configurable: true, value: { isInputPending: () => false } });
+})();
+
+// Last: the interfaces' prototype chain. Everything above lives on one
+// shared node prototype, which becomes Node.prototype; each interface gets
+// its own prototype inheriting from its parent's - HTMLDivElement.prototype
+// from HTMLElement.prototype from Element.prototype from Node.prototype -
+// and each node's wrapper gets its interface's (__wtSetPrototypes;
+// NodeWrappers::protos picks by tag). So a library that patches
+// Element.prototype changes elements only, Text.prototype text only, and a
+// class extending HTMLElement (a custom element) inherits what elements
+// have. The names an interface defines are copied onto its own prototype
+// too, where polyfills look them up (getOwnPropertyDescriptor(
+// Element.prototype, 'innerHTML')).
+(() => {
+  const g = globalThis;
+  const nodeProto = Object.getPrototypeOf(document);
+  const tagClasses = g.__wtTagClasses;
+  delete g.__wtTagClasses;
+
+  Object.defineProperty(nodeProto, 'constructor', { value: g.Node, writable: true, configurable: true });
+  const made = new Set([g.Node]);
+  const protoOf = C => {
+    if (made.has(C)) return C.prototype;
+    const parent = Object.getPrototypeOf(C);
+    const p = Object.create(parent && parent !== Function.prototype ? protoOf(parent) : nodeProto);
+    Object.defineProperty(p, 'constructor', { value: C, writable: true, configurable: true });
+    C.prototype = p;
+    made.add(C);
+    return p;
+  };
+  const names = ['CharacterData', 'Text', 'CDATASection', 'Comment', 'ProcessingInstruction', 'DocumentFragment',
+    'Document', 'HTMLDocument', 'DocumentType', 'Element', 'HTMLElement', 'SVGElement', 'SVGGraphicsElement',
+    'SVGSVGElement', 'HTMLAudioElement', 'HTMLVideoElement', ...Object.keys(tagClasses)];
+  for (const n of names) if (g[n]) protoOf(g[n]);
+  g.Audio.prototype = g.HTMLAudioElement.prototype;
+  g.Image.prototype = g.HTMLImageElement.prototype;
+
+  // Each interface's own members, copied from the shared prototype.
+  const copy = (C, list) => {
+    for (const name of list) {
+      const d = Object.getOwnPropertyDescriptor(nodeProto, name);
+      if (d) Object.defineProperty(C.prototype, name, d);
+    }
+  };
+  const parentNode = ['children', 'firstElementChild', 'lastElementChild', 'childElementCount', 'querySelector',
+    'querySelectorAll', 'append', 'prepend', 'replaceChildren', 'getElementsByTagName', 'getElementsByClassName'];
+  const childNode = ['before', 'after', 'replaceWith', 'remove', 'nextElementSibling', 'previousElementSibling'];
+  copy(g.Element, [...parentNode, ...childNode, 'innerHTML', 'outerHTML', 'id', 'className', 'classList', 'tagName',
+    'localName', 'namespaceURI', 'prefix', 'attributes', 'getAttribute', 'getAttributeNS', 'setAttribute',
+    'setAttributeNS', 'removeAttribute', 'removeAttributeNS', 'hasAttribute', 'hasAttributeNS', 'hasAttributes',
+    'toggleAttribute', 'getAttributeNames', 'getAttributeNode', 'getAttributeNodeNS', 'setAttributeNode',
+    'setAttributeNodeNS', 'removeAttributeNode', 'matches', 'closest', 'insertAdjacentElement', 'insertAdjacentHTML',
+    'insertAdjacentText', 'getBoundingClientRect', 'getClientRects', 'scroll', 'scrollTo', 'scrollBy',
+    'scrollIntoView', 'scrollTop', 'scrollLeft', 'scrollWidth', 'scrollHeight', 'clientTop', 'clientLeft',
+    'clientWidth', 'clientHeight', 'slot', 'requestFullscreen']);
+  copy(g.HTMLElement, ['style', 'dataset', 'hidden', 'title', 'lang', 'dir', 'tabIndex', 'accessKey', 'innerText',
+    'offsetParent', 'offsetTop', 'offsetLeft', 'offsetWidth', 'offsetHeight', 'click', 'focus', 'blur', 'inert',
+    'autofocus', 'inputMode', 'enterKeyHint', 'nonce']);
+  copy(g.CharacterData, [...childNode, 'data']);
+  copy(g.DocumentFragment, [...parentNode, 'getElementById']);
+  copy(g.Document, [...parentNode, 'getElementById', 'createElement', 'createTextNode', 'createComment',
+    'createDocumentFragment', 'readyState', 'cookie', 'body', 'head', 'documentElement', 'currentScript', 'title']);
+  // Document's alone: on an element they'd be getter-only properties no
+  // element has, which a framework assigning `this[name] = value` for an
+  // attribute of that name runs into.
+  for (const name of ['body', 'head', 'documentElement', 'currentScript']) delete nodeProto[name];
+
+  // The members recorded by __wtScope go to the interfaces they belong to
+  // (a tag stands for its interface, '*' for HTMLElement); the shared
+  // prototype gets back what it had before.
+  const classOfTag = {};
+  for (const [name, tags] of Object.entries(tagClasses)) for (const t of tags.split(' ')) classOfTag[t] = classOfTag[t] || name;
+  const ifaceOf = target => typeof g[target] === 'function' ? target : target === '*' ? 'HTMLElement' : classOfTag[target] || 'HTMLElement';
+  for (const [name, { targets, base }] of g.__wtScopedProps) {
+    const d = Object.getOwnPropertyDescriptor(nodeProto, name);
+    if (!d) continue;
+    for (const t of new Set(Array.from(targets, ifaceOf)))
+      if (g[t]) Object.defineProperty(g[t].prototype, name, d);
+    if (base) Object.defineProperty(nodeProto, name, base);
+    else delete nodeProto[name];
+  }
+  delete g.__wtScopedProps;
+  delete g.__wtScope;
+
+  // The native members only some nodes have, likewise.
+  const moveNative = (name, ifaces) => {
+    const d = Object.getOwnPropertyDescriptor(nodeProto, name);
+    if (!d) return;
+    for (const i of ifaces)
+      if (g[i] && !Object.getOwnPropertyDescriptor(g[i].prototype, name)) Object.defineProperty(g[i].prototype, name, d);
+    delete nodeProto[name];
+  };
+  moveNative('value', ['HTMLInputElement', 'HTMLButtonElement', 'HTMLSelectElement', 'HTMLTextAreaElement',
+    'HTMLOptionElement', 'HTMLOutputElement', 'HTMLDataElement', 'HTMLProgressElement', 'HTMLMeterElement',
+    'HTMLParamElement', 'HTMLLIElement']);
+  moveNative('checked', ['HTMLInputElement']);
+  moveNative('data', ['CharacterData']);
+  moveNative('readyState', ['Document', 'HTMLMediaElement']);
+  moveNative('cookie', ['Document']);
+
+  // An element createElementNS makes in SVG gets an SVG prototype (it's
+  // made detached, so its tag alone said HTML).
+  const SVG = 'http://www.w3.org/2000/svg';
+  const nativeCreateElementNS = document.createElementNS;
+  Object.defineProperty(document, 'createElementNS', {
+    configurable: true, writable: true,
+    value: function createElementNS(ns, name) {
+      const el = nativeCreateElementNS.call(this, ns, name);
+      if (ns === SVG) Object.setPrototypeOf(el, el.localName === 'svg' ? g.SVGSVGElement.prototype : g.SVGGraphicsElement.prototype);
+      return el;
+    },
+  });
+
+  // The document's own members - createEvent, importNode, createTreeWalker,
+  // activeElement, ... defined on `document` above - go to
+  // Document.prototype, where they live in browsers: polyfills wrap them
+  // there. YouTube's custom elements polyfill wraps importNode so the
+  // elements of a cloned template are upgraded at once, before Polymer
+  // sets their bound properties; an own importNode on `document` hid the
+  // wrapper, the upgrade came later, and the bound values were lost.
+  // (location stays: it's the document's own in browsers too.)
+  for (const name of Reflect.ownKeys(document)) {
+    if (name === 'location') continue;
+    const d = Object.getOwnPropertyDescriptor(document, name);
+    if (!d.configurable) continue;
+    Object.defineProperty(g.Document.prototype, name, d);
+    delete document[name];
+  }
+
+  // EventTarget.prototype above Node.prototype and Window.prototype, as in
+  // browsers - polyfills copy addEventListener from it and call the copy
+  // on nodes and window (ShadyDOM's __shady_native_addEventListener). On a
+  // node or window it's the native listener list's; on anything else
+  // (XMLHttpRequest, a MessagePort, a page's own subclass) the JS one's.
+  const ET = g.EventTarget.prototype;
+  for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) {
+    const own = ET[name], forNode = nodeProto[name], forWindow = g[name];
+    Object.defineProperty(ET, name, {
+      configurable: true, writable: true,
+      value: { [name](...args) {
+        if (this === g) return forWindow.apply(g, args);
+        if (__wtIsNode(this)) return forNode.apply(this, args);
+        return own.apply(this, args);
+      } }[name],
+    });
+  }
+  Object.setPrototypeOf(nodeProto, ET);
+  const windowProto = Object.create(ET);
+  Object.defineProperty(windowProto, 'constructor', { value: g.Window, writable: true, configurable: true });
+  g.Window.prototype = windowProto;
+  Object.setPrototypeOf(g, windowProto);
+
+  const protos = {
+    '#text': g.Text.prototype, '#comment': g.Comment.prototype, '#document-fragment': g.DocumentFragment.prototype,
+    '#document': g.HTMLDocument.prototype, '*': g.HTMLElement.prototype,
+    svg: g.SVGSVGElement.prototype, '*svg': g.SVGGraphicsElement.prototype,
+    audio: g.HTMLAudioElement.prototype, video: g.HTMLVideoElement.prototype,
+  };
+  for (const [name, tags] of Object.entries(tagClasses))
+    for (const t of tags.split(' ')) if (!protos[t]) protos[t] = g[name].prototype;
+  __wtSetPrototypes(protos);
+})();
 )JS";
 
 // ---------------------------------------------------------------------
@@ -5694,6 +7041,11 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("__wtComputedStyle", 1, js_native_computedStyle), // behind getComputedStyle
     JS_CFUNC_DEF("__wtScrollInfo", 0, js_native_scrollInfo),     // behind scrollX/scrollY, scrollHeight
     JS_CFUNC_DEF("__wtScrollTo", 2, js_native_scrollTo),         // behind scrollTo/scrollBy/scrollIntoView
+    JS_CFUNC_DEF("__wtElementFromPoint", 2, js_native_elementFromPoint), // behind document.elementFromPoint
+    JS_CFUNC_DEF("__wtActiveElement", 0, js_native_activeElement),       // behind document.activeElement
+    JS_CFUNC_DEF("__wtIsNode", 1, js_native_isNode),
+    JS_CFUNC_DEF("__wtMakeAllCollection", 0, js_native_makeAllCollection), // behind document.all
+    JS_CFUNC_DEF("__wtSetPrototypes", 1, js_native_setPrototypes),     // the DOM interfaces' prototype chain
     JS_CFUNC_DEF("__wtMedia", 3, js_native_media),               // behind HTMLMediaElement
     JS_CFUNC_DEF("__wtCanPlayType", 1, js_native_canPlayType),
     JS_CFUNC_DEF("__wtParserInserted", 1, js_native_parserInserted), // behind script.async

@@ -360,6 +360,17 @@ void Engine::beginScripts() {
         layoutForScript(); // so the page's full height is known
         scrollY = std::clamp(y, 0, maxScroll()); // no horizontal scrolling
     };
+    domState.geometry.elementFromPoint = [this](double x, double y) -> Element* {
+        if (x < 0 || y < 0 || x >= layoutRoot.viewportWidth || y >= viewHeight()) return nullptr;
+        layoutForScript();
+        int docX = (int)std::floor(x), docY = (int)std::floor(y) + scrollY;
+        for (auto it = layoutRoot.boxes.rbegin(); it != layoutRoot.boxes.rend(); ++it)
+            if (it->el && boxContains(*it, docX, docY)) return it->el;
+        return document ? document->body.get() : nullptr; // nothing painted there: the page itself
+    };
+    domState.geometry.activeElement = [this]() -> Element* {
+        return focusedEl && stillInPage(focusedEl) ? focusedEl : nullptr;
+    };
     consoleLog().clear(); // a new page starts with an empty console, as in browsers
     jsEngine.reset();
     jsEngine = std::make_unique<JSEngine>(); // fresh realm per page

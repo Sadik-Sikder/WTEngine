@@ -29,7 +29,8 @@ It's a learning project, not a replacement for Chrome. Many real sites load and 
 - quickjs-ng with a DOM API that frameworks like React and Vue run on:
   - elements, events, `classList`, `dataset`;
   - `innerHTML`, `querySelector`, `getBoundingClientRect` and `getComputedStyle`;
-  - `MutationObserver`, `IntersectionObserver` and `ResizeObserver`.
+  - `MutationObserver`, `IntersectionObserver` and `ResizeObserver`;
+  - the DOM interfaces as a real prototype chain, `TreeWalker`, `Range`/`Selection`, `AbortController`, and enough more that YouTube's web components polyfill runs.
 - `fetch`, `XMLHttpRequest`, timers, `requestAnimationFrame`, `postMessage`, `localStorage`/`sessionStorage`.
 - `URL`, `location`, `history`, `navigator` and `matchMedia`.
 - `Intl` (number, date, plural, list and relative-time formatting, collation, segmentation), built on the ICU library that ships with Windows. The output matches Chrome's.

@@ -620,8 +620,14 @@ net::awaitable<void> exchange(Stream& stream, http::request<http::string_body>& 
                               bool& keepAlive, std::chrono::seconds& keepAliveTimeout) {
     co_await http::async_write(stream, req, net::use_awaitable);
     beast::flat_buffer buffer;
-    http::response<http::string_body> res;
-    co_await http::async_read(stream, buffer, res, net::use_awaitable);
+    // Beast's defaults are 8 KB of headers and 8 MB of body. YouTube's
+    // headers alone (CSP, cookies) pass 8 KB, and a big site's script
+    // bundle can pass 8 MB, so: Chrome's 256 KB of headers, and no body cap.
+    http::response_parser<http::string_body> parser;
+    parser.header_limit(256 * 1024);
+    parser.body_limit(boost::none);
+    co_await http::async_read(stream, buffer, parser, net::use_awaitable);
+    http::response<http::string_body> res = parser.release();
     fillRawResponse(res, out);
     out.ok = true;
 

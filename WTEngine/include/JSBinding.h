@@ -51,6 +51,12 @@ struct PageGeometry {
     // The page's scroll position and full size, in CSS pixels.
     std::function<void(int& scrollX, int& scrollY, int& width, int& height)> scrollInfo;
     std::function<void(int x, int y)> scrollTo;
+    // document.elementFromPoint: the topmost element with a box at (x, y)
+    // in viewport coordinates, or nullptr outside the viewport.
+    std::function<Element*(double x, double y)> elementFromPoint;
+    // document.activeElement: the focused form field, or nullptr (scripts
+    // then see <body>).
+    std::function<Element*()> activeElement;
 };
 
 // What scripts can do with a <video>/<audio> (HTMLMediaElement). Engine
