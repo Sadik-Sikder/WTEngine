@@ -57,6 +57,10 @@ struct App {
     Engine* engine = nullptr;
     OpenGLRenderer* renderer = nullptr;
     AddressBar bar;
+    // A short message at the bottom of the window (Ctrl+S's "Saved ..."),
+    // shown until noticeUntil (glfwGetTime seconds).
+    std::wstring notice;
+    double noticeUntil = 0;
     std::wstring currentUrl;
     std::wstring pendingUrl; // set by input callbacks, handled in the main loop
     std::wstring pendingReferrer; // the page a link click in pendingUrl came from (empty for a typed URL)
@@ -333,6 +337,7 @@ static void onMouseButton(GLFWwindow* window, int button, int action, int) {
         case AddressBar::NavButton::Stop:    app->pendingStop = true; return;
         case AddressBar::NavButton::ConsoleBadge: app->console.show(); return;
         case AddressBar::NavButton::ZoomReset: app->engine->setZoom(1.0f); return;
+        case AddressBar::NavButton::SaveMedia: app->engine->saveMedia(); return;
         case AddressBar::NavButton::None:    break;
         }
         app->engine->blurInput();
@@ -586,6 +591,12 @@ static void onKey(GLFWwindow* window, int key, int scancode, int action, int mod
         return;
     }
 
+    // Ctrl+S: save the page's video/audio to Downloads (Engine::saveMedia).
+    if (ctrl && key == GLFW_KEY_S) {
+        engine.saveMedia();
+        return;
+    }
+
     // Ctrl+F: open (or return to) the find bar, its text selected so typing
     // replaces it; an existing query is searched again on this page.
     FindBar& find = app->find;
@@ -777,9 +788,25 @@ static void drawFrame(App& app) {
                               app.pageLoader.loading());
         app.bar.setErrorCount(consoleLog().errorCount());
         app.bar.setZoomPercent((int)std::lround(engine.zoom() * 100));
+        app.bar.setCanSave(engine.hasMediaToSave());
         app.bar.draw(renderer, width, glfwGetTime()); // after the page so it covers overscroll
         app.console.draw(renderer, width, height, glfwGetTime()); // likewise covers the page's bottom
         app.find.draw(renderer, width, engine.findCurrentIndex(), engine.findMatchCount(), glfwGetTime());
+    }
+
+    // The newest notice (Ctrl+S's progress) shows for a few seconds, in a
+    // dark pill at the bottom center - over the page, even in fullscreen.
+    for (auto& n : engine.takeNotices()) {
+        app.notice = std::move(n);
+        app.noticeUntil = glfwGetTime() + 4;
+    }
+    if (!app.notice.empty() && glfwGetTime() < app.noticeUntil) {
+        const float size = 14, padX = 16, h = 34;
+        float w = renderer.measureText(app.notice, size) + padX * 2;
+        float x = std::max(8.0f, (width - w) / 2), y = height - h - 24.0f;
+        const float radii[4] = { h / 2, h / 2, h / 2, h / 2 };
+        renderer.drawRoundedRect(x, y, w, h, radii, Color{ 0.12f, 0.12f, 0.14f, 0.92f });
+        renderer.drawText(x + padX, y + (h - size) / 2 - 2, app.notice, size, Color{ 1, 1, 1, 1 });
     }
 
     // I-beam over the address bar and text fields, hand over links and

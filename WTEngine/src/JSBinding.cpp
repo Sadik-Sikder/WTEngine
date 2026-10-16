@@ -1996,6 +1996,77 @@ static JSValue js_native_parserInserted(JSContext* ctx, JSValueConst, int argc, 
 }
 
 // __wtCanPlayType(type) -> "probably", "maybe" or "".
+static bool uint8Bytes(JSContext* ctx, JSValueConst v, std::string& out);
+
+// __wtMse(op, ...) - the native half of MediaSource/SourceBuffer
+// (kBootstrapJS), over Media.cpp's mse::. `op` names the operation; ids
+// are mse::create's, buffers a SourceBuffer's index in its MediaSource.
+static JSValue js_native_mse(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 1) return JS_UNDEFINED;
+    const std::string op = wideToUtf8(argStr(ctx, argc, argv, 0));
+    auto intArg = [&](int i) { int32_t v = 0; if (argc > i) JS_ToInt32(ctx, &v, argv[i]); return (int)v; };
+    auto numArg = [&](int i) { double v = 0; if (argc > i) JS_ToFloat64(ctx, &v, argv[i]); return v; };
+    const int id = intArg(1), buffer = intArg(2);
+    if (op == "available") return JS_NewBool(ctx, mse::isTypeSupported(L"video/mp4; codecs=\"avc1.42E01E\""));
+    if (op == "create") return JS_NewInt32(ctx, mse::create());
+    if (op == "isTypeSupported") return JS_NewBool(ctx, mse::isTypeSupported(argStr(ctx, argc, argv, 1)));
+    if (op == "readyState") return JS_NewInt32(ctx, mse::readyState(id));
+    if (op == "duration") return JS_NewFloat64(ctx, mse::duration(id));
+    if (op == "setDuration") return JS_NewBool(ctx, mse::setDuration(id, numArg(2)));
+    if (op == "addSourceBuffer") {
+        std::wstring error;
+        int index = mse::addSourceBuffer(id, argStr(ctx, argc, argv, 2), error);
+        return index >= 0 ? JS_NewInt32(ctx, index) : jsStr(ctx, error);
+    }
+    if (op == "removeSourceBuffer") return JS_NewBool(ctx, mse::removeSourceBuffer(id, buffer));
+    if (op == "endOfStream") return JS_NewBool(ctx, mse::endOfStream(id, intArg(2)));
+    if (op == "append") {
+        std::string bytes;
+        if (argc < 4 || !uint8Bytes(ctx, argv[3], bytes)) return JS_FALSE;
+        return JS_NewBool(ctx, mse::append(id, buffer, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()));
+    }
+    if (op == "abort") return JS_NewBool(ctx, mse::abort(id, buffer));
+    if (op == "remove") return JS_NewBool(ctx, mse::remove(id, buffer, numArg(3), numArg(4)));
+    if (op == "updating") return JS_NewBool(ctx, mse::updating(id, buffer));
+    if (op == "buffered") {
+        JSValue out = JS_NewArray(ctx);
+        uint32_t i = 0;
+        for (const auto& [start, end] : mse::buffered(id, buffer)) {
+            JSValue range = JS_NewArray(ctx);
+            JS_SetPropertyUint32(ctx, range, 0, JS_NewFloat64(ctx, start));
+            JS_SetPropertyUint32(ctx, range, 1, JS_NewFloat64(ctx, end));
+            JS_SetPropertyUint32(ctx, out, i++, range);
+        }
+        return out;
+    }
+    if (op == "get") {
+        double v = 0;
+        return mse::getNumber(id, buffer, wideToUtf8(argStr(ctx, argc, argv, 3)), v) ? JS_NewFloat64(ctx, v) : JS_UNDEFINED;
+    }
+    if (op == "set") return JS_NewBool(ctx, mse::setNumber(id, buffer, wideToUtf8(argStr(ctx, argc, argv, 3)), numArg(4)));
+    if (op == "registerUrl") { mse::registerUrl(argStr(ctx, argc, argv, 1), intArg(2)); return JS_UNDEFINED; }
+    if (op == "revokeUrl") { mse::revokeUrl(argStr(ctx, argc, argv, 1)); return JS_UNDEFINED; }
+    return JS_ThrowTypeError(ctx, "__wtMse: unknown operation");
+}
+
+void pollMediaSources(JSContext* ctx) {
+    std::vector<mse::Event> events = mse::takeEvents();
+    if (events.empty()) return;
+    JSValue list = JS_NewArray(ctx);
+    uint32_t i = 0;
+    for (const auto& e : events) {
+        JS_SetPropertyUint32(ctx, list, i++, JS_NewInt32(ctx, e.id));
+        JS_SetPropertyUint32(ctx, list, i++, JS_NewInt32(ctx, e.buffer));
+        JS_SetPropertyUint32(ctx, list, i++, jsStr(ctx, e.name));
+    }
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue deliver = JS_GetPropertyStr(ctx, global, "__wtMseEvents");
+    if (JS_IsFunction(ctx, deliver)) callCallback(ctx, deliver, 1, &list, L"MediaSource");
+    JS_FreeValue(ctx, deliver);
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, list);
+}
+
 static JSValue js_native_canPlayType(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     if (argc < 1) return JS_NewString(ctx, "");
     const char* s = JS_ToCString(ctx, argv[0]);
@@ -2424,6 +2495,47 @@ static std::wstring resolveFetchUrl(const std::wstring& pageUrl, const std::wstr
     return resolveUrl(pageUrl, href);
 }
 
+// The bytes of a Uint8Array - kBootstrapJS hands every binary value over
+// as one (an ArrayBuffer, any other view or a Blob becomes one first).
+// False for anything else.
+static bool uint8Bytes(JSContext* ctx, JSValueConst v, std::string& out) {
+    if (!JS_IsObject(v)) return false;
+    size_t size = 0;
+    uint8_t* p = JS_GetUint8Array(ctx, &size, v);
+    if (!p && JS_HasException(ctx)) { JS_FreeValue(ctx, JS_GetException(ctx)); return false; }
+    out.assign(reinterpret_cast<const char*>(p), p ? size : 0);
+    return true;
+}
+
+// __wtUtf8Decode(bytes, fatal) -> the string the UTF-8 bytes (a Uint8Array)
+// spell; an invalid sequence becomes U+FFFD, or throws when `fatal`.
+// TextDecoder's UTF-8 path.
+static JSValue js_native_utf8Decode(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    std::string bytes;
+    if (argc < 1 || !uint8Bytes(ctx, argv[0], bytes)) return JS_ThrowTypeError(ctx, "expected a Uint8Array");
+    if (bytes.empty()) return JS_NewString(ctx, "");
+    const bool fatal = argc > 1 && JS_ToBool(ctx, argv[1]) > 0;
+    const DWORD flags = fatal ? MB_ERR_INVALID_CHARS : 0;
+    int n = MultiByteToWideChar(CP_UTF8, flags, bytes.data(), (int)bytes.size(), nullptr, 0);
+    if (n == 0) {
+        if (fatal) return JS_ThrowTypeError(ctx, "Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid.");
+        return JS_NewString(ctx, "");
+    }
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, flags, bytes.data(), (int)bytes.size(), w.data(), n);
+    return jsStr(ctx, w);
+}
+
+// __wtUtf8Encode(string) -> a Uint8Array of its UTF-8 bytes (TextEncoder).
+static JSValue js_native_utf8Encode(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    size_t len = 0;
+    const char* s = JS_ToCStringLen(ctx, &len, argc > 0 ? argv[0] : JS_UNDEFINED);
+    if (!s) return JS_EXCEPTION;
+    JSValue out = JS_NewUint8ArrayCopy(ctx, reinterpret_cast<const uint8_t*>(s), len);
+    JS_FreeCString(ctx, s);
+    return out;
+}
+
 static JSValue js_native_fetch(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
     DOMBindingState* state = bindingState(ctx);
     if (!state) return JS_EXCEPTION;
@@ -2446,7 +2558,8 @@ static JSValue js_native_fetch(JSContext* ctx, JSValueConst /*this_val*/, int ar
             JS_FreeValue(ctx, value);
         }
     }
-    req.body = wideToUtf8(argStr(ctx, argc, argv, 3));
+    // The body: bytes as they are (a Uint8Array), or a string sent as UTF-8.
+    if (argc <= 3 || !uint8Bytes(ctx, argv[3], req.body)) req.body = wideToUtf8(argStr(ctx, argc, argv, 3));
     req.referrer = state->pageUrl;
 
     if (req.url.empty())
@@ -2499,7 +2612,9 @@ void pollFetches(JSContext* ctx) {
             JSValue args[6] = {
                 JS_NewInt32(ctx, res.status),
                 jsStr(ctx, res.finalUrl),
-                JS_NewStringLen(ctx, res.body.data(), res.body.size()),
+                // The bytes, untouched (text() decodes them): an image, a
+                // video segment or a zip must arrive as they were sent.
+                JS_NewArrayBufferCopy(ctx, reinterpret_cast<const uint8_t*>(res.body.data()), res.body.size()),
                 JS_NewStringLen(ctx, res.contentType.data(), res.contentType.size()),
                 headers,
                 JS_NewStringLen(ctx, res.statusText.data(), res.statusText.size()),
@@ -3274,47 +3389,454 @@ Object.defineProperty(globalThis, '__wtScope', {
   Object.defineProperty(g, 'localStorage', { value: makeStorage(0), enumerable: true, configurable: true });
   Object.defineProperty(g, 'sessionStorage', { value: makeStorage(1), enumerable: true, configurable: true });
 
-  // `rawHeaders`: the response's headers as [name, value, ...] (names
-  // lowercased, no Set-Cookie) - empty for a local file.
-  g.__wtResponse = function (status, url, body, contentType, rawHeaders, statusText) {
-    rawHeaders = rawHeaders || [];
-    let used = false;
-    const take = () => {
-      if (used) return Promise.reject(new TypeError('Body has already been consumed'));
-      used = true;
-      return Promise.resolve(body);
-    };
-    const headers = new Headers();
-    for (let i = 0; i + 1 < rawHeaders.length; i += 2) headers.append(rawHeaders[i], rawHeaders[i + 1]);
-    if (contentType && !headers.has('content-type')) headers.set('content-type', contentType);
-    return {
-      ok: status >= 200 && status < 300, status, statusText: statusText || '', url,
-      redirected: false, type: 'basic', headers,
-      get bodyUsed() { return used; },
-      text: () => take(),
-      json: () => take().then(JSON.parse),
-      clone: () => g.__wtResponse(status, url, body, contentType, rawHeaders, statusText),
-    };
+  // --- Bytes and bodies: TextEncoder/TextDecoder, Blob/File, FormData, a
+  // basic ReadableStream, Response/Request, and fetch() itself. Bodies are
+  // bytes throughout (a Uint8Array), crossing to the native side as one -
+  // a video segment, an image or a gzip must arrive exactly as sent.
+  const toU8 = v => v instanceof ArrayBuffer ? new Uint8Array(v)
+    : ArrayBuffer.isView(v) ? new Uint8Array(v.buffer, v.byteOffset, v.byteLength) : null;
+  const concatBytes = parts => {
+    let size = 0;
+    for (const p of parts) size += p.byteLength;
+    const out = new Uint8Array(size);
+    let at = 0;
+    for (const p of parts) { out.set(p, at); at += p.byteLength; }
+    return out;
+  };
+
+  // One code point as UTF-8.
+  const utf8Of = cp => cp < 0x80 ? [cp]
+    : cp < 0x800 ? [0xC0 | cp >> 6, 0x80 | cp & 63]
+    : cp < 0x10000 ? [0xE0 | cp >> 12, 0x80 | cp >> 6 & 63, 0x80 | cp & 63]
+    : [0xF0 | cp >> 18, 0x80 | cp >> 12 & 63, 0x80 | cp >> 6 & 63, 0x80 | cp & 63];
+  class TextEncoder {
+    get encoding() { return 'utf-8'; }
+    encode(s = '') { return __wtUtf8Encode(String(s)); }
+    encodeInto(s, dest) {
+      let read = 0, written = 0;
+      for (const ch of String(s)) {
+        const cp = ch.codePointAt(0);
+        const bytes = utf8Of(cp >= 0xD800 && cp <= 0xDFFF ? 0xFFFD : cp);
+        if (written + bytes.length > dest.length) break;
+        dest.set(bytes, written);
+        written += bytes.length;
+        read += ch.length;
+      }
+      return { read, written };
+    }
+  }
+
+  const encodings = {
+    'utf-8': 'utf-8', 'utf8': 'utf-8', 'unicode-1-1-utf-8': 'utf-8', 'unicode11utf8': 'utf-8', 'unicode20utf8': 'utf-8',
+    'x-unicode20utf8': 'utf-8', 'utf-16le': 'utf-16le', 'utf-16': 'utf-16le', 'ucs-2': 'utf-16le', 'unicode': 'utf-16le',
+    'csunicode': 'utf-16le', 'iso-10646-ucs-2': 'utf-16le', 'unicodefeff': 'utf-16le', 'utf-16be': 'utf-16be',
+    'unicodefffe': 'utf-16be', 'windows-1252': 'windows-1252', 'latin1': 'windows-1252', 'iso-8859-1': 'windows-1252',
+    'ascii': 'windows-1252', 'us-ascii': 'windows-1252', 'cp1252': 'windows-1252', 'l1': 'windows-1252',
+    'iso8859-1': 'windows-1252', 'x-cp1252': 'windows-1252',
+  };
+  // windows-1252's 0x80-0x9F, which latin1 labels mean too.
+  const cp1252 = [0x20AC, 0x81, 0x201A, 0x192, 0x201E, 0x2026, 0x2020, 0x2021, 0x2C6, 0x2030, 0x160, 0x2039, 0x152, 0x8D,
+    0x17D, 0x8F, 0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x2DC, 0x2122, 0x161, 0x203A, 0x153, 0x9D,
+    0x17E, 0x178];
+  const fromCodes = codes => {
+    let s = '';
+    for (let i = 0; i < codes.length; i += 8192) s += String.fromCharCode.apply(null, codes.slice(i, i + 8192));
+    return s;
+  };
+  // How many bytes at the end of `b` start a character that isn't complete
+  // yet (a streaming decode keeps them for the next call).
+  const incompleteTail = (b, enc) => {
+    if (enc === 'utf-16le' || enc === 'utf-16be') return b.length % 2;
+    if (enc !== 'utf-8') return 0;
+    for (let back = 1; back <= Math.min(3, b.length); back++) {
+      const c = b[b.length - back];
+      if ((c & 0xC0) === 0x80) continue;
+      const need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+      return need > back ? back : 0;
+    }
+    return 0;
+  };
+  class TextDecoder {
+    constructor(label = 'utf-8', options = {}) {
+      const enc = encodings[String(label).trim().toLowerCase()];
+      if (!enc) throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
+      hidden(this, '_enc', enc);
+      hidden(this, '_fatal', !!(options && options.fatal));
+      hidden(this, '_ignoreBOM', !!(options && options.ignoreBOM));
+      hidden(this, '_pending', null);
+      hidden(this, '_started', false);
+    }
+    get encoding() { return this._enc; }
+    get fatal() { return this._fatal; }
+    get ignoreBOM() { return this._ignoreBOM; }
+    decode(input, options) {
+      let b = input === undefined ? new Uint8Array(0) : toU8(input);
+      if (!b) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The provided value is not of type '(ArrayBuffer or ArrayBufferView)'.");
+      if (this._pending) { b = concatBytes([this._pending, b]); this._pending = null; }
+      const stream = !!(options && options.stream);
+      if (stream) {
+        const keep = incompleteTail(b, this._enc);
+        if (keep) { this._pending = b.slice(b.length - keep); b = b.subarray(0, b.length - keep); }
+      } else if (b.length % 2 && this._enc !== 'utf-8' && this._enc !== 'windows-1252') {
+        if (this._fatal) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid.");
+      }
+      let s;
+      if (this._enc === 'utf-8') {
+        s = __wtUtf8Decode(b, this._fatal);
+      } else if (this._enc === 'windows-1252') {
+        const codes = new Array(b.length);
+        for (let i = 0; i < b.length; i++) codes[i] = b[i] >= 0x80 && b[i] <= 0x9F ? cp1252[b[i] - 0x80] : b[i];
+        s = fromCodes(codes);
+      } else {
+        const le = this._enc === 'utf-16le', codes = new Array(b.length >> 1);
+        for (let i = 0; i + 1 < b.length; i += 2) codes[i >> 1] = le ? b[i] | b[i + 1] << 8 : b[i] << 8 | b[i + 1];
+        s = fromCodes(codes);
+        if (b.length % 2) s += '�';
+      }
+      if (!this._started && !this._ignoreBOM && s.charCodeAt(0) === 0xFEFF) s = s.slice(1);
+      this._started = stream && (this._started || s.length > 0);
+      if (!stream) this._started = false;
+      return s;
+    }
+  }
+  const decodeText = bytes => {
+    const s = __wtUtf8Decode(bytes, false);
+    return s.charCodeAt(0) === 0xFEFF ? s.slice(1) : s;
+  };
+
+  // A stream of chunks from an underlying source ({ start, pull, cancel },
+  // each given a controller with enqueue/close/error). Enough for reading
+  // a body chunk by chunk; no byte streams, piping or tee.
+  class ReadableStream {
+    constructor(source = {}) {
+      hidden(this, '_source', source || {});
+      hidden(this, '_queue', []);
+      hidden(this, '_closed', false);
+      hidden(this, '_error', null);
+      hidden(this, '_waiters', []);
+      hidden(this, '_reader', null);
+      hidden(this, '_pulling', false);
+      const stream = this;
+      hidden(this, '_controller', {
+        enqueue(chunk) {
+          if (stream._closed) throw new TypeError("Failed to execute 'enqueue' on 'ReadableStreamDefaultController': Cannot enqueue a chunk into a closed readable stream.");
+          stream._queue.push(chunk);
+          stream._flush();
+        },
+        close() { stream._closed = true; stream._flush(); },
+        error(e) { stream._error = e === undefined ? new TypeError('The stream errored') : e; stream._flush(); },
+        get desiredSize() { return 1 - stream._queue.length; },
+      });
+      try {
+        const r = this._source.start && this._source.start(this._controller);
+        Promise.resolve(r).then(() => this._pull(), e => this._controller.error(e));
+      } catch (e) { this._controller.error(e); }
+    }
+    get locked() { return !!this._reader; }
+    _pull() {
+      if (this._pulling || this._closed || this._error || !this._source.pull || !this._waiters.length) return;
+      this._pulling = true;
+      Promise.resolve().then(() => this._source.pull(this._controller)).then(() => {
+        this._pulling = false;
+        this._pull();
+      }, e => this._controller.error(e));
+    }
+    _flush() {
+      while (this._waiters.length) {
+        const w = this._waiters[0];
+        if (this._queue.length) { this._waiters.shift(); w.resolve({ value: this._queue.shift(), done: false }); }
+        else if (this._error) { this._waiters.shift(); w.reject(this._error); }
+        else if (this._closed) { this._waiters.shift(); w.resolve({ value: undefined, done: true }); }
+        else break;
+      }
+    }
+    _read() {
+      return new Promise((resolve, reject) => {
+        this._waiters.push({ resolve, reject });
+        this._flush();
+        this._pull();
+      });
+    }
+    getReader() {
+      if (this._reader)
+        throw new TypeError("Failed to execute 'getReader' on 'ReadableStream': ReadableStreamDefaultReader constructor can only accept readable streams that are not yet locked to a reader");
+      const stream = this;
+      const reader = {
+        read: () => stream._read(),
+        releaseLock: () => { if (stream._reader === reader) stream._reader = null; },
+        cancel: reason => stream.cancel(reason),
+        get closed() { return new Promise((res, rej) => { const check = () => stream._error ? rej(stream._error) : stream._closed && !stream._queue.length ? res() : setTimeout(check, 50); check(); }); },
+      };
+      this._reader = reader;
+      return reader;
+    }
+    cancel(reason) {
+      this._queue.length = 0;
+      this._closed = true;
+      try { if (this._source.cancel) this._source.cancel(reason); } catch (e) {}
+      this._flush();
+      return Promise.resolve();
+    }
+    async *[Symbol.asyncIterator]() {
+      const reader = this.getReader();
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) return;
+          yield value;
+        }
+      } finally { reader.releaseLock(); }
+    }
+  }
+  const byteStream = bytes => new ReadableStream({ start(c) { if (bytes.byteLength) c.enqueue(bytes); c.close(); } });
+
+  class Blob {
+    constructor(parts = [], options = {}) {
+      const chunks = [];
+      for (const p of parts) chunks.push(p instanceof Blob ? p._bytes : toU8(p) || __wtUtf8Encode(String(p)));
+      hidden(this, '_bytes', concatBytes(chunks));
+      const type = options && options.type !== undefined ? String(options.type) : '';
+      hidden(this, '_type', /^[\x20-\x7E]*$/.test(type) ? type.toLowerCase() : '');
+    }
+    get size() { return this._bytes.byteLength; }
+    get type() { return this._type; }
+    slice(start = 0, end = this.size, type = '') {
+      const n = this.size;
+      const clamp = v => v < 0 ? Math.max(n + v, 0) : Math.min(v, n);
+      const s = clamp(Math.trunc(Number(start) || 0)), e = clamp(Math.trunc(end === undefined ? n : Number(end) || 0));
+      const b = new Blob([], { type });
+      b._bytes = this._bytes.slice(s, Math.max(s, e));
+      return b;
+    }
+    arrayBuffer() { return Promise.resolve(this._bytes.slice().buffer); }
+    bytes() { return Promise.resolve(this._bytes.slice()); }
+    text() { return Promise.resolve(decodeText(this._bytes)); }
+    stream() { return byteStream(this._bytes.slice()); }
+    get [Symbol.toStringTag]() { return 'Blob'; }
+  }
+  class File extends Blob {
+    constructor(parts, name, options = {}) {
+      if (arguments.length < 2) throw new TypeError("Failed to construct 'File': 2 arguments required, but only " + arguments.length + ' present.');
+      super(parts, options);
+      hidden(this, '_name', String(name));
+      hidden(this, '_lastModified', options && options.lastModified !== undefined ? Number(options.lastModified) : Date.now());
+    }
+    get name() { return this._name; }
+    get lastModified() { return this._lastModified; }
+    get webkitRelativePath() { return ''; }
+    get [Symbol.toStringTag]() { return 'File'; }
+  }
+
+  // FormData: name/value entries, a value a string or a File. As a fetch
+  // or XHR body it's sent multipart/form-data.
+  class FormData {
+    constructor(form) {
+      hidden(this, '_entries', []);
+      if (form && form.nodeType === 1) {
+        for (const el of form.querySelectorAll('input, select, textarea')) {
+          const name = el.getAttribute('name');
+          if (!name || el.hasAttribute('disabled')) continue;
+          const type = (el.getAttribute('type') || '').toLowerCase();
+          if ((type === 'checkbox' || type === 'radio') && !el.hasAttribute('checked')) continue;
+          if (type === 'submit' || type === 'button' || type === 'reset' || type === 'image' || type === 'file') continue;
+          this.append(name, el.value === undefined ? (el.getAttribute('value') || '') : el.value);
+        }
+      }
+    }
+    _value(value, filename) {
+      if (!(value instanceof Blob)) return String(value);
+      if (value instanceof File && filename === undefined) return value;
+      return new File([value], filename !== undefined ? String(filename) : value instanceof File ? value.name : 'blob', { type: value.type });
+    }
+    append(name, value, filename) { this._entries.push([String(name), this._value(value, filename)]); }
+    set(name, value, filename) {
+      name = String(name);
+      const i = this._entries.findIndex(e => e[0] === name);
+      const entry = [name, this._value(value, filename)];
+      this._entries = this._entries.filter(e => e[0] !== name);
+      this._entries.splice(i < 0 ? this._entries.length : i, 0, entry);
+    }
+    get(name) { const e = this._entries.find(e => e[0] === String(name)); return e ? e[1] : null; }
+    getAll(name) { return this._entries.filter(e => e[0] === String(name)).map(e => e[1]); }
+    has(name) { return this._entries.some(e => e[0] === String(name)); }
+    delete(name) { this._entries = this._entries.filter(e => e[0] !== String(name)); }
+    entries() { return this._entries.map(e => [e[0], e[1]])[Symbol.iterator](); }
+    keys() { return this._entries.map(e => e[0])[Symbol.iterator](); }
+    values() { return this._entries.map(e => e[1])[Symbol.iterator](); }
+    forEach(cb, self) { for (const [k, v] of this._entries) cb.call(self, v, k, this); }
+    [Symbol.iterator]() { return this.entries(); }
+  }
+  const multipart = form => {
+    const boundary = '----WTEngineFormBoundary' + Math.random().toString(36).slice(2, 18);
+    const enc = s => __wtUtf8Encode(s);
+    const quote = s => s.replace(/"/g, '%22').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+    const parts = [];
+    for (const [name, value] of form._entries) {
+      if (value instanceof File) {
+        parts.push(enc('--' + boundary + '\r\nContent-Disposition: form-data; name="' + quote(name) + '"; filename="' + quote(value.name) +
+                       '"\r\nContent-Type: ' + (value.type || 'application/octet-stream') + '\r\n\r\n'), value._bytes, enc('\r\n'));
+      } else {
+        parts.push(enc('--' + boundary + '\r\nContent-Disposition: form-data; name="' + quote(name) + '"\r\n\r\n' + value + '\r\n'));
+      }
+    }
+    parts.push(enc('--' + boundary + '--\r\n'));
+    return { data: concatBytes(parts), type: 'multipart/form-data; boundary=' + boundary };
   };
 
   // The content type a URLSearchParams body is sent with, as in browsers.
   const formType = 'application/x-www-form-urlencoded;charset=UTF-8';
+  // A body as it goes on the wire - a string, or bytes - and the content
+  // type it implies when no header names one.
+  const extractBody = body => {
+    if (body == null) return { data: '', type: null };
+    if (typeof body === 'string') return { data: body, type: 'text/plain;charset=UTF-8' };
+    if (g.URLSearchParams && body instanceof g.URLSearchParams) return { data: body.toString(), type: formType };
+    if (body instanceof Blob) return { data: body._bytes, type: body.type || null };
+    if (body instanceof FormData) return multipart(body);
+    const u8 = toU8(body);
+    if (u8) return { data: u8, type: null };
+    return { data: String(body), type: 'text/plain;charset=UTF-8' };
+  };
+  const bodyBytes = data => typeof data === 'string' ? __wtUtf8Encode(data) : data.slice();
+
+  class Response {
+    constructor(body = null, init = {}) {
+      const { data, type } = extractBody(body);
+      hidden(this, '_bytes', bodyBytes(data));
+      hidden(this, '_used', false);
+      hidden(this, '_stream', null);
+      init = init || {};
+      const status = init.status === undefined ? 200 : Number(init.status);
+      if (!(status >= 200 && status <= 599) && status !== 0)
+        throw new RangeError("Failed to construct 'Response': The status provided (" + status + ') is outside the range [200, 599].');
+      this.status = status;
+      this.statusText = init.statusText === undefined ? '' : String(init.statusText);
+      this.headers = new Headers(init.headers);
+      if (type && body != null && !this.headers.has('content-type')) this.headers.set('content-type', type);
+      this.url = '';
+      this.redirected = false;
+      this.type = 'default';
+    }
+    get ok() { return this.status >= 200 && this.status < 300; }
+    get bodyUsed() { return this._used; }
+    // The body as a stream, read in one chunk (it's all here already).
+    get body() {
+      if (!this._stream) {
+        const bytes = this._bytes, self = this;
+        this._stream = new ReadableStream({ start(c) { self._used = true; if (bytes.byteLength) c.enqueue(bytes.slice()); c.close(); } });
+      }
+      return this._stream;
+    }
+    _take(what) {
+      if (this._used) return Promise.reject(new TypeError("Failed to execute '" + what + "' on 'Response': body stream already read"));
+      this._used = true;
+      return Promise.resolve(this._bytes);
+    }
+    arrayBuffer() { return this._take('arrayBuffer').then(b => b.slice().buffer); }
+    bytes() { return this._take('bytes').then(b => b.slice()); }
+    blob() { return this._take('blob').then(b => new Blob([b], { type: this.headers.get('content-type') || '' })); }
+    text() { return this._take('text').then(decodeText); }
+    json() { return this._take('json').then(b => JSON.parse(decodeText(b))); }
+    formData() { return Promise.reject(new TypeError("Failed to execute 'formData' on 'Response': not supported")); }
+    clone() {
+      if (this._used) throw new TypeError("Failed to execute 'clone' on 'Response': Response body is already used");
+      const r = new Response(this._bytes, { status: this.status, statusText: this.statusText, headers: this.headers });
+      Object.assign(r, { url: this.url, redirected: this.redirected, type: this.type });
+      return r;
+    }
+    static json(data, init = {}) {
+      const r = new Response(JSON.stringify(data), init);
+      r.headers.set('content-type', 'application/json');
+      return r;
+    }
+    static error() { const r = new Response(null, { status: 0 }); r.type = 'error'; return r; }
+    static redirect(url, status = 302) {
+      const r = new Response(null, { status, headers: { location: new URL(String(url), location.href).href } });
+      return r;
+    }
+  }
+
+  class Request {
+    constructor(input, init = {}) {
+      init = init || {};
+      const base = input instanceof Request ? input : null;
+      let url = base ? base.url : String(input);
+      try { url = new URL(url, location.href).href; } catch (e) {}
+      this.url = url;
+      this.method = String(init.method || (base ? base.method : 'GET')).toUpperCase();
+      this.headers = new Headers(init.headers || (base ? base.headers : undefined));
+      hidden(this, '_body', init.body !== undefined ? init.body : base ? base._body : null);
+      this.signal = init.signal || (base ? base.signal : null);
+      this.credentials = init.credentials || (base ? base.credentials : 'same-origin');
+      this.mode = init.mode || (base ? base.mode : 'cors');
+      this.cache = init.cache || 'default';
+      this.redirect = init.redirect || 'follow';
+      this.referrer = 'about:client';
+      this.referrerPolicy = init.referrerPolicy || '';
+      this.integrity = init.integrity || '';
+      this.keepalive = !!init.keepalive;
+    }
+    clone() { return new Request(this); }
+    arrayBuffer() { return new Response(this._body).arrayBuffer(); }
+    text() { return new Response(this._body).text(); }
+    json() { return new Response(this._body).json(); }
+    blob() { return new Response(this._body).blob(); }
+  }
+
+  // blob: URLs - URL.createObjectURL's - and what each names (a Blob, or a
+  // MediaSource for a <video>).
+  const objectURLs = new Map();
+  Object.defineProperty(g, '__wtObjectURLs', { value: objectURLs, configurable: true });
+  const uuid = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 3) | 8).toString(16);
+  });
+  Object.defineProperty(g, '__wtCreateObjectURL', { configurable: true, value: obj => {
+    const url = 'blob:' + (location.origin && location.origin !== 'null' ? location.origin : 'null') + '/' + uuid();
+    objectURLs.set(url, obj);
+    return url;
+  } });
+
+  // `rawHeaders`: the response's headers as [name, value, ...] (names
+  // lowercased, no Set-Cookie) - empty for a local file. `body`: the bytes,
+  // as an ArrayBuffer.
+  g.__wtResponse = function (status, url, body, contentType, rawHeaders, statusText) {
+    const r = new Response(null, { status: status >= 200 && status <= 599 ? status : 200, statusText });
+    r.status = status;
+    r._bytes = new Uint8Array(body);
+    rawHeaders = rawHeaders || [];
+    for (let i = 0; i + 1 < rawHeaders.length; i += 2) r.headers.append(rawHeaders[i], rawHeaders[i + 1]);
+    if (contentType && !r.headers.has('content-type')) r.headers.set('content-type', contentType);
+    r.url = url;
+    r.type = 'basic';
+    return r;
+  };
+
   g.fetch = function (input, init) {
     try {
       init = init || {};
-      const url = String(input && typeof input === 'object' && 'url' in input ? input.url : input);
-      const method = String(init.method || 'GET').toUpperCase();
+      const req = input instanceof Request ? input : null;
+      const url = req ? req.url : String(input && typeof input === 'object' && 'url' in input ? input.url : input);
+      const method = String(init.method || (req ? req.method : 'GET')).toUpperCase();
+      // A blob: URL is the Blob it names, here and now.
+      if (url.startsWith('blob:')) {
+        const blob = objectURLs.get(url.split('#')[0]);
+        if (!(blob instanceof Blob)) return Promise.reject(new TypeError('Failed to fetch'));
+        const r = new Response(blob, { headers: { 'content-type': blob.type } });
+        r.url = url;
+        return Promise.resolve(r);
+      }
+      const headers = new Headers(init.headers || (req ? req.headers : undefined));
+      const { data, type } = extractBody(init.body !== undefined ? init.body : req ? req._body : null);
+      if (type && method !== 'GET' && method !== 'HEAD' && !headers.has('content-type')) headers.set('content-type', type);
       const flat = [];
-      const headers = new Headers(init.headers);
-      if (init.body instanceof g.URLSearchParams && !headers.has('content-type')) headers.set('content-type', formType);
       headers.forEach((v, k) => flat.push(k, v));
-      let body = init.body == null ? '' : init.body;
-      if (typeof body !== 'string') body = String(body);
-      return __wtFetch(url, method, flat, body);
+      return __wtFetch(url, method, flat, method === 'GET' || method === 'HEAD' ? '' : data);
     } catch (e) {
       return Promise.reject(e);
     }
   };
+  Object.assign(g, { TextEncoder, TextDecoder, ReadableStream, Blob, File, FormData, Response, Request });
 
   class ProgressEvent extends Event {
     constructor(type, init) {
@@ -3347,7 +3869,7 @@ Object.defineProperty(globalThis, '__wtScope', {
       // gen: bumped by open/abort/timeout, so a response for an earlier
       // request is ignored when it arrives.
       hidden(this, '_x', { method: 'GET', url: '', headers: new Headers(), sent: false, gen: 0,
-                           response: null, text: '', timer: null });
+                           response: null, text: '', bytes: null, value: undefined, timer: null });
       this.readyState = 0;
       this.status = 0;
       this.statusText = '';
@@ -3372,6 +3894,8 @@ Object.defineProperty(globalThis, '__wtScope', {
       x.sent = false;
       x.response = null;
       x.text = '';
+      x.bytes = null;
+      x.value = undefined;
       this.status = 0;
       this.statusText = '';
       this.responseURL = '';
@@ -3391,9 +3915,9 @@ Object.defineProperty(globalThis, '__wtScope', {
       x.sent = true;
       let data = '';
       if (x.method !== 'GET' && x.method !== 'HEAD' && body != null) {
-        data = typeof body === 'string' ? body : String(body);
-        if (!x.headers.has('content-type'))
-          x.headers.set('content-type', body instanceof g.URLSearchParams ? formType : 'text/plain;charset=UTF-8');
+        const extracted = extractBody(body); // bytes stay bytes: a Uint8Array goes as it is
+        data = extracted.data;
+        if (extracted.type && !x.headers.has('content-type')) x.headers.set('content-type', extracted.type);
       }
       const gen = x.gen;
       this._progress('loadstart', 0, 0);
@@ -3408,20 +3932,23 @@ Object.defineProperty(globalThis, '__wtScope', {
           this._fail('timeout');
         }, this.timeout);
       }
-      request.then(res => res.text().then(text => {
+      request.then(res => res.bytes().then(bytes => {
         if (gen !== x.gen) return; // aborted, timed out or reopened meanwhile
         clearTimeout(x.timer);
         x.response = res;
-        x.text = text;
+        x.bytes = bytes;
+        x.text = null; // decoded when asked for: a binary response may never be
+        x.value = undefined;
         this.status = res.status;
         this.statusText = res.statusText;
         this.responseURL = res.url;
+        const n = bytes.byteLength;
         this._setState(2);
         this._setState(3);
-        this._progress('progress', text.length, text.length);
+        this._progress('progress', n, n);
         this._setState(4);
-        this._progress('load', text.length, text.length);
-        this._progress('loadend', text.length, text.length);
+        this._progress('load', n, n);
+        this._progress('loadend', n, n);
       }), () => {
         if (gen !== x.gen) return;
         clearTimeout(x.timer);
@@ -3452,14 +3979,27 @@ Object.defineProperty(globalThis, '__wtScope', {
     get responseText() {
       if (this.responseType !== '' && this.responseType !== 'text')
         throw new DOMException("Failed to read the 'responseText' property from 'XMLHttpRequest': The value is only accessible if the object's 'responseType' is '' or 'text'.", 'InvalidStateError');
-      return this.readyState >= 3 ? this._x.text : '';
+      return this.readyState >= 3 ? this._text() : '';
     }
+    _text() {
+      const x = this._x;
+      if (x.text === null) x.text = x.bytes ? decodeText(x.bytes) : '';
+      return x.text;
+    }
+    // responseType: '' / 'text' (a string), 'json', 'arraybuffer', 'blob';
+    // 'document' gives null (no XML/HTML documents here). The same object
+    // each time it's read, as in browsers.
     get response() {
-      const t = this.responseType;
-      if (t === '' || t === 'text') return this.readyState >= 3 ? this._x.text : '';
-      if (this.readyState !== 4 || !this._x.response) return null;
-      if (t === 'json') { try { return JSON.parse(this._x.text); } catch (e) { return null; } }
-      return null;
+      const t = this.responseType, x = this._x;
+      if (t === '' || t === 'text') return this.readyState >= 3 ? this._text() : '';
+      if (this.readyState !== 4 || !x.response) return null;
+      if (x.value === undefined) {
+        if (t === 'json') { try { x.value = JSON.parse(this._text()); } catch (e) { x.value = null; } }
+        else if (t === 'arraybuffer') x.value = x.bytes.slice().buffer;
+        else if (t === 'blob') x.value = new Blob([x.bytes], { type: x.response.headers.get('content-type') || '' });
+        else x.value = null;
+      }
+      return x.value;
     }
     get responseXML() { return null; }
     _setState(s) {
@@ -3474,6 +4014,8 @@ Object.defineProperty(globalThis, '__wtScope', {
       const x = this._x;
       x.response = null;
       x.text = '';
+      x.bytes = null;
+      x.value = undefined;
       this.status = 0;
       this.statusText = '';
       this._setState(4);
@@ -4053,8 +4595,19 @@ Object.defineProperty(globalThis, '__wtScope', {
     }
     static canParse(url, base) { try { new URL(url, base); return true; } catch { return false; } }
     static parse(url, base) { try { return new URL(url, base); } catch { return null; } }
-    static createObjectURL() { throw new DOMException('URL.createObjectURL is not supported', 'NotSupportedError'); }
-    static revokeObjectURL() {}
+    // A blob: URL naming a Blob (fetch() reads it) or a MediaSource (a
+    // <video> plays it).
+    static createObjectURL(obj) {
+      if (!(obj instanceof g.Blob) && !(g.MediaSource && obj instanceof g.MediaSource))
+        throw new TypeError("Failed to execute 'createObjectURL' on 'URL': Overload resolution failed.");
+      const url = g.__wtCreateObjectURL(obj);
+      if (g.MediaSource && obj instanceof g.MediaSource) __wtMse('registerUrl', url, obj._id); // for the <video> that plays it
+      return url;
+    }
+    static revokeObjectURL(url) {
+      g.__wtObjectURLs.delete(String(url));
+      __wtMse('revokeUrl', String(url));
+    }
     get href() { return serialize(this._r); }
     set href(v) {
       this._r = parse(v);
@@ -5112,6 +5665,181 @@ Object.defineProperty(globalThis, '__wtScope', {
     return img;
   };
   g.Image.prototype = nodeProto;
+})();
+
+// Media Source Extensions: MediaSource, SourceBuffer and SourceBufferList,
+// over Windows' own MSE (Media.cpp's mse::, through __wtMse). A page makes
+// a MediaSource, points a <video>'s src at its blob: URL, and on
+// sourceopen appends the segments it fetches to SourceBuffers. What
+// happens natively comes back each frame through __wtMseEvents.
+(() => {
+  const g = globalThis;
+  if (!__wtMse('available')) return; // no Media Foundation: no MediaSource, as on a browser without MSE
+  const hidden = (o, k, v) => Object.defineProperty(o, k, { value: v, writable: true, configurable: true });
+  const sources = new Map(); // id -> MediaSource
+  const fail = (where, what, name) => new DOMException("Failed to execute '" + what + "' on '" + where + "': " +
+    (name === 'InvalidStateError' ? 'This SourceBuffer has been removed from the parent media source, or the media source is not open.' : 'The operation failed.'), name);
+  const handlers = (o, names) => { for (const n of names) o['on' + n] = null; };
+
+  class SourceBufferList extends g.EventTarget {
+    constructor() { super(); hidden(this, '_list', []); handlers(this, ['addsourcebuffer', 'removesourcebuffer']); }
+    get length() { return this._list.length; }
+    item(i) { return this._list[i >>> 0] || null; }
+    [Symbol.iterator]() { return this._list[Symbol.iterator](); }
+    _sync() {
+      for (let i = 0; i < this._list.length + 1; i++) {
+        if (i < this._list.length) Object.defineProperty(this, i, { value: this._list[i], configurable: true, enumerable: true });
+        else delete this[i];
+      }
+    }
+    _add(sb) { this._list.push(sb); this._sync(); this.dispatchEvent(new Event('addsourcebuffer')); }
+    _remove(sb) {
+      const i = this._list.indexOf(sb);
+      if (i < 0) return;
+      this._list.splice(i, 1);
+      delete this[this._list.length];
+      this._sync();
+      this.dispatchEvent(new Event('removesourcebuffer'));
+    }
+  }
+
+  class SourceBuffer extends g.EventTarget {
+    constructor(ms, index) {
+      super();
+      hidden(this, '_ms', ms);
+      hidden(this, '_index', index);
+      hidden(this, '_updating', false);
+      hidden(this, '_removed', false);
+      handlers(this, ['updatestart', 'update', 'updateend', 'error', 'abort']);
+    }
+    _check(what, needOpen) {
+      if (this._removed) throw fail('SourceBuffer', what, 'InvalidStateError');
+      if (this._updating) throw new DOMException("Failed to execute '" + what + "' on 'SourceBuffer': This SourceBuffer is still processing an 'appendBuffer' or 'remove' operation.", 'InvalidStateError');
+      if (needOpen && this._ms.readyState === 'closed') throw fail('SourceBuffer', what, 'InvalidStateError');
+    }
+    get updating() { return this._updating; }
+    get buffered() {
+      if (this._removed) throw fail('SourceBuffer', 'buffered', 'InvalidStateError');
+      return new g.TimeRanges(__wtMse('buffered', this._ms._id, this._index));
+    }
+    _get(name) { return __wtMse('get', this._ms._id, this._index, name); }
+    _set(name, value, what) {
+      this._check(what, true);
+      __wtMse('set', this._ms._id, this._index, name, value);
+    }
+    get timestampOffset() { return this._get('timestampOffset'); }
+    set timestampOffset(v) { this._set('timestampOffset', Number(v), 'timestampOffset'); }
+    get appendWindowStart() { return this._get('appendWindowStart'); }
+    set appendWindowStart(v) { this._set('appendWindowStart', Number(v), 'appendWindowStart'); }
+    get appendWindowEnd() { return this._get('appendWindowEnd'); }
+    set appendWindowEnd(v) { this._set('appendWindowEnd', Number(v), 'appendWindowEnd'); }
+    get mode() { return this._get('mode') === 1 ? 'sequence' : 'segments'; }
+    set mode(v) {
+      if (v !== 'segments' && v !== 'sequence') return;
+      this._set('mode', v === 'sequence' ? 1 : 0, 'mode');
+    }
+    get audioTracks() { return []; }
+    get videoTracks() { return []; }
+    get textTracks() { return []; }
+    appendBuffer(data) {
+      this._check('appendBuffer', true);
+      const bytes = data instanceof ArrayBuffer ? new Uint8Array(data)
+        : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
+      if (!bytes) throw new TypeError("Failed to execute 'appendBuffer' on 'SourceBuffer': The provided value is not of type '(ArrayBuffer or ArrayBufferView)'.");
+      this._updating = true;
+      if (!__wtMse('append', this._ms._id, this._index, bytes)) {
+        this._updating = false;
+        throw new DOMException("Failed to execute 'appendBuffer' on 'SourceBuffer': The SourceBuffer is full, and cannot free space to append additional buffers.", 'QuotaExceededError');
+      }
+    }
+    abort() {
+      if (this._removed || this._ms.readyState !== 'open') throw fail('SourceBuffer', 'abort', 'InvalidStateError');
+      __wtMse('abort', this._ms._id, this._index);
+    }
+    remove(start, end) {
+      this._check('remove', true);
+      start = Number(start); end = Number(end);
+      if (!(start >= 0) || !(end > start))
+        throw new TypeError("Failed to execute 'remove' on 'SourceBuffer': The start provided (" + start + ') is outside the range (0, ' + end + ').');
+      this._updating = true;
+      if (!__wtMse('remove', this._ms._id, this._index, start, end)) this._updating = false;
+    }
+    changeType() {
+      throw new DOMException("Failed to execute 'changeType' on 'SourceBuffer': Changing the type isn't supported.", 'NotSupportedError');
+    }
+  }
+
+  class MediaSource extends g.EventTarget {
+    constructor() {
+      super();
+      const id = __wtMse('create');
+      if (!id) throw new DOMException("Failed to construct 'MediaSource': Media Source Extensions aren't available.", 'NotSupportedError');
+      hidden(this, '_id', id);
+      hidden(this, '_buffers', []);
+      Object.defineProperty(this, 'sourceBuffers', { value: new SourceBufferList(), enumerable: true });
+      Object.defineProperty(this, 'activeSourceBuffers', { value: new SourceBufferList(), enumerable: true });
+      handlers(this, ['sourceopen', 'sourceended', 'sourceclose']);
+      sources.set(id, this);
+    }
+    get readyState() { return ['closed', 'closed', 'open', 'ended'][__wtMse('readyState', this._id)] || 'closed'; }
+    get duration() { return this.readyState === 'closed' ? NaN : __wtMse('duration', this._id); }
+    set duration(v) {
+      v = Number(v);
+      if (!(v >= 0)) throw new TypeError("Failed to set the 'duration' property on 'MediaSource': The value provided (" + v + ') is negative.');
+      if (this.readyState !== 'open' || this._buffers.some(b => b && b._updating))
+        throw new DOMException("Failed to set the 'duration' property on 'MediaSource': The MediaSource's readyState is not 'open', or a SourceBuffer is updating.", 'InvalidStateError');
+      __wtMse('setDuration', this._id, v);
+    }
+    addSourceBuffer(type) {
+      type = String(type);
+      if (!type) throw new TypeError("Failed to execute 'addSourceBuffer' on 'MediaSource': The type provided is empty.");
+      if (!MediaSource.isTypeSupported(type))
+        throw new DOMException("Failed to execute 'addSourceBuffer' on 'MediaSource': The type provided ('" + type + "') is unsupported.", 'NotSupportedError');
+      if (this.readyState !== 'open')
+        throw new DOMException("Failed to execute 'addSourceBuffer' on 'MediaSource': The MediaSource's readyState is not 'open'.", 'InvalidStateError');
+      const r = __wtMse('addSourceBuffer', this._id, type);
+      if (typeof r === 'string') throw new DOMException("Failed to execute 'addSourceBuffer' on 'MediaSource': " + r, r);
+      const sb = new SourceBuffer(this, r);
+      this._buffers[r] = sb;
+      this.sourceBuffers._add(sb);
+      this.activeSourceBuffers._add(sb);
+      return sb;
+    }
+    removeSourceBuffer(sb) {
+      if (!(sb instanceof SourceBuffer) || sb._ms !== this || sb._removed)
+        throw new DOMException("Failed to execute 'removeSourceBuffer' on 'MediaSource': The SourceBuffer provided is not contained in this MediaSource.", 'NotFoundError');
+      if (sb._updating) { __wtMse('abort', this._id, sb._index); sb._updating = false; }
+      __wtMse('removeSourceBuffer', this._id, sb._index);
+      sb._removed = true;
+      this._buffers[sb._index] = null;
+      this.activeSourceBuffers._remove(sb);
+      this.sourceBuffers._remove(sb);
+    }
+    endOfStream(error) {
+      if (this.readyState !== 'open' || this._buffers.some(b => b && b._updating))
+        throw new DOMException("Failed to execute 'endOfStream' on 'MediaSource': The MediaSource's readyState is not 'open', or a SourceBuffer is updating.", 'InvalidStateError');
+      __wtMse('endOfStream', this._id, error === 'network' ? 1 : error === 'decode' ? 2 : 0);
+    }
+    setLiveSeekableRange() {}
+    clearLiveSeekableRange() {}
+    static isTypeSupported(type) { return __wtMse('isTypeSupported', String(type)); }
+    static get canConstructInDedicatedWorker() { return false; }
+  }
+
+  // [id, buffer, name, ...]: buffer -1 is the MediaSource itself. A
+  // SourceBuffer stops updating with its updateend (or error).
+  g.__wtMseEvents = list => {
+    for (let i = 0; i + 2 < list.length; i += 3) {
+      const ms = sources.get(list[i]);
+      if (!ms) continue;
+      const target = list[i + 1] < 0 ? ms : ms._buffers[list[i + 1]];
+      if (!target) continue;
+      const name = list[i + 2];
+      if (name === 'updateend' || name === 'error') target._updating = false;
+      target.dispatchEvent(new Event(name));
+    }
+  };
+  Object.assign(g, { MediaSource, SourceBuffer, SourceBufferList });
 })();
 
 // <script>: HTMLScriptElement's properties, each reflecting its attribute
@@ -6446,7 +7174,7 @@ Object.defineProperty(globalThis, '__wtScope', {
 
   const nativeFetch = g.fetch;
   g.fetch = function fetch(input, init) {
-    const signal = init && init.signal;
+    const signal = (init && init.signal) || (input instanceof g.Request ? input.signal : null);
     if (!signal) return nativeFetch(input, init);
     if (signal.aborted) return Promise.reject(signal.reason);
     return new Promise((resolve, reject) => {
@@ -7048,6 +7776,7 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("__wtSetPrototypes", 1, js_native_setPrototypes),     // the DOM interfaces' prototype chain
     JS_CFUNC_DEF("__wtMedia", 3, js_native_media),               // behind HTMLMediaElement
     JS_CFUNC_DEF("__wtCanPlayType", 1, js_native_canPlayType),
+    JS_CFUNC_DEF("__wtMse", 5, js_native_mse),                    // behind MediaSource and SourceBuffer
     JS_CFUNC_DEF("__wtParserInserted", 1, js_native_parserInserted), // behind script.async
     JS_CFUNC_DEF("__wtObserve", 2, js_native_observe),            // behind MutationObserver, IntersectionObserver, ResizeObserver
     JS_CFUNC_DEF("__wtSetFullscreen", 1, js_native_setFullscreen),         // behind requestFullscreen
@@ -7058,6 +7787,8 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("removeEventListener", 2, js_window_removeEventListener),
     JS_CFUNC_DEF("dispatchEvent", 1, js_window_dispatchEvent),
     JS_CFUNC_DEF("__wtFetch", 4, js_native_fetch), // the native half of fetch() - see kBootstrapJS
+    JS_CFUNC_DEF("__wtUtf8Decode", 2, js_native_utf8Decode), // behind TextDecoder and Response.text()
+    JS_CFUNC_DEF("__wtUtf8Encode", 1, js_native_utf8Encode), // behind TextEncoder
     JS_CFUNC_DEF("__wtConsole", 2, js_native_console), // the native half of console.* - see kBootstrapJS
     // the natives behind localStorage/sessionStorage - see kBootstrapJS
     JS_CFUNC_DEF("__wtStorageGet", 2, js_storage_get),

@@ -5,6 +5,7 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <mutex>
 #include "DOM.h"
 #include "JSBinding.h"
 #include "Layout.h"
@@ -90,6 +91,16 @@ public:
     // to make the window fill the screen without the browser's bars, or
     // put it back.
     bool takeFullscreenChange(bool& on);
+
+    // Ctrl+S, or the address bar's Save button: saves what the page's
+    // <video>/<audio> elements played to the Downloads folder - a plain
+    // source's file, or a MediaSource stream's video and audio merged into
+    // one file (EngineMedia.cpp). Runs in the background; takeNotices gives
+    // what to tell the user. hasMediaToSave: whether there's anything to
+    // save (cheap enough to ask every frame).
+    void saveMedia();
+    bool hasMediaToSave() const;
+    std::vector<std::wstring> takeNotices();
     bool fullscreen() const { return fullscreen_ != nullptr; }
     void exitFullscreen() { setFullscreen(nullptr); }
     bool draggingScrollbar() const { return draggingScrollbar_; }
@@ -384,6 +395,13 @@ private:
     // `el`'s player, created (`create`) if it has none; (re)loads it when
     // its source changed. nullptr without one.
     MediaElement* mediaFor(Element* el, bool create);
+    // saveMedia's messages, from the threads that finish its copies.
+    struct Notices {
+        std::mutex mutex;
+        std::vector<std::wstring> list;
+    };
+    std::shared_ptr<Notices> saveNotices_ = std::make_shared<Notices>();
+    static bool worthSaving(const MediaElement& m); // saveMedia would save it
     void startMediaLoad(MediaElement& m);
     bool mediaProperty(Element* el, const std::string& name, double& out);
     void setMediaProperty(Element* el, const std::string& name, double value);

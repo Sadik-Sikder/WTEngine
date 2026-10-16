@@ -146,6 +146,7 @@
     <ClCompile Include="src\EngineForms.cpp" />
     <ClCompile Include="src\EngineMedia.cpp" />
     <ClCompile Include="src\Media.cpp" />
+    <ClCompile Include="src\MediaMux.cpp" />
     <ClCompile Include="src\Intl.cpp" />
     <ClCompile Include="src\Modules.cpp" />
     <ClCompile Include="src\TextEditor.cpp" />
@@ -211,6 +212,7 @@
     <ClInclude Include="include\WebStorage.h" />
     <ClInclude Include="include\Svg.h" />
     <ClInclude Include="include\Media.h" />
+    <ClInclude Include="include\MediaMux.h" />
     <ClInclude Include="include\Intl.h" />
     <ClInclude Include="include\Modules.h" />
     <ClInclude Include="src\IntlJS.inc" />

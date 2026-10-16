@@ -418,7 +418,9 @@ static http::request<http::string_body> buildRequest(const UrlParts& parts, http
     std::string cookies = CookieJar::instance().cookieHeader(parts.https, parts.host, parts.pathAndQuery);
     if (!cookies.empty()) req.set(http::field::cookie, cookies);
 
-    if (!body.empty()) req.set(http::field::content_type, "application/x-www-form-urlencoded");
+    // A form submission's body is form-encoded; a script's request says
+    // what its body is itself (and with no Content-Type, sends none).
+    if (!body.empty() && dest == FetchDest::Document) req.set(http::field::content_type, "application/x-www-form-urlencoded");
     for (const auto& [name, value] : extraHeaders) req.set(name, value);
     if (!body.empty() || method == http::verb::post || method == http::verb::put || method == http::verb::patch) {
         req.body() = body;

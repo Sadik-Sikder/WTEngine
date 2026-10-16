@@ -40,7 +40,9 @@ It's a learning project, not a replacement for Chrome. Many real sites load and 
 - `<video>` and `<audio>`, played through Windows Media Foundation:
   - formats: MP4/H.264, WebM/VP9, MP3, WAV;
   - controls: play/pause, seeking, volume, fullscreen;
-  - scripting: the `HTMLMediaElement` API and `new Audio()`.
+  - scripting: the `HTMLMediaElement` API and `new Audio()`;
+  - Media Source Extensions, on Windows' own MSE: streaming players like YouTube's play.
+  - The address bar's "Save media" button (or Ctrl+S) saves what a page played: a video file as it is, or a stream's video and audio merged into one MP4, WebM or MKV file. Nothing is re-encoded, and it holds the parts the page loaded.
 
 **Browser UI**
 - Address bar, back/forward, reload, links and forms (text fields, buttons, checkboxes, dropdowns).
@@ -94,6 +96,7 @@ Pass a URL or a local file path. With no argument, a built-in start page opens.
 | Alt+Left / Alt+Right | Back / forward |
 | F5 / Ctrl+R | Reload |
 | Ctrl+F, F3 | Find in page, next match |
+| Ctrl+S | Save the page's video or audio to Downloads |
 | Ctrl + / Ctrl − / Ctrl+0 | Zoom in / out / reset (Ctrl+wheel works too) |
 | F12 | Developer console |
 | Esc | Leave fullscreen video |
@@ -116,7 +119,7 @@ If you want to understand or change the code, start with **[docs/HOW_IT_WORKS.md
 
 The larger gaps:
 
-- **Streaming video:** sites that stream through Media Source Extensions (YouTube, Netflix) don't play, and DRM-protected video isn't supported.
+- **DRM video:** DRM-protected video (Netflix, most paid streaming) isn't supported.
 - **Canvas and WebAssembly:** `<canvas>` doesn't draw, and there's no `WebAssembly`.
 - **Scrolling:** only the page itself scrolls, not elements inside it.
 - **Paint and layout:** layout is a full pass on every change, with no incremental layout. Painting uses fixed-function OpenGL on the main thread.

@@ -3,9 +3,20 @@
 #include "Engine.h"
 #include "Fetcher.h"
 #include "JSEngine.h"
+#include "MediaMux.h"
 #include "Renderer.h"
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
+#include <cwctype>
+#include <functional>
+#include <set>
+#include <thread>
+#define NOMINMAX
+#include <windows.h>
+#include <shlobj.h> // SHGetKnownFolderPath: the Downloads folder
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 
 namespace {
 
@@ -182,7 +193,8 @@ Engine::MediaElement* Engine::mediaFor(Element* el, bool create) {
     // A new source - src set, or <source> children changed - is loaded.
     MediaElement& m = it->second;
     std::wstring raw = mediaSource(el);
-    std::wstring url = raw.empty() ? L"" : resolveUrl(pageBaseUrl, raw);
+    // A blob: URL (a MediaSource's) is taken as it is; resolveUrl only knows http(s).
+    std::wstring url = raw.empty() ? L"" : raw.rfind(L"blob:", 0) == 0 ? raw : resolveUrl(pageBaseUrl, raw);
     if (url != m.src) {
         m.src = url;
         m.loaded = false;
@@ -203,6 +215,8 @@ void Engine::startMediaLoad(MediaElement& m) {
     m.player->setAutoPlay(hasAttr(static_cast<Element*>(m.node.get()), L"autoplay"));
     // From a web page, its requests carry the page as their referrer.
     bool webPage = pageBaseUrl.rfind(L"http://", 0) == 0 || pageBaseUrl.rfind(L"https://", 0) == 0;
+    // A MediaSource's blob: URL plays the stream the page builds in it.
+    if (int mseId = mse::idForUrl(m.src)) { m.player->loadMediaSource(mseId); return; }
     m.player->load(m.src, webPage ? pageBaseUrl : L"");
 }
 
@@ -318,6 +332,7 @@ void Engine::clearMedia() {
         fullscreenChanged_ = true;
     }
     fullscreenEvents_.clear();
+    mse::destroyAll(); // the page's MediaSources, with the players that played them
 }
 
 // --- Fullscreen -----------------------------------------------------------
@@ -577,4 +592,236 @@ void Engine::dragMedia(int x) {
     }
     double duration = p.duration();
     if (duration > 0 && std::isfinite(duration)) p.setCurrentTime(f * duration);
+}
+
+// --- Saving media ---------------------------------------------------------
+// Ctrl+S (main.cpp): what the page's media elements played goes to the
+// Downloads folder. A plain source is the file itself, fetched again
+// through our own stack (cookies and referrer as before). A MediaSource's
+// stream is what its SourceBuffers were given (mse::recordings) - video
+// and audio in separate files, as the page fetched them. Copies run on
+// background threads; each tells the window when it's done (takeNotices).
+
+namespace {
+
+std::wstring downloadsFolder() {
+    PWSTR path = nullptr;
+    std::wstring out;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &path)) && path) out = path;
+    CoTaskMemFree(path);
+    if (out.empty()) {
+        const wchar_t* home = _wgetenv(L"USERPROFILE");
+        out = std::wstring(home ? home : L".") + L"\\Downloads";
+    }
+    return out;
+}
+
+// A file name from the page title: no characters Windows forbids, not too long.
+std::wstring safeFileName(std::wstring name) {
+    for (auto& c : name) if (c < 32 || wcschr(L"\\/:*?\"<>|", c)) c = L'_';
+    size_t a = name.find_first_not_of(L" ."), b = name.find_last_not_of(L" .");
+    name = a == std::wstring::npos ? L"" : name.substr(a, b - a + 1);
+    if (name.size() > 120) name = name.substr(0, 120);
+    return name.empty() ? L"media" : name;
+}
+
+// `folder\base.ext`, or `base (2).ext` and so on if that's taken - created
+// empty there and then, so saves running at once can't pick the same name.
+// The caller writes over it (or deletes it if that fails).
+std::wstring freePath(const std::wstring& folder, const std::wstring& base, const std::wstring& ext) {
+    std::wstring path = folder + L"\\" + base + L"." + ext;
+    for (int n = 2; n < 1000; n++) {
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
+            break;
+        }
+        if (GetLastError() != ERROR_FILE_EXISTS) break; // can't be written: the save itself will say so
+        path = folder + L"\\" + base + L" (" + std::to_wstring(n) + L")." + ext;
+    }
+    return path;
+}
+
+std::wstring fileNameOf(const std::wstring& path) {
+    size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
+// A MediaSource buffer's file extension, from its MIME type.
+std::wstring extensionForType(const std::wstring& mime) {
+    if (mime.rfind(L"video/webm", 0) == 0 || mime.rfind(L"audio/webm", 0) == 0) return L"webm";
+    if (mime.rfind(L"audio/mp4", 0) == 0) return L"m4a";
+    if (mime.rfind(L"audio/mpeg", 0) == 0) return L"mp3";
+    return L"mp4";
+}
+
+// A plain source's extension, from its URL (or what its element plays).
+std::wstring extensionForUrl(const std::wstring& url, bool audio) {
+    std::wstring path = url.substr(0, url.find_first_of(L"?#"));
+    size_t dot = path.rfind(L'.'), slash = path.find_last_of(L"/\\");
+    if (dot != std::wstring::npos && (slash == std::wstring::npos || dot > slash) && path.size() - dot <= 5) {
+        std::wstring ext = path.substr(dot + 1);
+        for (auto& c : ext) c = (wchar_t)towlower(c);
+        if (!ext.empty() && std::all_of(ext.begin(), ext.end(), [](wchar_t c) { return iswalnum(c); })) return ext;
+    }
+    return audio ? L"mp3" : L"mp4";
+}
+
+// "3:07", or "1:02:09".
+std::wstring clock(double seconds) {
+    long s = std::lround(std::max(0.0, seconds));
+    wchar_t text[32];
+    if (s >= 3600) swprintf(text, 32, L"%ld:%02ld:%02ld", s / 3600, s / 60 % 60, s % 60);
+    else swprintf(text, 32, L"%ld:%02ld", s / 60, s % 60);
+    return text;
+}
+
+// A stream's recordings as files (on a background thread). Each
+// SourceBuffer's best part - the quality with the most media - goes into
+// one file with the others' (video and audio together), the segments in
+// time order (mux::merge): MP4 if they're all MP4, else WebM or Matroska.
+// The other qualities' parts are saved on their own, and anything merge
+// can't read is copied as it was recorded.
+void saveStream(const std::vector<mse::Recording>& recordings, double total, const std::wstring& folder,
+                const std::wstring& base, const std::function<void(std::wstring)>& notify) {
+    struct Part {
+        std::wstring file, mime;
+        mux::Info info;
+    };
+    std::vector<Part> best, others;
+    for (const auto& rec : recordings) {
+        std::vector<Part> parts;
+        for (const auto& f : rec.files) parts.push_back({ f, rec.mimeType, mux::inspect(f) });
+        auto top = std::max_element(parts.begin(), parts.end(), [](const Part& a, const Part& b) {
+            return a.info.ok != b.info.ok ? !a.info.ok : a.info.seconds < b.info.seconds;
+        });
+        best.push_back(*top);
+        for (auto it = parts.begin(); it != parts.end(); ++it)
+            if (it != top) others.push_back(*it);
+    }
+    auto isVideo = [](const Part& p) { return p.info.ok ? p.info.video : p.mime.rfind(L"audio", 0) != 0; };
+    // One part on its own: tidied (a merge of one), else as recorded.
+    auto saveOne = [&](const Part& p, const std::wstring& name) {
+        std::wstring tidied = mux::mergedExtension({ p.info });
+        std::wstring to = freePath(folder, name, tidied.empty() ? extensionForType(p.mime) : tidied);
+        if ((!tidied.empty() && mux::merge({ p.file }, to)) || CopyFileW(p.file.c_str(), to.c_str(), FALSE)) return fileNameOf(to);
+        DeleteFileW(to.c_str());
+        return std::wstring();
+    };
+
+    std::vector<std::wstring> saved;
+    double seconds = 0; // what the merged file holds: as much as its shortest track
+    std::vector<mux::Info> infos;
+    for (const auto& p : best) infos.push_back(p.info);
+    const std::wstring kind = mux::mergedExtension(infos);
+    bool together = !kind.empty();
+    if (together) {
+        std::vector<std::wstring> files;
+        seconds = best[0].info.seconds;
+        for (const auto& p : best) {
+            files.push_back(p.file);
+            seconds = std::min(seconds, p.info.seconds);
+        }
+        std::wstring to = freePath(folder, base, kind);
+        if (mux::merge(files, to)) {
+            saved.push_back(fileNameOf(to));
+        } else {
+            DeleteFileW(to.c_str());
+            together = false;
+        }
+    }
+    if (!together) { // each track in its own file
+        seconds = 0;
+        for (const auto& p : best) {
+            std::wstring name = saveOne(p, best.size() > 1 ? base + (isVideo(p) ? L" - video" : L" - audio") : base);
+            if (!name.empty()) saved.push_back(name);
+        }
+    }
+    int extra = 0, videos = 1, audios = 1;
+    for (const auto& p : others) {
+        const bool video = isVideo(p);
+        std::wstring name = base + (video ? L" - video " + std::to_wstring(++videos) : L" - audio " + std::to_wstring(++audios));
+        if (!saveOne(p, name).empty()) extra++;
+    }
+
+    if (saved.empty()) { notify(L"Couldn't save " + base); return; }
+    std::wstring text = L"Saved " + saved[0] + (saved.size() > 1 ? L" and " + std::to_wstring(saved.size() - 1) + L" more" : L"") + L" to Downloads";
+    if (seconds > 0 && std::isfinite(total) && total > 0 && seconds < total - 1)
+        text += L" - " + clock(seconds) + L" of " + clock(total) + L"; the rest wasn't loaded";
+    if (extra) text += L" (+" + std::to_wstring(extra) + L" in another quality)";
+    notify(text);
+}
+
+} // namespace
+
+// Whether an element's media is worth saving: it has a source, a stream
+// has had something appended, and it isn't under a second long (an
+// interface sound, or a probe of what plays - not what the person means).
+bool Engine::worthSaving(const MediaElement& m) {
+    if (m.src.empty()) return false;
+    if (int mseId = mse::idForUrl(m.src)) return mse::recorded(mseId);
+    const double length = m.player ? m.player->duration() : NAN;
+    return !(std::isfinite(length) && length < 1);
+}
+
+bool Engine::hasMediaToSave() const {
+    for (const auto& [el, m] : media_)
+        if (worthSaving(m)) return true;
+    return false;
+}
+
+void Engine::saveMedia() {
+    auto notices = saveNotices_;
+    auto notify = [notices](std::wstring text) {
+        std::lock_guard<std::mutex> lock(notices->mutex);
+        notices->list.push_back(std::move(text));
+    };
+    const std::wstring folder = downloadsFolder();
+    const std::wstring base = safeFileName(title());
+    int started = 0;
+    std::set<std::wstring> seen; // a source two elements play is saved once
+    for (auto& [el, m] : media_) {
+        if (!worthSaving(m) || !seen.insert(m.src).second) continue;
+        const bool audio = static_cast<const Element*>(el)->tag == L"audio";
+        if (int mseId = mse::idForUrl(m.src)) {
+            auto recordings = mse::recordings(mseId);
+            const double total = mse::duration(mseId);
+            started++;
+            notify(L"Saving " + base + L"...");
+            std::thread([recordings, total, folder, base, notify] { saveStream(recordings, total, folder, base, notify); }).detach();
+            continue;
+        }
+        std::wstring to = freePath(folder, base + (audio ? L" - audio" : L""), extensionForUrl(m.src, audio));
+        started++;
+        if (m.src.rfind(L"http://", 0) == 0 || m.src.rfind(L"https://", 0) == 0) {
+            FetchOptions options;
+            options.dest = FetchDest::Empty;
+            options.referrer = pageBaseUrl;
+            notify(L"Downloading " + fileNameOf(to) + L"...");
+            fetchBytesAsync(m.src, std::move(options), [to, notify](bool ok, std::vector<unsigned char> bytes) {
+                FILE* f = ok ? _wfopen(to.c_str(), L"wb") : nullptr;
+                if (f) {
+                    ok = fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+                    fclose(f);
+                } else ok = false;
+                if (!ok) DeleteFileW(to.c_str());
+                notify(ok ? L"Saved " + fileNameOf(to) + L" to Downloads" : L"Couldn't download " + fileNameOf(to));
+            });
+        } else { // a local file
+            std::wstring from = m.src;
+            std::thread([from, to, notify] {
+                bool ok = CopyFileW(from.c_str(), to.c_str(), FALSE) != FALSE;
+                if (!ok) DeleteFileW(to.c_str());
+                notify(ok ? L"Saved " + fileNameOf(to) + L" to Downloads" : L"Couldn't save " + fileNameOf(to));
+            }).detach();
+        }
+    }
+    if (!started) notify(L"Nothing to save: this page has no video or audio that has loaded");
+}
+
+std::vector<std::wstring> Engine::takeNotices() {
+    std::lock_guard<std::mutex> lock(saveNotices_->mutex);
+    std::vector<std::wstring> out;
+    out.swap(saveNotices_->list);
+    return out;
 }

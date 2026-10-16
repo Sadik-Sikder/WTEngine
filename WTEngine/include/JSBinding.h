@@ -238,6 +238,11 @@ void runQueuedTasks(JSContext* ctx, double budgetSeconds);
 // jobs. Called once per frame from Engine::render, like fireDueTimers.
 void pollFetches(JSContext* ctx);
 
+// Delivers what MediaSources and their SourceBuffers did since the last
+// call (sourceopen, updateend, ...) to the page's objects. Called every
+// frame by Engine::render, after the media players' own events.
+void pollMediaSources(JSContext* ctx);
+
 // Runs one line typed into the developer console against the page: logs it
 // as Input, then its value (formatted like a REPL shows it) as Result, or
 // the error it threw. Marks the DOM dirty, since it may have changed it.

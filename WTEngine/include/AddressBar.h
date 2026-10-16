@@ -37,7 +37,11 @@ public:
     // Back / Forward / Reload buttons drawn to the left of the field. While
     // a page is loading, Reload turns into Stop (a cross), like browsers -
     // which is also what shows that a click on Reload did something.
-    enum class NavButton { None, Back, Forward, Reload, Stop, ConsoleBadge, ZoomReset };
+    enum class NavButton { None, Back, Forward, Reload, Stop, ConsoleBadge, ZoomReset, SaveMedia };
+    // Whether the page has video/audio to save; if so, a "Save media"
+    // button shows left of the zoom pill (NavButton::SaveMedia, which does
+    // what Ctrl+S does).
+    void setCanSave(bool can) { canSave_ = can; }
     // The page zoom in percent; when it isn't 100, a "125%" pill shows at
     // the bar's right end (left of the error badge), and clicking it
     // (NavButton::ZoomReset) goes back to 100%, as in browsers.
@@ -69,5 +73,12 @@ private:
     int windowWidth_ = 0;   // as of the last draw(), for hit-testing the badge
     int zoomPercent_ = 100;
     int zoomPillWidth() const { return zoomPercent_ != 100 ? 52 : 0; }
+    bool canSave_ = false;
+    int saveButtonWidth() const { return canSave_ ? 104 : 0; }
+    // The items at the bar's right end, right to left - the error badge,
+    // the zoom pill, the save button - as their left x (for a shown one),
+    // and where the field has to end to leave room for them.
+    struct RightItems { int badgeX, zoomX, saveX, fieldRight; };
+    RightItems rightItems() const;
     float scrollX_ = 0; // horizontal scroll of the text inside the field
 };

@@ -919,6 +919,7 @@ void Engine::render(Renderer& renderer, double timeSeconds) {
 
     // What the <video>/<audio> players did since the last frame, as events.
     pollMedia();
+    if (jsEngine) pollMediaSources(jsEngine->context()); // MediaSource/SourceBuffer events
 
     // A script mutated the DOM (appendChild, textContent=, setAttribute,
     // innerHTML=, ...) since the last layout - re-layout to pick it up.

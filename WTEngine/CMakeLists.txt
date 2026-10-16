@@ -52,6 +52,7 @@ add_executable(WTEngine
     src/WebStorage.cpp
     src/Svg.cpp
     src/Media.cpp
+    src/MediaMux.cpp
     src/Intl.cpp
     src/Modules.cpp
     resources/WTEngine.rc # the app icon

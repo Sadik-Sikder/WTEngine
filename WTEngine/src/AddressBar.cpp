@@ -65,14 +65,28 @@ int AddressBar::badgeWidth() const {
     return errorCount_ > 0 ? 54 : 0;
 }
 
+AddressBar::RightItems AddressBar::rightItems() const {
+    int x = windowWidth_ - kBarMargin;
+    auto place = [&](int width) {
+        if (!width) return x;
+        int left = x - width;
+        x = left - 6;
+        return left;
+    };
+    RightItems items;
+    items.badgeX = place(badgeWidth());
+    items.zoomX = place(zoomPillWidth());
+    items.saveX = place(saveButtonWidth());
+    items.fieldRight = x;
+    return items;
+}
+
 AddressBar::NavButton AddressBar::navButtonAt(int x, int y) const {
     if (y < kFieldY || y >= kFieldY + kFieldH) return NavButton::None;
-    int bw = badgeWidth();
-    if (bw && x >= windowWidth_ - kBarMargin - bw && x < windowWidth_ - kBarMargin)
-        return NavButton::ConsoleBadge;
-    int zoomRight = windowWidth_ - kBarMargin - (bw ? bw + 6 : 0);
-    if (int zw = zoomPillWidth(); zw && x >= zoomRight - zw && x < zoomRight)
-        return NavButton::ZoomReset;
+    const RightItems items = rightItems();
+    if (int w = badgeWidth(); w && x >= items.badgeX && x < items.badgeX + w) return NavButton::ConsoleBadge;
+    if (int w = zoomPillWidth(); w && x >= items.zoomX && x < items.zoomX + w) return NavButton::ZoomReset;
+    if (int w = saveButtonWidth(); w && x >= items.saveX && x < items.saveX + w) return NavButton::SaveMedia;
     if (canBack_ && x >= kNavBackX && x < kNavBackX + kNavSize) return NavButton::Back;
     if (canForward_ && x >= kNavFwdX && x < kNavFwdX + kNavSize) return NavButton::Forward;
     if (x >= kNavReloadX && x < kNavReloadX + kNavSize) {
@@ -86,7 +100,9 @@ void AddressBar::draw(Renderer& r, int windowWidth, double t) {
     windowWidth_ = windowWidth;
     const int badgeW = badgeWidth();
     const int zoomW = zoomPillWidth();
-    const int fieldW = std::max(windowWidth - kFieldX - kBarMargin - (badgeW ? badgeW + 6 : 0) - (zoomW ? zoomW + 6 : 0), 50);
+    const int saveW = saveButtonWidth();
+    const RightItems items = rightItems();
+    const int fieldW = std::max(items.fieldRight - kFieldX, 50);
     const int viewW = fieldW - 2 * kTextPad; // visible text area
     const std::wstring& text = ed_.text();
 
@@ -143,9 +159,19 @@ void AddressBar::draw(Renderer& r, int windowWidth, double t) {
 
     r.clearClip();
 
+    // Save button: "↓ Save media", left of the zoom pill.
+    if (saveW) {
+        const float sx = (float)items.saveX;
+        r.drawRect(sx - 1, (float)kFieldY - 1, (float)saveW + 2, (float)kFieldH + 2, kBorder);
+        r.drawRect(sx, (float)kFieldY, (float)saveW, (float)kFieldH, kField);
+        std::wstring label = std::wstring(1, (wchar_t)0x2193) + L" Save media";
+        float lw = r.measureText(label, 13);
+        r.drawText(sx + (saveW - lw) / 2, (float)kFieldY + 6, label, 13, kInk);
+    }
+
     // Zoom pill: "125%", just left of the error badge; clicking resets to 100%.
     if (zoomW) {
-        const float zx = (float)(windowWidth - kBarMargin - (badgeW ? badgeW + 6 : 0) - zoomW);
+        const float zx = (float)items.zoomX;
         r.drawRect(zx - 1, (float)kFieldY - 1, (float)zoomW + 2, (float)kFieldH + 2, kBorder);
         r.drawRect(zx, (float)kFieldY, (float)zoomW, (float)kFieldH, kField);
         std::wstring label = std::to_wstring(zoomPercent_) + L"%";
@@ -155,7 +181,7 @@ void AddressBar::draw(Renderer& r, int windowWidth, double t) {
 
     // JS error badge: a red "✖ N" at the right end, which opens the console.
     if (badgeW) {
-        const float bx = (float)(windowWidth - kBarMargin - badgeW);
+        const float bx = (float)items.badgeX;
         r.drawRect(bx, (float)kFieldY, (float)badgeW, (float)kFieldH, kErrorBadge);
         const wchar_t cross[] = { 0x2716, 0 };
         std::wstring label = std::wstring(cross) + L" " + (errorCount_ > 99 ? L"99+" : std::to_wstring(errorCount_));
