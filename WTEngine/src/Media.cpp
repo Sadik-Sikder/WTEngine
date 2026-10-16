@@ -10,6 +10,7 @@
 #include <wrl/client.h>
 #include <wrl/implements.h>
 #include <io.h>
+#include <share.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -645,11 +646,11 @@ void record(BufferRecording& rec, int id, int buffer, const uint8_t* data, size_
             rec.settle();
             rec.close();
             if (part >= 0) { // a quality it had before: back to its file
-                rec.out = _wfopen(rec.parts[part].path.c_str(), L"ab");
+                rec.out = _wfsopen(rec.parts[part].path.c_str(), L"ab", _SH_DENYNO);
             } else {
                 std::wstring path = recordingDir() + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(id) + L"-" +
                                     std::to_wstring(buffer) + L"-" + std::to_wstring(rec.parts.size()) + L".part";
-                rec.out = _wfopen(path.c_str(), L"wb");
+                rec.out = _wfsopen(path.c_str(), L"wb", _SH_DENYNO);
                 if (rec.out) {
                     fwrite(data, 1, init, rec.out);
                     RecordingPart p;

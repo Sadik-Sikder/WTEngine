@@ -2370,11 +2370,22 @@ const LayoutRoot::AncestorFilter& LayoutRoot::ancestorFilter() {
     return filterStack_.empty() ? empty : filterStack_.back();
 }
 
+void LayoutRoot::ensureRuleIndex() {
+    const CSS::Rule* data = rules ? rules->data() : nullptr;
+    const size_t size = rules ? rules->size() : 0;
+    if (data == ruleIndex.data && size == ruleIndex.size) return;
+    rebuildRuleIndex();
+    styleCache_.clear();
+    described_.clear();
+}
+
 void LayoutRoot::rebuildRuleIndex() {
     ruleIndex = RuleIndex{};
     filterFor_.clear();
     filterStack_.clear();
     if (!rules) return;
+    ruleIndex.data = rules->data();
+    ruleIndex.size = rules->size();
     ruleIndex.required.resize(rules->size());
     for (size_t r = 0; r < rules->size(); r++) {
         // What the rule needs among the element's ancestors: every compound
@@ -4524,6 +4535,7 @@ void LayoutRoot::layoutTable(Element* el, int x, int& y, int contentWidth, const
 // --- Styles for scripts (getComputedStyle) ------------------------------------
 
 const LayoutRoot::Described& LayoutRoot::describe(Element* el) {
+    ensureRuleIndex(); // a script may have added a stylesheet since the last layout
     auto found = described_.find(el);
     if (found != described_.end()) return found->second;
 

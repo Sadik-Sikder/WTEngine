@@ -856,8 +856,15 @@ private:
         std::unordered_map<std::wstring, std::vector<const CSS::Rule*>> byId, byClass, byTag;
         std::vector<const CSS::Rule*> universal;
         std::vector<AncestorFilter> required; // per rule, by its position in *rules
+        // The rules it was built for: scripts add stylesheets between layouts.
+        const CSS::Rule* data = nullptr;
+        size_t size = 0;
     } ruleIndex;
     void rebuildRuleIndex();
+    // Rebuilds the index (and drops styles computed with the old rules) if
+    // *rules changed since it was built - for describe(), which a script's
+    // getComputedStyle can call between layouts.
+    void ensureRuleIndex();
     // The filter of ancestorStack's elements, kept as a stack alongside it:
     // computeStyle revalidates it against ancestorStack (which is pushed,
     // popped and swapped wholesale in many places) and recomputes only what

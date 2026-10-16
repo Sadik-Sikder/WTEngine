@@ -7,6 +7,7 @@
 #include "Renderer.h"
 #include <cmath>
 #include <cstdio>
+#include <share.h> // _SH_DENYNO: _wfsopen lets others read a file being written
 #include <algorithm>
 #include <cwctype>
 #include <functional>
@@ -610,8 +611,9 @@ std::wstring downloadsFolder() {
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &path)) && path) out = path;
     CoTaskMemFree(path);
     if (out.empty()) {
-        const wchar_t* home = _wgetenv(L"USERPROFILE");
-        out = std::wstring(home ? home : L".") + L"\\Downloads";
+        wchar_t home[MAX_PATH];
+        DWORD n = GetEnvironmentVariableW(L"USERPROFILE", home, MAX_PATH);
+        out = (n && n < MAX_PATH ? std::wstring(home, n) : std::wstring(L".")) + L"\\Downloads";
     }
     return out;
 }
@@ -799,7 +801,7 @@ void Engine::saveMedia() {
             options.referrer = pageBaseUrl;
             notify(L"Downloading " + fileNameOf(to) + L"...");
             fetchBytesAsync(m.src, std::move(options), [to, notify](bool ok, std::vector<unsigned char> bytes) {
-                FILE* f = ok ? _wfopen(to.c_str(), L"wb") : nullptr;
+                FILE* f = ok ? _wfsopen(to.c_str(), L"wb", _SH_DENYNO) : nullptr;
                 if (f) {
                     ok = fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
                     fclose(f);

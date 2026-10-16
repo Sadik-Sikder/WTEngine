@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <share.h> // _SH_DENYNO: _wfsopen lets others read a file being written
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -16,7 +17,7 @@ constexpr size_t npos = (size_t)-1;
 // A file read at any offset.
 class File {
 public:
-    explicit File(const std::wstring& path) : f_(_wfopen(path.c_str(), L"rb")) {
+    explicit File(const std::wstring& path) : f_(_wfsopen(path.c_str(), L"rb", _SH_DENYNO)) {
         if (f_ && _fseeki64(f_, 0, SEEK_END) == 0) size = (uint64_t)_ftelli64(f_);
     }
     ~File() { if (f_) fclose(f_); }
@@ -38,7 +39,7 @@ private:
 // The file being written. It's deleted again unless finish() succeeds.
 class Out {
 public:
-    explicit Out(const std::wstring& path) : path_(path), f_(_wfopen(path.c_str(), L"wb")) {}
+    explicit Out(const std::wstring& path) : path_(path), f_(_wfsopen(path.c_str(), L"wb", _SH_DENYNO)) {}
     ~Out() {
         if (f_) {
             fclose(f_);
