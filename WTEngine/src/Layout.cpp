@@ -67,6 +67,12 @@ static bool parseNumberAndUnit(const std::wstring& v, double& value, std::wstrin
     return true;
 }
 
+// What 1rem is: the root (<html>) element's font size, set by layout() for
+// its pass (and kept for getComputedStyle after it). A page that sets one -
+// `html { font-size: 10px }` or `62.5%` - gets it, against the browser
+// default of 16px; otherwise it's this engine's base text size, 14px.
+static int remBase = 14;
+
 // font-size specifically also supports units relative to `baseFontSize` (the
 // inherited size): em/rem multiply it, % scales it - e.g. real pages commonly
 // write `h1 { font-size: 1.5em }`. Anything else unsupported (pt, vw, ...)
@@ -79,7 +85,8 @@ int LayoutRoot::resolveFontSize(const std::wstring& s, int baseFontSize, int def
     if (!parseNumberAndUnit(v, value, unit)) return def;
 
     if (unit.empty() || unit == L"px") return (int)std::lround(value);
-    if (unit == L"em" || unit == L"rem") return (int)std::lround(value * baseFontSize);
+    if (unit == L"em") return (int)std::lround(value * baseFontSize);
+    if (unit == L"rem") return (int)std::lround(value * remBase);
     if (unit == L"%") return (int)std::lround(value * baseFontSize / 100.0);
     return def;
 }
@@ -95,7 +102,7 @@ int LayoutRoot::resolveLength(const std::wstring& s, int base, int def) {
     if (unit.empty() || unit == L"px") return (int)std::lround(value);
     if (unit == L"%") return (int)std::lround(value * base / 100.0);
     if (unit == L"em") return (int)std::lround(value * emBase_);
-    if (unit == L"rem") return (int)std::lround(value * 14); // the root font size - see layout()
+    if (unit == L"rem") return (int)std::lround(value * remBase);
     if (unit == L"vw") return (int)std::lround(value * viewportWidth / 100.0);
     if (unit == L"vh" || unit == L"vmin" || unit == L"vmax") usedViewportHeight = true;
     if (unit == L"vh") return (int)std::lround(value * viewportHeight / 100.0);
@@ -112,7 +119,8 @@ int LayoutRoot::resolveHeight(const std::wstring& s, int fontSize, int def) {
     double value; std::wstring unit;
     if (!parseNumberAndUnit(v, value, unit)) return def;
     if (unit == L"%") return containingHeight_ >= 0 ? (int)std::lround(value * containingHeight_ / 100.0) : def;
-    if (unit == L"em" || unit == L"rem") return (int)std::lround(value * fontSize);
+    if (unit == L"em") return (int)std::lround(value * fontSize);
+    if (unit == L"rem") return (int)std::lround(value * remBase);
     return resolveLength(v, 0, def);
 }
 
@@ -366,12 +374,19 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containin
             continue;
         }
 
+        const bool image = isPictureTag(e->tag);
+        // An inline-level box (inline-block, inline-flex, a <button>): one
+        // item of the line, like a word.
+        if (sv.inlineLevel && !image) {
+            appendAtom(e, containingWidth, sv, out);
+            continue;
+        }
+
         // A block-level element (<a><div>...</div></a>) or a form control
         // inside inline content: the run is split around it, which lays it
         // out on lines of its own (InlineItem::blockItem) - the same a
         // control directly in a block gets.
-        const bool control = e->tag == L"input" || e->tag == L"button" || e->tag == L"select";
-        const bool image = isPictureTag(e->tag);
+        const bool control = e->tag == L"input" || e->tag == L"select";
         if (control || (sv.display != Display::Inline && !image)) {
             out.push_back(makeFloatItem(e, sv, true));
             continue;
@@ -402,6 +417,8 @@ void LayoutRoot::collectInline(Element* el, int inheritedFontSize, int containin
 // items on the same line can differ in font size, href, or owning element
 // (e.g. a link in the middle of a sentence). Generalizes what layoutText
 // used to do for a single homogeneously-styled string.
+
+static void moveBox(LayoutBox& b, int dx, int dy); // below, with the grid
 
 void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, int& y, int containingWidth,
                                  TextAlign align) {
@@ -454,6 +471,7 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
         int textBand = 0, imageHeight = 0;
         for (auto& p : line) {
             if (p.item.image) imageHeight = std::max(imageHeight, p.item.image->height);
+            else if (p.item.atom) imageHeight = std::max(imageHeight, p.item.atomHeight); // placed like an image
             else textBand = std::max(textBand, lineBand(p.item.paint, p.item.fontSize));
         }
         int lineHeight = std::max(textBand, imageHeight);
@@ -478,6 +496,23 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
                 box.y = textBand > box.height ? textTop + (textBand - box.height) / 2 : y + lineHeight - box.height;
                 box.href = p.item.href;
                 boxes.push_back(box);
+                continue;
+            }
+            if (p.item.atom) { // an inline-block: its boxes, moved to where it sits (as an image would)
+                const int h = p.item.atomHeight;
+                const int dx = left + textInset;
+                const int dy = textBand > h ? textTop + (textBand - h) / 2 : y + lineHeight - h;
+                for (LayoutBox b : *p.item.atom) {
+                    moveBox(b, dx, dy);
+                    boxes.push_back(std::move(b));
+                }
+                LayoutBox extent; // its whole width, for a shrink-to-fit box around it (contentWidth)
+                extent.geometryOnly = extent.atomExtent = true;
+                extent.x = dx;
+                extent.y = dy;
+                extent.width = p.item.atomWidth;
+                extent.height = h;
+                boxes.push_back(extent);
                 continue;
             }
             const TextPaint& paint = p.item.paint;
@@ -562,12 +597,12 @@ void LayoutRoot::layoutInlineRun(const std::vector<InlineItem>& items, int x, in
             continue;
         }
 
-        if (raw.image) {
+        if (raw.image || raw.atom) {
             // Wraps like a word; never split.
-            float w = (float)(raw.marginLeft + raw.image->width + raw.marginRight);
+            float w = raw.image ? (float)(raw.marginLeft + raw.image->width + raw.marginRight) : (float)raw.atomWidth;
             float spaceWidth = gapBefore(raw);
             if (!line.empty() && lineWidth + spaceWidth + w > maxWidth && !keepsLine(raw)) emitLine();
-            if (line.empty()) openLine(w, raw.image->height);
+            if (line.empty()) openLine(w, raw.image ? raw.image->height : raw.atomHeight);
             float offset = line.empty() ? 0 : lineWidth + spaceWidth;
             lineWidth = offset + w;
             line.push_back({ raw, offset, w });
@@ -635,20 +670,6 @@ static std::vector<std::wstring> cssTokens(const std::wstring& v) {
     return out;
 }
 
-// First piece of text inside an element (used for <button> labels).
-// (Trimmed; whitespace-only text is skipped.)
-static std::wstring firstText(Element* el) {
-    for (auto& child : el->children) {
-        if (child->type == Node::TEXT) {
-            std::wstring t = trimmed(static_cast<TextNode*>(child.get())->text);
-            if (!t.empty()) return t;
-            continue;
-        }
-        std::wstring t = firstText(static_cast<Element*>(child.get()));
-        if (!t.empty()) return t;
-    }
-    return L"";
-}
 
 // Replaces every var(--name) / var(--name, fallback) in `v` with that
 // custom property's value, or else the fallback. Returns false if one has
@@ -697,7 +718,7 @@ bool LayoutRoot::parseRadius(const std::wstring& v, int fontSize, LayoutBox::Cor
     if (n < 0) return false;
     if (unit == L"%") out = { n, true };
     else if (unit == L"px" || (unit.empty() && n == 0)) out = { n, false };
-    else if (unit == L"em" || unit == L"rem") out = { n * fontSize, false };
+    else if (unit == L"em" || unit == L"rem") out = { n * (unit == L"rem" ? remBase : fontSize), false };
     else return false;
     return true;
 }
@@ -741,7 +762,7 @@ static bool pixelLength(const std::wstring& tok, int fontSize, float& out) {
     double n; std::wstring unit;
     if (!parseNumberAndUnit(tok, n, unit)) return false;
     if (unit == L"px" || (unit.empty() && n == 0)) out = (float)n;
-    else if (unit == L"em" || unit == L"rem") out = (float)(n * fontSize);
+    else if (unit == L"em" || unit == L"rem") out = (float)(n * (unit == L"rem" ? remBase : fontSize));
     else return false;
     return true;
 }
@@ -1122,6 +1143,18 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyleUncached(Element* e, int inher
     }
     else if (tag == L"col" || tag == L"colgroup") sv.display = Display::None; // read by buildTable for widths only
     else if (tag == L"audio" && !e->attrs.count(L"controls")) sv.display = Display::None; // nothing to show
+    // A <button> is an inline-block box around whatever it holds (text,
+    // icons, an <svg>), drawn as a plain push button until the page styles
+    // it - as browsers do; its content is centred (below).
+    else if (tag == L"button") {
+        sv.inlineLevel = true;
+        sv.paddingTop = sv.paddingBottom = 1;
+        sv.paddingLeft = sv.paddingRight = 6;
+        sv.borderWidth = 1;
+        sv.borderColor = L"#767676";
+        sv.background = L"#efefef";
+        sv.boxSizing = BoxSizing::BorderBox; // a width includes the padding and border, as browsers have it
+    }
 
     // The rest of a browser's built-in spacing and sizes. Vertical margins
     // are in em of the element's final font size, so they're resolved once
@@ -1183,7 +1216,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyleUncached(Element* e, int inher
     }
     if (tag == L"u" || tag == L"ins") sv.paint.underline = true;
     if (tag == L"s" || tag == L"strike" || tag == L"del") sv.paint.lineThrough = true;
-    if (tag == L"center" || tag == L"th") sv.paint.align = TextAlign::Center;
+    if (tag == L"center" || tag == L"th" || tag == L"button") sv.paint.align = TextAlign::Center;
     if (tag == L"pre" || tag == L"listing" || tag == L"xmp" || tag == L"plaintext") sv.paint.whiteSpace = WhiteSpace::Pre;
     if (tag == L"nobr" || ((tag == L"td" || tag == L"th") && e->attrs.count(L"nowrap")))
         sv.paint.whiteSpace = WhiteSpace::NoWrap;
@@ -1193,6 +1226,10 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyleUncached(Element* e, int inher
     // line-height as written; resolved once the cascade is done, since a
     // percentage or em is of this element's final font size.
     std::wstring lineHeightRaw;
+    // mask / mask-image: masks aren't supported. An icon drawn as a mask
+    // over `background-color: currentColor` would otherwise be a solid
+    // square, so a masked element's background colour isn't painted.
+    bool masked = false;
 
     // Background layers and shadows, also built once the cascade is done:
     // the `background` shorthand and its longhands override each other in
@@ -1207,7 +1244,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyleUncached(Element* e, int inher
         if (v == L"auto" || !parseNumberAndUnit(v, n, unit)) return out;
         out.isAuto = false;
         if (unit == L"%") { out.percent = true; out.value = (float)n; }
-        else if (unit == L"em" || unit == L"rem") out.value = (float)(n * fontSize);
+        else if (unit == L"em" || unit == L"rem") out.value = (float)(n * (unit == L"rem" ? remBase : fontSize));
         else out.value = (float)resolveLength(v, 0, 0);
         return out;
     };
@@ -1267,7 +1304,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyleUncached(Element* e, int inher
             P_grid_row_start, P_grid_template, P_grid_template_areas, P_grid_template_columns,
             P_grid_template_rows, P_height, P_inset, P_justify_content, P_left, P_line_height, P_list_style,
             P_list_style_position, P_list_style_type, P_margin, P_margin_bottom, P_margin_left, P_margin_right,
-            P_margin_top, P_max_height, P_max_width,
+            P_margin_top, P_mask, P_max_height, P_max_width,
             P_min_height, P_min_width, P_opacity, P_overflow, P_overflow_x, P_overflow_y, P_padding,
             P_padding_bottom, P_padding_left, P_padding_right, P_padding_top, P_position, P_right,
             P_row_gap, P_text_align, P_text_decoration, P_text_decoration_line, P_text_transform, P_top,
@@ -1301,6 +1338,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyleUncached(Element* e, int inher
             { L"justify-content", P_justify_content }, { L"left", P_left }, { L"line-height", P_line_height },
             { L"list-style", P_list_style }, { L"list-style-position", P_list_style_position },
             { L"list-style-type", P_list_style_type },
+            { L"mask", P_mask }, { L"mask-image", P_mask }, { L"-webkit-mask", P_mask }, { L"-webkit-mask-image", P_mask },
             { L"margin", P_margin }, { L"margin-bottom", P_margin_bottom }, { L"margin-left", P_margin_left },
             { L"margin-right", P_margin_right }, { L"margin-top", P_margin_top },
             { L"max-height", P_max_height }, { L"max-width", P_max_width }, { L"min-height", P_min_height },
@@ -1367,6 +1405,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyleUncached(Element* e, int inher
             if (known) sv.paint.centerBlocks = a == L"-webkit-center";
         }
         else if (prop == P_line_height) lineHeightRaw = trimmed(v);
+        else if (prop == P_mask) masked = lowerCase(trimmed(v)) != L"none";
         else if (prop == P_list_style_type) listType(v);
         else if (prop == P_list_style_position) {
             std::wstring p = lowerCase(trimmed(v));
@@ -1656,8 +1695,18 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyleUncached(Element* e, int inher
                 sv.paint.whiteSpace = preserve ? WhiteSpace::PreWrap : sv.paint.whiteSpace == WhiteSpace::NoWrap ? WhiteSpace::Normal : sv.paint.whiteSpace;
         }
         else if (prop == P_display) {
+            // A value this engine doesn't know (-webkit-box, ...) leaves the
+            // one before it, as the standard value pages write after it does.
+            const bool known = v == L"none" || v == L"inline" || v == L"inline-block" || v == L"inline-flex" ||
+                               v == L"inline-grid" || v == L"block" || v == L"grid" || v == L"flex" ||
+                               v.rfind(L"table", 0) == 0 || v == L"inline-table" || v == L"flow-root" ||
+                               v.find(L"list-item") != std::wstring::npos;
+            if (known) sv.inlineLevel = v == L"inline-block" || v == L"inline-flex" || v == L"inline-grid";
             if (v == L"none") sv.display = Display::None;
-            else if (v == L"inline" || v == L"inline-block") sv.display = Display::Inline;
+            else if (v == L"inline") sv.display = Display::Inline;
+            else if (v == L"inline-block") sv.display = Display::Block;
+            else if (v == L"inline-flex") sv.display = Display::Flex;
+            else if (v == L"inline-grid") sv.display = Display::Grid;
             else if (v == L"block") sv.display = Display::Block;
             else if (v == L"grid") sv.display = Display::Grid;
             else if (v == L"flex") sv.display = Display::Flex;
@@ -1673,6 +1722,10 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyleUncached(Element* e, int inher
             else if (v == L"flow-root") sv.display = Display::Block;
             sv.flowRoot = v == L"flow-root";
             sv.listItem = v.find(L"list-item") != std::wstring::npos;
+            if (tag == L"button" && sv.display == Display::Inline) { // still a box, as in browsers
+                sv.display = Display::Block;
+                sv.inlineLevel = true;
+            }
         }
         else if (prop == P_float) {
             std::wstring f = lowerCase(trimmed(v));
@@ -1866,6 +1919,8 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyleUncached(Element* e, int inher
     if (!marginTopSet) sv.marginTop = (int)std::lround(uaMarginEm * sv.fontSize);
     if (!marginBottomSet) sv.marginBottom = (int)std::lround(uaMarginEm * sv.fontSize);
 
+    if (masked) sv.background.clear(); // see `masked`
+
     if (!lineHeightRaw.empty()) {
         // A plain number is inherited as a multiple (each descendant applies
         // it to its own font size); px, em and % become a fixed pixel height
@@ -1877,7 +1932,7 @@ LayoutRoot::ComputedStyle LayoutRoot::computeStyleUncached(Element* e, int inher
         else if (parseNumberAndUnit(lineHeightRaw, n, unit) && n >= 0) {
             if (unit.empty()) { sv.paint.lineHeight = (float)n; sv.paint.lineHeightPx = -1; }
             else if (unit == L"px") { sv.paint.lineHeightPx = (int)std::lround(n); sv.paint.lineHeight = -1; }
-            else if (unit == L"em" || unit == L"rem") { sv.paint.lineHeightPx = (int)std::lround(n * sv.fontSize); sv.paint.lineHeight = -1; }
+            else if (unit == L"em" || unit == L"rem") { sv.paint.lineHeightPx = (int)std::lround(n * (unit == L"rem" ? remBase : sv.fontSize)); sv.paint.lineHeight = -1; }
             else if (unit == L"%") { sv.paint.lineHeightPx = (int)std::lround(n * sv.fontSize / 100); sv.paint.lineHeight = -1; }
         }
     }
@@ -1957,7 +2012,7 @@ std::vector<LayoutRoot::GridTrack> LayoutRoot::parseGridTemplateTracks(const std
         double n; std::wstring unit;
         if (!parseNumberAndUnit(t, n, unit)) return false;
         if (unit == L"em") { out = (float)(n * fontSize); return true; }
-        if (unit == L"rem") { out = (float)(n * 14); return true; }
+        if (unit == L"rem") { out = (float)(n * remBase); return true; }
         int px = resolveLength(t, containingWidth, -1);
         if (px < 0) return false;
         out = (float)px;
@@ -2122,9 +2177,10 @@ void LayoutRoot::parseGridTemplateShorthand(const std::wstring& v, int containin
     if (slash != std::wstring::npos) colTracks = parseGridTemplateTracks(trimmed(v.substr(slash + 1)), containingWidth, fontSize);
 }
 
-// Places one <input> or <button> as a box of its own. Controls are laid out
+// Places one <input> or <select> as a box of its own. Controls are laid out
 // as blocks like everything else here, so a label and its field end up on
-// separate rows.
+// separate rows. (A <button> isn't one: it's an inline-block box around its
+// content - appendAtom.)
 void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth, const ComputedStyle& style) {
     // Control heights scale with font-size so a bigger font doesn't clip.
     const int fieldHeight = std::max(28, style.fontSize + 14);
@@ -2145,12 +2201,7 @@ void LayoutRoot::layoutControl(Element* e, int x, int& y, int containingWidth, c
     box.form = currentForm;
     box.visuallyHidden = style.visuallyHidden;
 
-    if (e->tag == L"button") {
-        box.control = LayoutBox::Button;
-        box.text = firstText(e);
-        if (box.text.empty()) box.text = L"Button";
-    }
-    else if (e->tag == L"select") {
+    if (e->tag == L"select") {
         box.control = LayoutBox::Select;
     }
     else if (type == L"submit" || type == L"button" || type == L"reset" || type == L"image") {
@@ -2321,6 +2372,47 @@ void LayoutRoot::appendImage(Element* e, int containingWidth, const ComputedStyl
     out.push_back(std::move(item));
 }
 
+void LayoutRoot::appendAtom(Element* e, int containingWidth, const ComputedStyle& style, std::vector<InlineItem>& out) {
+    // Laid out the way a float is (placeFloat): on its own at (0, 0) and
+    // shrink-to-fit unless it has a width. layoutInlineRun then puts it in
+    // its line and moves the boxes there.
+    const int available = std::max(containingWidth, 0);
+    const int savedCH = containingHeight_;
+    containingHeight_ = -1;
+    int width = available;
+    if (style.width < 0) { // shrink-to-fit, measured once per pass where it can be (atomMeasures_)
+        width = -1;
+        auto& measures = atomMeasures_[e];
+        for (const auto& m : measures)
+            if (available >= m.width && (m.width < m.available || available <= m.available)) { width = m.width; break; }
+        if (width < 0) {
+            width = shrinkToFitWidth(e, style, available);
+            measures.push_back({ available, width });
+        }
+    }
+    int height = 0;
+    std::vector<LayoutBox> laid = layoutItemDetached(e, width, style, height);
+    containingHeight_ = savedCH;
+    if (style.width >= 0) { // its own width, with its padding, border and margins
+        int chrome = style.boxSizing == BoxSizing::BorderBox ? 0 : style.paddingLeft + style.paddingRight + 2 * style.borderWidth;
+        int w = style.width;
+        if (style.maxWidth >= 0) w = std::min(w, style.maxWidth);
+        if (style.minWidth >= 0) w = std::max(w, style.minWidth);
+        width = style.marginLeft + w + chrome + style.marginRight;
+    }
+    InlineItem item;
+    item.fontSize = style.fontSize;
+    item.href = currentHref;
+    item.owner = e;
+    item.visuallyHidden = style.visuallyHidden;
+    item.paint = style.paint;
+    item.atom = std::make_shared<const std::vector<LayoutBox>>(std::move(laid));
+    item.atomWidth = std::max(width, 0);
+    item.atomHeight = std::max(height, 0);
+    item.spaceBefore = false; // as for an image: a gap only from whitespace in the HTML
+    out.push_back(std::move(item));
+}
+
 // An image displayed as a block: on its own, stacked below what came before.
 void LayoutRoot::layoutImage(Element* e, int x, int& y, int containingWidth, const ComputedStyle& style) {
     LayoutBox box = makeImageBox(e, containingWidth, style);
@@ -2423,6 +2515,8 @@ void LayoutRoot::layout() {
     listOrdinals_.clear();
     anonymousItems_.clear();
     styleCache_.clear(); // styles hold for one pass only - the DOM and rules can change between passes
+    atomMeasures_.clear(); // likewise what appendAtom worked out
+    measured_.clear();     // and measuring layouts (layoutItemDetached)
     imagesSizedByGuess.clear();
     elementRects.clear();
     described_.clear();
@@ -2447,6 +2541,16 @@ void LayoutRoot::layout() {
 
     std::vector<Element*> ancestors;
     for (Element* a = root->parent; a; a = a->parent) ancestors.insert(ancestors.begin(), a);
+    // 1rem (remBase), before any style is computed: <html>'s font size when
+    // a rule sets one (resolved against the browser default of 16px, so
+    // `10px` and `62.5%` both give 10), else the 14px base.
+    remBase = 14;
+    {
+        Element* html = ancestors.empty() ? root : ancestors.front();
+        const int fromDefault = computeStyle(html, 16, viewportWidth - 20, false, TextPaint()).fontSize;
+        if (fromDefault != 16) remBase = std::max(fromDefault, 1);
+        styleCache_.erase(html); // computed against 16px just for this
+    }
     TextPaint paint;
     for (Element* a : ancestors) {
         ComputedStyle s = computeStyle(a, 14, viewportWidth - 20, false, paint);
@@ -2718,7 +2822,7 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
             if (sv.position == ComputedStyle::Position::Absolute || sv.position == ComputedStyle::Position::Fixed) {
                 // A block-level one's static position is below the text
                 // before it, so that text is laid out first.
-                if (sv.display != Display::Inline) flushInline();
+                if (sv.display != Display::Inline && !sv.inlineLevel) flushInline();
                 deferOutOfFlow(e, sv, x, y, true);
                 continue;
             }
@@ -2730,7 +2834,7 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
                 continue;
             }
 
-            if (e->tag == L"input" || e->tag == L"button" || e->tag == L"select") {
+            if (e->tag == L"input" || e->tag == L"select") {
                 flushInline();
                 layoutControl(e, x, y, containingWidth, sv);
                 continue;
@@ -2740,13 +2844,20 @@ void LayoutRoot::layoutElement(Element* el, int x, int& y, int containingWidth, 
                 // Inline by default, as in CSS: it joins the text around it
                 // ("Click <img> here" stays one line). display:block puts it
                 // on its own.
-                if (sv.display == Display::Inline) {
+                if (sv.display == Display::Inline || sv.inlineLevel) {
                     appendImage(e, containingWidth, sv, pendingInline);
                 }
                 else {
                     flushInline();
                     layoutImage(e, x, y, containingWidth, sv);
                 }
+                continue;
+            }
+
+            // An inline-level box (inline-block, inline-flex, a <button>)
+            // joins the run too, as one item of its line.
+            if (sv.inlineLevel) {
+                appendAtom(e, containingWidth, sv, pendingInline);
                 continue;
             }
 
@@ -3787,11 +3898,20 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
             // block does - it takes `width` as its own size. One with a CSS
             // width gets the flexed width that way; one without keeps its
             // natural size, as in browsers.
-            bool isControl = items[i]->tag == L"input" || items[i]->tag == L"button" || items[i]->tag == L"select";
+            bool isControl = items[i]->tag == L"input" || items[i]->tag == L"select";
             if (isControl && itemStyles[i].width >= 0)
                 real.width = std::max(itemWidths[i] - real.marginLeft - real.marginRight, 0);
             itemBoxes[i - a] = layoutItemDetached(items[i], itemWidths[i], real, itemHeights[i - a]);
             lineHeight = std::max(lineHeight, itemHeights[i - a]);
+        }
+        // A single line fills a container of definite height, so
+        // align-items centres (or stretches) items in all of it - a 32px
+        // chip's label, a button's icon.
+        if (lines.size() == 1 && style.height >= 0) {
+            const int content = style.boxSizing == BoxSizing::BorderBox
+                ? style.height - style.paddingTop - style.paddingBottom - 2 * style.borderWidth
+                : style.height;
+            lineHeight = std::max(lineHeight, content);
         }
 
         int usedWidth = colGap * (count - 1);
@@ -3851,6 +3971,19 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
                 moveBox(box, cursorX, lineY + itemY);
                 boxes.push_back(std::move(box));
             }
+            // While measuring, the item's whole width counts towards how
+            // wide this row needs to be (contentWidth sees only text and
+            // images, so an item's own padding would go uncounted) - up to
+            // its natural size: one grown to fill the space doesn't need it.
+            if (measuring_) {
+                LayoutBox extent;
+                extent.geometryOnly = extent.atomExtent = true;
+                extent.x = cursorX;
+                extent.y = lineY + itemY;
+                extent.width = std::min(itemWidths[i], basis[i]);
+                extent.height = itemHeights[k];
+                boxes.push_back(extent);
+            }
             cursorX += itemWidths[i] + colGap + extraGap;
             if (itemStyles[i].marginRightAuto) cursorX += perAutoMargin;
         }
@@ -3861,7 +3994,28 @@ void LayoutRoot::layoutFlex(Element* el, int x, int& y, int containingWidth, con
     ancestorStack.pop_back();
 }
 
+LayoutRoot::MeasureKey LayoutRoot::measureKey(int width, const ComputedStyle& s) const {
+    return { width, containingHeight_, s.width, s.height, s.minWidth, s.maxWidth, s.minHeight, s.maxHeight, (int)s.display,
+             s.fontSize, s.paddingTop, s.paddingRight, s.paddingBottom, s.paddingLeft, s.marginTop, s.marginRight,
+             s.marginBottom, s.marginLeft, s.borderWidth, (int)s.boxSizing };
+}
+
 std::vector<LayoutBox> LayoutRoot::layoutItemDetached(Element* item, int width, const ComputedStyle& style, int& height) {
+    if (!measuring_) return layoutItemDetachedNow(item, width, style, height);
+    // A measuring layout (measuring_) is only read for its size, so the same
+    // one is reused for the rest of the pass: flex measures each item more
+    // than once, and nested flex boxes, inline-blocks and table cells would
+    // otherwise redo all of that at every level.
+    const MeasureKey key = measureKey(width, style);
+    auto& kept = measured_[item];
+    for (const auto& m : kept)
+        if (m.key == key) { height = m.height; return m.boxes; }
+    std::vector<LayoutBox> laid = layoutItemDetachedNow(item, width, style, height);
+    kept.push_back({ key, laid, height });
+    return laid;
+}
+
+std::vector<LayoutBox> LayoutRoot::layoutItemDetachedNow(Element* item, int width, const ComputedStyle& style, int& height) {
     std::vector<LayoutBox> scratch;
     std::swap(boxes, scratch);
     // Laid out at (0, 0), away from the floats around it - in a float
@@ -3876,7 +4030,7 @@ std::vector<LayoutBox> LayoutRoot::layoutItemDetached(Element* item, int width, 
     savedOpenTops.swap(openTops_);
     marginEndY_ = INT_MIN;
     int localY = 0;
-    if (item->tag == L"input" || item->tag == L"button" || item->tag == L"select")
+    if (item->tag == L"input" || item->tag == L"select")
         layoutControl(item, 0, localY, width, style);
     else if (isPictureTag(item->tag))
         layoutImage(item, 0, localY, width, style);
@@ -3914,6 +4068,7 @@ int LayoutRoot::contentWidth(Element* item, const ComputedStyle& style, int widt
     measuring_ = wasMeasuring;
     int right = 0;
     for (const auto& b : trial) {
+        if (b.atomExtent) { right = std::max(right, b.x + b.width); continue; } // an inline-block: all of it
         if (b.anchor || b.geometryOnly) continue; // marks a position or a border box; no content of its own
         // Content has a natural width. A background box, when laid out
         // wide, just spans whatever width it was given, so it says nothing
@@ -3998,7 +4153,7 @@ void LayoutRoot::layoutInlineBlock(const FloatItem& item, int x, int& y, int wid
     currentHref = item.href;
     currentForm = item.form;
     const std::wstring& tag = item.el->tag;
-    if (tag == L"input" || tag == L"button" || tag == L"select") layoutControl(item.el, x, y, width, item.style);
+    if (tag == L"input" || tag == L"select") layoutControl(item.el, x, y, width, item.style);
     else layoutBlockChild(item.el, x, y, width, item.style);
     currentHref = savedHref;
     currentForm = savedForm;
@@ -4010,7 +4165,7 @@ void LayoutRoot::placeFloat(const FloatItem& item, int cbX, int cbW, int y) {
     ComputedStyle s = item.style;
     if (s.display == Display::Inline) s.display = Display::Block; // a float is blockified
     const std::wstring& tag = item.el->tag;
-    const bool replaced = isPictureTag(tag) || tag == L"input" || tag == L"button" || tag == L"select";
+    const bool replaced = isPictureTag(tag) || tag == L"input" || tag == L"select";
 
     // Laid out in the context it was met in.
     std::vector<Element*> ancestors = item.ancestors;
@@ -4349,6 +4504,7 @@ std::unique_ptr<LayoutRoot::TableModel> LayoutRoot::buildTable(Element* table, c
     auto rightEdge = [](const std::vector<LayoutBox>& laid, const TableCell& c, bool narrow) {
         int right = 0;
         for (const auto& b : laid) {
+            if (b.atomExtent) { right = std::max(right, b.x + b.width); continue; } // an inline-block: all of it
             if (b.anchor || b.geometryOnly) continue; // marks a position or a border box; no content of its own
             bool text = !b.text.empty() && b.control == LayoutBox::NoControl;
             bool content = text || !b.imageSrc.empty() || b.control != LayoutBox::NoControl;
@@ -4601,7 +4757,9 @@ std::vector<std::pair<std::wstring, std::wstring>> LayoutRoot::computedStyleOf(E
     static const wchar_t* const kDisplay[] = { L"block", L"inline", L"none", L"grid", L"flex", L"table",
         L"table-row-group", L"table-header-group", L"table-footer-group", L"table-row", L"table-cell", L"table-caption" };
     std::wstring display = kDisplay[(int)s.display];
-    if (s.display == Display::Block && s.listItem) display = L"list-item";
+    if (s.inlineLevel && (s.display == Display::Block || s.display == Display::Flex || s.display == Display::Grid))
+        display = L"inline-" + display;
+    else if (s.display == Display::Block && s.listItem) display = L"list-item";
     else if (s.display == Display::Block && s.flowRoot) display = L"flow-root";
     add(L"display", display);
     static const wchar_t* const kPosition[] = { L"static", L"relative", L"absolute", L"fixed", L"sticky" };

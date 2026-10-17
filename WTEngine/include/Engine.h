@@ -356,8 +356,10 @@ private:
     // spot, as browsers do. Unless layouts are slow (over 16 ms) and one
     // ended less than its own duration ago - so a script alternating
     // writes and reads can't spend more than about half the time laying
-    // out; it then gets the last layout's geometry (styles are recomputed).
-    void layoutForScript();
+    // out; it then gets the last layout's geometry (styles are recomputed),
+    // and false is returned. An element that came after that layout, with
+    // no geometry in it, is laid out anyway (scriptElementRect).
+    bool layoutForScript();
     unsigned layoutChangeCount_ = 0; // DOMBindingState::changeCount as of the last layout
     unsigned styleChangeCount_ = 0;  // ... as of the last time computed styles were current
     bool pageLaidOut_ = false; // the current page has been laid out at least once

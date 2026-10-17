@@ -1,5 +1,6 @@
 // Layout.h
 #pragma once
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <memory>
@@ -130,6 +131,11 @@ struct LayoutBox {
     // boxes around it; layout() turns these into LayoutRoot::elementRects
     // and removes them. Never painted.
     bool geometryOnly = false;
+    // With geometryOnly (and no `el`): how far an inline-level box reaches
+    // in its line, or a flex item in a measuring layout, so a shrink-to-fit
+    // width around it (contentWidth) counts all of it - its padding, or an
+    // icon that's only a 24px background with no content of its own.
+    bool atomExtent = false;
     // A <video> or <audio>: Engine draws its frame (or poster) and its
     // controls; `el` is the element.
     bool media = false;
@@ -359,6 +365,13 @@ private:
         // `marginRight` add space around it within the line.
         std::shared_ptr<const LayoutBox> image;
         int marginLeft = 0, marginRight = 0;
+        // An inline-level box instead of a word (inline-block, inline-flex,
+        // inline-grid, a <button>): its content already laid out at (0, 0)
+        // by appendAtom, `atomWidth` x `atomHeight` with its margins.
+        // layoutInlineRun places it in the line like an image and moves
+        // the boxes there.
+        std::shared_ptr<const std::vector<LayoutBox>> atom;
+        int atomWidth = 0, atomHeight = 0;
         // Whether whitespace separated this item from the one before it in
         // the HTML - only then does it get a space ("<em>x</em>," has none).
         bool spaceBefore = true;
@@ -470,6 +483,11 @@ private:
         BoxSizing boxSizing = BoxSizing::ContentBox;
         int fontSize = 14;
         Display display = Display::Block;
+        // inline-block, inline-flex, inline-grid: `display` is the inside
+        // (Block, Flex, Grid), and the element is one box in its line of
+        // text (appendAtom). Also set for a <button>, which is
+        // inline-block by default.
+        bool inlineLevel = false;
         // Only meaningful with display:grid. Empty means no explicit
         // grid-template-columns was set - layoutGrid then falls back to one
         // full-width column, so items still stack rather than disappear.
@@ -625,6 +643,16 @@ private:
     LayoutBox makeImageBox(Element* el, int containingWidth, const ComputedStyle& style);
     // Adds an <img>/<svg> to an inline run, as one item that wraps like a word.
     void appendImage(Element* el, int containingWidth, const ComputedStyle& style, std::vector<InlineItem>& out);
+    // An inline-level element (ComputedStyle::inlineLevel) as one item of
+    // the run: laid out on its own, shrink-to-fit unless it has a width.
+    void appendAtom(Element* el, int containingWidth, const ComputedStyle& style, std::vector<InlineItem>& out);
+    // appendAtom's shrink-to-fit widths, kept for the rest of the layout
+    // pass: inline-blocks nest (an icon in a chip in a button), and each
+    // level is measured before it's laid out. A width `width` measured
+    // with `available` px holds for any available width from `width` up
+    // (when it was less than `available`, nothing wrapped).
+    struct AtomMeasure { int available, width; };
+    std::unordered_map<const Element*, std::vector<AtomMeasure>> atomMeasures_;
     // The box-model + content treatment layoutElement gives any block-level
     // child (background/border box, margin/padding, then recurse into
     // children or - if `style.display` is Grid - into layoutGrid). Factored
@@ -682,7 +710,19 @@ private:
     // Lays out one flex/grid item (a control, an image, or a block) at
     // local origin (0, 0) and `width`, returning its boxes instead of
     // appending them to `boxes`; `height` receives how tall it came out.
+    // A measuring one (measuring_) is kept and reused for the rest of the
+    // pass (measured_): flex measures an item more than once, and nested
+    // flex boxes and inline-blocks would redo all of that at every level.
     std::vector<LayoutBox> layoutItemDetached(Element* item, int width, const ComputedStyle& style, int& height);
+    std::vector<LayoutBox> layoutItemDetachedNow(Element* item, int width, const ComputedStyle& style, int& height);
+    // What a measuring layout's result depends on, besides the element.
+    struct MeasureKey {
+        int v[20];
+        bool operator==(const MeasureKey& o) const { return std::equal(std::begin(v), std::end(v), std::begin(o.v)); }
+    };
+    MeasureKey measureKey(int width, const ComputedStyle& style) const;
+    struct Measured { MeasureKey key; std::vector<LayoutBox> boxes; int height; };
+    std::unordered_map<const Element*, std::vector<Measured>> measured_;
     // A shrink-to-fit width for an item with no width of its own: lays it
     // out at `available` and measures how far right its content (text,
     // images, controls) actually reaches, plus its right padding/border/

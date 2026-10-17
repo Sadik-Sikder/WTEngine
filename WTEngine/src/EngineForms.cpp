@@ -108,6 +108,22 @@ namespace {
         r.drawRoundedRect(x, y, w, h, rad, fill);
     }
 
+    // The <button> `el` is in (or is), or nullptr. A <button> is laid out
+    // around its content, so a click lands on a child of it - its icon,
+    // its label.
+    Element* buttonAround(Element* el) {
+        for (; el; el = el->parent)
+            if (el->tag == L"button") return el;
+        return nullptr;
+    }
+
+    // The <form> a control belongs to: the one around it.
+    Element* formAround(Element* el) {
+        for (Element* a = el ? el->parent : nullptr; a; a = a->parent)
+            if (a->tag == L"form") return a;
+        return nullptr;
+    }
+
     // <button> defaults to submit; <input> only when type=submit/image.
     bool isSubmitButton(const Element* el) {
         std::wstring type = lower(attrOf(el, L"type"));
@@ -187,6 +203,7 @@ Engine::Cursor Engine::cursorAt(int x, int y, Renderer& renderer) const {
     if (const LayoutBox* c = controlAt(x, y))
         return c->control == LayoutBox::TextField ? Cursor::IBeam : Cursor::Hand;
     if (overMediaControl(x, y)) return Cursor::Hand; // a video's buttons and sliders
+    if (buttonAround(elementAt(x, y))) return Cursor::Hand;
     return linkAt(x, y, renderer).empty() ? Cursor::Arrow : Cursor::Hand;
 }
 
@@ -375,7 +392,19 @@ bool Engine::dispatchClick(int x, int y) {
     JSContext* ctx = jsContext();
     Element* target = elementAt(x, y);
     if (!ctx || !target) return false;
-    return fireMouseEvent(ctx, target, L"click", mouseInfoAt(x, y));
+    // A disabled <button> takes no clicks, as in browsers.
+    Element* button = buttonAround(target);
+    if (button && button->attrs.count(L"disabled")) return true;
+    const bool prevented = fireMouseEvent(ctx, target, L"click", mouseInfoAt(x, y));
+    // A submit <button>'s own action, unless a listener cancelled it.
+    if (!prevented && button && stillInPage(button) && isSubmitButton(button)) {
+        Element* form = formAround(button);
+        if (form && stillInPage(form)) {
+            blurInput();
+            queueSubmit(form, button);
+        }
+    }
+    return prevented;
 }
 
 bool Engine::onKeyEvent(const KeyInfo& info, bool down) {

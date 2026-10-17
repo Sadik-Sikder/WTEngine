@@ -1123,10 +1123,10 @@ int Engine::shiftFor(bool fixed, int sticky) const {
 
 // --- Geometry for scripts -------------------------------------------------
 
-void Engine::layoutForScript() {
+bool Engine::layoutForScript() {
     // A script running while the page loads comes before its first layout.
     const bool laidOut = pageLaidOut_;
-    if (laidOut && domState.changeCount == layoutChangeCount_) return; // the layout is current
+    if (laidOut && domState.changeCount == layoutChangeCount_) return true; // the layout is current
     double sinceMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lastLayoutEnd_).count();
     if (laidOut && lastLayoutMs > 16 && sinceMs < lastLayoutMs) {
         // Held back (see the declaration): geometry stays as it was, but
@@ -1135,11 +1135,12 @@ void Engine::layoutForScript() {
             layoutRoot.forgetStyles();
             styleChangeCount_ = domState.changeCount;
         }
-        return;
+        return false;
     }
     // domDirty stays set: render() still runs its checks for elements the
     // script freed; it skips the relayout itself, since this one is current.
     doLayout();
+    return true;
 }
 
 bool Engine::unionRect(const Element* el, int& x0, int& y0, int& x1, int& y1, int depth) {
@@ -1172,15 +1173,31 @@ bool Engine::unionRect(const Element* el, int& x0, int& y0, int& x1, int& y1, in
 }
 
 bool Engine::scriptElementRect(Element* el, double& x, double& y, double& w, double& h) {
-    layoutForScript();
-    if (boxIndexGeneration_ != layoutGeneration_) {
+    const bool current = layoutForScript();
+    auto indexBoxes = [&] {
+        if (boxIndexGeneration_ == layoutGeneration_) return;
         boxesByElement_.clear();
         for (size_t i = 0; i < layoutRoot.boxes.size(); i++)
             if (layoutRoot.boxes[i].el) boxesByElement_[layoutRoot.boxes[i].el].push_back(i);
         boxIndexGeneration_ = layoutGeneration_;
-    }
+    };
+    indexBoxes();
     int x0 = INT_MAX, y0 = INT_MAX, x1 = INT_MIN, y1 = INT_MIN;
-    if (!unionRect(el, x0, y0, x1, y1, 0)) return false;
+    if (!unionRect(el, x0, y0, x1, y1, 0)) {
+        // Layout was held back, and this element came after it: it would
+        // read as 0 x 0, and a script measuring something it just inserted
+        // may never ask again - YouTube's video grid sizes itself once,
+        // then waits for a resize. So it's laid out after all, as browsers
+        // always do. (Not for one outside the document, which has no box
+        // either way.)
+        const Element* top = el;
+        while (top && top->parent) top = top->parent;
+        const Element* root = document ? (document->root ? document->root.get() : document->body.get()) : nullptr;
+        if (current || !root || top != root) return false;
+        doLayout();
+        indexBoxes();
+        if (!unionRect(el, x0, y0, x1, y1, 0)) return false;
+    }
     // Document coordinates to the viewport's (fixed boxes already carry the
     // scroll offset from shiftFor).
     x = x0;
